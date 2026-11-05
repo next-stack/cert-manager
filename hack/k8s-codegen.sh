@@ -18,53 +18,45 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-go=$1
+clientgen=$1
+deepcopygen=$2
+informergen=$3
+listergen=$4
+defaultergen=$5
+conversiongen=$6
+openapigen=$7
+applyconfigurationgen=$8
 
-clientgen=$2
-deepcopygen=$3
-informergen=$4
-listergen=$5
-defaultergen=$6
-conversiongen=$7
-
-# If the envvar "VERIFY_ONLY" is set, we only check if everything's up to date
-# and don't actually generate anything
-
-VERIFY_FLAGS=""
-VERB="Generating"
-
-if [[ ${VERIFY_ONLY:-} ]]; then
-	VERIFY_FLAGS="--verify-only"
-	VERB="Verifying"
-fi
-
-export VERIFY_FLAGS
-export VERB
-
-echo "+++ ${VERB} code..." >&2
+echo "+++ Generating code..." >&2
 
 module_name="github.com/cert-manager/cert-manager"
 
 # Generate deepcopy functions for all internal and external APIs
 deepcopy_inputs=(
-  internal/apis/certmanager/v1alpha2 \
-  internal/apis/certmanager/v1alpha3 \
-  internal/apis/certmanager/v1beta1 \
   pkg/apis/certmanager/v1 \
   internal/apis/certmanager \
-  internal/apis/acme/v1alpha2 \
-  internal/apis/acme/v1alpha3 \
-  internal/apis/acme/v1beta1 \
   pkg/apis/acme/v1 \
   internal/apis/acme \
+  pkg/apis/config/cainjector/v1alpha1 \
+  internal/apis/config/cainjector \
   pkg/apis/config/webhook/v1alpha1 \
   internal/apis/config/webhook \
+  pkg/apis/config/controller/v1alpha1 \
+  internal/apis/config/controller \
+  pkg/apis/config/shared/v1alpha1 \
+  internal/apis/config/shared \
   pkg/apis/meta/v1 \
   internal/apis/meta \
-  pkg/webhook/handlers/testdata/apis/testgroup/v2 \
-  pkg/webhook/handlers/testdata/apis/testgroup/v1 \
-  pkg/webhook/handlers/testdata/apis/testgroup \
   pkg/acme/webhook/apis/acme/v1alpha1 \
+)
+
+# Used for generating apply configurations and client openapi specs.
+# Separate to client_inputs because we need apply configurations for metav1,
+# and client-gen has no way to exclude a input package just using markers in code.
+api_inputs=(
+  pkg/apis/certmanager/v1 \
+  pkg/apis/acme/v1 \
+  pkg/apis/meta/v1 \
 )
 
 client_subpackage="pkg/client"
@@ -77,43 +69,28 @@ client_inputs=(
 
 # Generate defaulting functions to be used by the mutating webhook
 defaulter_inputs=(
-  internal/apis/certmanager/v1alpha2 \
-  internal/apis/certmanager/v1alpha3 \
-  internal/apis/certmanager/v1beta1 \
   internal/apis/certmanager/v1 \
-  internal/apis/acme/v1alpha2 \
-  internal/apis/acme/v1alpha3 \
-  internal/apis/acme/v1beta1 \
   internal/apis/acme/v1 \
+  internal/apis/config/shared/v1alpha1 \
+  internal/apis/config/cainjector/v1alpha1 \
   internal/apis/config/webhook/v1alpha1 \
+  internal/apis/config/controller/v1alpha1 \
   internal/apis/meta/v1 \
-  pkg/webhook/handlers/testdata/apis/testgroup/v2 \
-  pkg/webhook/handlers/testdata/apis/testgroup/v1 \
 )
 
 # Generate conversion functions to be used by the conversion webhook
 conversion_inputs=(
-  internal/apis/certmanager/v1alpha2 \
-  internal/apis/certmanager/v1alpha3 \
-  internal/apis/certmanager/v1beta1 \
   internal/apis/certmanager/v1 \
-  internal/apis/acme/v1alpha2 \
-  internal/apis/acme/v1alpha3 \
-  internal/apis/acme/v1beta1 \
   internal/apis/acme/v1 \
+  internal/apis/config/shared/v1alpha1 \
+  internal/apis/config/cainjector/v1alpha1 \
   internal/apis/config/webhook/v1alpha1 \
+  internal/apis/config/controller/v1alpha1 \
   internal/apis/meta/v1 \
-  pkg/webhook/handlers/testdata/apis/testgroup/v2 \
-  pkg/webhook/handlers/testdata/apis/testgroup/v1 \
 )
 
 # clean will delete files matching name in path.
 clean() {
-  if [[ ${VERIFY_ONLY:-} ]]; then
-      # don't delete files if we're only verifying
-      return 0
-  fi
-
   path=$1
   name=$2
   if [[ ! -d "$path" ]]; then
@@ -122,118 +99,161 @@ clean() {
   find "$path" -name "$name" -delete
 }
 
-mkcp() {
-  src="$1"
-  dst="$2"
-  mkdir -p "$(dirname "$dst")"
-  cp "$src" "$dst"
+gen-openapi-acme() {
+  clean pkg/acme/webhook/openapi 'zz_generated.openapi.go'
+  echo "+++ Generating ACME openapi..." >&2
+  mkdir -p hack/openapi_reports
+  "$openapigen" \
+    --go-header-file "hack/boilerplate-go.txt" \
+    --report-filename "hack/openapi_reports/acme.txt" \
+    --output-dir ./pkg/acme/webhook/openapi/ \
+    --output-pkg "github.com/cert-manager/cert-manager/pkg/acme/webhook/openapi" \
+		--output-file zz_generated.openapi.go \
+    "k8s.io/apimachinery/pkg/version" \
+    "k8s.io/apimachinery/pkg/runtime" \
+    "k8s.io/apimachinery/pkg/apis/meta/v1" \
+    "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1" \
+    "github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
 }
 
-# Export mkcp for use in sub-shells
-export -f mkcp
+gen-openapi-client() {
+  clean internal/generated/openapi 'zz_generated.openapi.go'
+  echo "+++ Generating client openapi..." >&2
+  prefixed_inputs=( "${api_inputs[@]/#/$module_name/}" )
+  "$openapigen" \
+    --go-header-file "hack/boilerplate-go.txt" \
+    --report-filename "hack/openapi_reports/client.txt" \
+    --output-dir ./internal/generated/openapi/ \
+    --output-pkg "github.com/cert-manager/cert-manager/internal/generated/openapi" \
+		--output-file zz_generated.openapi.go \
+		"k8s.io/api/core/v1" \
+    "k8s.io/apimachinery/pkg/version" \
+    "k8s.io/apimachinery/pkg/runtime" \
+    "k8s.io/apimachinery/pkg/apis/meta/v1" \
+    "k8s.io/apimachinery/pkg/api/resource" \
+    "k8s.io/apimachinery/pkg/util/intstr" \
+    "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1" \
+    "k8s.io/component-base/logs/api/v1" \
+    "sigs.k8s.io/gateway-api/apis/v1" \
+    "${prefixed_inputs[@]}"
+}
 
 gen-deepcopy() {
   clean pkg/apis 'zz_generated.deepcopy.go'
   clean pkg/acme/webhook/apis 'zz_generated.deepcopy.go'
   clean pkg/webhook/handlers/testdata/apis 'zz_generated.deepcopy.go'
-  echo "+++ ${VERB} deepcopy methods..." >&2
+  echo "+++ Generating deepcopy methods..." >&2
   prefixed_inputs=( "${deepcopy_inputs[@]/#/$module_name/}" )
-  joined=$( IFS=$','; echo "${prefixed_inputs[*]}" )
   "$deepcopygen" \
-    ${VERIFY_FLAGS} \
-    --go-header-file hack/boilerplate/boilerplate.generatego.txt \
-    --input-dirs "$joined" \
-    --output-file-base zz_generated.deepcopy \
-    --trim-path-prefix="$module_name" \
-    --bounding-dirs "${module_name}" \
-    --output-base ./
+    --go-header-file hack/boilerplate-go.txt \
+    --output-file zz_generated.deepcopy.go \
+    "${prefixed_inputs[@]}"
+}
+
+gen-applyconfigurations() {
+  # This is a temporary hack to generate the schema YAMLs
+  # required to generate fake clientsets that actually works.
+  # Upstream issue: https://github.com/kubernetes/kubernetes/issues/126850
+  models_schema=( "${module_name}/internal/generated/openapi/cmd/models-schema" )
+
+  clean "${client_subpackage}"/applyconfigurations '*.go'
+  echo "+++ Generating applyconfigurations..." >&2
+  prefixed_inputs=( "${api_inputs[@]/#/$module_name/}" )
+ "$applyconfigurationgen" \
+    --go-header-file hack/boilerplate-go.txt \
+    --openapi-schema <(go run "$models_schema") \
+    --output-dir "${client_subpackage}"/applyconfigurations \
+    --output-pkg "${client_package}"/applyconfigurations \
+    "${prefixed_inputs[@]}"
 }
 
 gen-clientsets() {
   clean "${client_subpackage}"/clientset '*.go'
-  echo "+++ ${VERB} clientset..." >&2
+  echo "+++ Generating clientsets..." >&2
   prefixed_inputs=( "${client_inputs[@]/#/$module_name/}" )
   joined=$( IFS=$','; echo "${prefixed_inputs[*]}" )
   "$clientgen" \
-    ${VERIFY_FLAGS} \
-    --go-header-file hack/boilerplate/boilerplate.generatego.txt \
+    --go-header-file hack/boilerplate-go.txt \
     --clientset-name versioned \
+    --apply-configuration-package "${client_package}"/applyconfigurations \
     --input-base "" \
     --input "$joined" \
-    --trim-path-prefix="$module_name" \
-    --output-package "${client_package}"/clientset \
-    --output-base ./
+    --output-dir "${client_subpackage}"/clientset \
+    --output-pkg "${client_package}"/clientset
 }
 
 gen-listers() {
   clean "${client_subpackage}/listers" '*.go'
-  echo "+++ ${VERB} listers..." >&2
+  echo "+++ Generating listers..." >&2
   prefixed_inputs=( "${client_inputs[@]/#/$module_name/}" )
-  joined=$( IFS=$','; echo "${prefixed_inputs[*]}" )
   "$listergen" \
-    ${VERIFY_FLAGS} \
-    --go-header-file hack/boilerplate/boilerplate.generatego.txt \
-    --input-dirs "$joined" \
-    --trim-path-prefix="$module_name" \
-    --output-package "${client_package}"/listers \
-    --output-base ./
+    --go-header-file hack/boilerplate-go.txt \
+    --output-dir "${client_subpackage}"/listers \
+    --output-pkg "${client_package}"/listers \
+    "${prefixed_inputs[@]}"
 }
 
 gen-informers() {
   clean "${client_subpackage}"/informers '*.go'
-  echo "+++ ${VERB} informers..." >&2
+  echo "+++ Generating informers..." >&2
   prefixed_inputs=( "${client_inputs[@]/#/$module_name/}" )
-  joined=$( IFS=$','; echo "${prefixed_inputs[*]}" )
   "$informergen" \
-    ${VERIFY_FLAGS} \
-    --go-header-file hack/boilerplate/boilerplate.generatego.txt \
-    --input-dirs "$joined" \
+    --go-header-file hack/boilerplate-go.txt \
     --versioned-clientset-package "${client_package}"/clientset/versioned \
     --listers-package "${client_package}"/listers \
-    --trim-path-prefix="$module_name" \
-    --output-package "${client_package}"/informers \
-    --output-base ./
+    --output-dir "${client_subpackage}"/informers \
+    --output-pkg "${client_package}"/informers \
+    "${prefixed_inputs[@]}"
 }
 
 gen-defaulters() {
   clean internal/apis 'zz_generated.defaults.go'
   clean pkg/webhook/handlers/testdata/apis 'zz_generated.defaults.go'
-  echo "+++ ${VERB} defaulting functions..." >&2
-  prefixed_inputs=( "${defaulter_inputs[@]/#/$module_name/}" )
-  joined=$( IFS=$','; echo "${prefixed_inputs[*]}" )
+  echo "+++ Generating defaulting functions..." >&2
+  
+  DEFAULT_EXTRA_PEER_PKGS=(
+    github.com/cert-manager/cert-manager/internal/apis/meta \
+    github.com/cert-manager/cert-manager/internal/apis/meta/v1 \
+    github.com/cert-manager/cert-manager/internal/apis/config/shared \
+    github.com/cert-manager/cert-manager/internal/apis/config/shared/v1alpha1 \
+    github.com/cert-manager/cert-manager/pkg/apis/meta/v1 \
+    github.com/cert-manager/cert-manager/pkg/apis/config/shared/v1alpha1 \
+  )
+  DEFAULT_PKGS=( "${defaulter_inputs[@]/#/$module_name/}" )
+
   "$defaultergen" \
-    ${VERIFY_FLAGS} \
-    --go-header-file hack/boilerplate/boilerplate.generatego.txt \
-    --input-dirs "$joined" \
-    --trim-path-prefix="$module_name" \
-    -O zz_generated.defaults \
-    --output-base ./
+    --go-header-file hack/boilerplate-go.txt \
+    --extra-peer-dirs "$( IFS=$','; echo "${DEFAULT_EXTRA_PEER_PKGS[*]}" )" \
+    --output-file zz_generated.defaults.go \
+    "${DEFAULT_PKGS[@]}"
 }
 
 gen-conversions() {
   clean internal/apis 'zz_generated.conversion.go'
   clean pkg/webhook/handlers/testdata/apis 'zz_generated.conversion.go'
-  echo "+++ ${VERB} conversion functions..." >&2
+  echo "+++ Generating conversion functions..." >&2
 
   CONVERSION_EXTRA_PEER_PKGS=(
     github.com/cert-manager/cert-manager/internal/apis/meta \
     github.com/cert-manager/cert-manager/internal/apis/meta/v1 \
-    github.com/cert-manager/cert-manager/pkg/apis/meta/v1
+    github.com/cert-manager/cert-manager/internal/apis/config/shared \
+    github.com/cert-manager/cert-manager/internal/apis/config/shared/v1alpha1 \
+    github.com/cert-manager/cert-manager/pkg/apis/meta/v1 \
+    github.com/cert-manager/cert-manager/pkg/apis/config/shared/v1alpha1 \
   )
   CONVERSION_PKGS=( "${conversion_inputs[@]/#/$module_name/}" )
 
   "$conversiongen" \
-      ${VERIFY_FLAGS} \
-      --go-header-file hack/boilerplate/boilerplate.generatego.txt \
-      --extra-peer-dirs $( IFS=$','; echo "${CONVERSION_EXTRA_PEER_PKGS[*]}" ) \
-      --extra-dirs $( IFS=$','; echo "${CONVERSION_PKGS[*]}" ) \
-      --input-dirs $( IFS=$','; echo "${CONVERSION_PKGS[*]}" ) \
-      --trim-path-prefix="$module_name" \
-      -O zz_generated.conversion \
-      --output-base ./
+      --go-header-file hack/boilerplate-go.txt \
+      --extra-peer-dirs "$( IFS=$','; echo "${CONVERSION_EXTRA_PEER_PKGS[*]}" )" \
+      --output-file zz_generated.conversion.go \
+      "${CONVERSION_PKGS[@]}"
 }
 
+gen-openapi-acme
+gen-openapi-client
 gen-deepcopy
+gen-applyconfigurations
 gen-clientsets
 gen-listers
 gen-informers

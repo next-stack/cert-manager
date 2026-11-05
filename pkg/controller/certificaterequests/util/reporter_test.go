@@ -18,17 +18,18 @@ package util
 
 import (
 	"errors"
-	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
 
+	"github.com/cert-manager/cert-manager/internal/test/testutil"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	controllertest "github.com/cert-manager/cert-manager/pkg/controller/test"
-	"github.com/cert-manager/cert-manager/pkg/util"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
 
@@ -239,6 +240,7 @@ func TestReporter(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fixedClock.SetTime(fixedClockStart)
 			apiutil.Clock = fixedClock
+			t.Cleanup(func() { apiutil.Clock = clock.RealClock{} })
 			test.runTest(t)
 		})
 	}
@@ -263,14 +265,11 @@ func (tt *reporterT) runTest(t *testing.T) {
 		reporter.Ready(tt.certificateRequest)
 	}
 
-	expConditions := conditionsToString(tt.expectedConditions)
-	gotConditions := conditionsToString(tt.certificateRequest.Status.Conditions)
-	if expConditions != gotConditions {
-		t.Errorf("got unexpected conditions response exp=%+v got=%+v",
-			expConditions, gotConditions)
+	if diffErr := testutil.Diff(tt.expectedConditions, tt.certificateRequest.Status.Conditions); diffErr != nil {
+		t.Errorf("got unexpected conditions response: %v", diffErr)
 	}
 
-	if !util.EqualSorted(tt.expectedEvents, recorder.Events) {
+	if !slices.Equal(tt.expectedEvents, recorder.Events) {
 		t.Errorf("got unexpected events, exp=%+v got=%+v",
 			tt.expectedEvents, recorder.Events)
 	}
@@ -289,8 +288,4 @@ func (tt *reporterT) runTest(t *testing.T) {
 				tt.certificateRequest.Status.FailureTime.String())
 		}
 	}
-}
-
-func conditionsToString(conds []cmapi.CertificateRequestCondition) string {
-	return fmt.Sprintf("%+v", conds)
 }

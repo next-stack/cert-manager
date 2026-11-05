@@ -19,14 +19,14 @@ package admission_test
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/cert-manager/cert-manager/pkg/webhook/admission"
-	v1 "github.com/cert-manager/cert-manager/pkg/webhook/handlers/testdata/apis/testgroup/v1"
 )
 
 func TestChainHandles(t *testing.T) {
@@ -82,22 +82,21 @@ func TestChainValidate(t *testing.T) {
 		},
 		mutatingImplementation{
 			handles: handles(true).Handles,
-			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj runtime.Object) error {
+			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj *unstructured.Unstructured) error {
 				t.Errorf("mutate function was unexpectedly called during a validate call")
 				return fmt.Errorf("unexpected error")
 			},
 		},
 	})
-	warnings, err := pc.Validate(context.Background(), admissionv1.AdmissionRequest{}, nil, nil)
+	warnings, err := pc.Validate(t.Context(), admissionv1.AdmissionRequest{}, nil, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	if !validateCalled {
 		t.Errorf("validation function was not called")
 	}
-	if !reflect.DeepEqual(warnings, []string{"warning1", "warning2", "warning5"}) {
-		t.Errorf("got unexpected list of warnings: %v", warnings)
-	}
+	assert.Equal(t, []string{"warning1", "warning2", "warning5"},
+		warnings, "got unexpected list of warnings")
 }
 
 func TestChainValidate_Fails(t *testing.T) {
@@ -117,13 +116,12 @@ func TestChainValidate_Fails(t *testing.T) {
 			},
 		},
 	})
-	warnings, err := pc.Validate(context.Background(), admissionv1.AdmissionRequest{}, nil, nil)
+	warnings, err := pc.Validate(t.Context(), admissionv1.AdmissionRequest{}, nil, nil)
 	if err == nil {
 		t.Errorf("didn't get an error when one was expected")
 	}
-	if !reflect.DeepEqual(warnings, []string{"warning1", "warning2", "warning5"}) {
-		t.Errorf("got unexpected list of warnings: %v", warnings)
-	}
+	assert.Equal(t, []string{"warning1", "warning2", "warning5"},
+		warnings, "got unexpected list of warnings")
 }
 
 func TestChainMutate(t *testing.T) {
@@ -131,32 +129,29 @@ func TestChainMutate(t *testing.T) {
 		// this handler should be called
 		mutatingImplementation{
 			handles: handles(true).Handles,
-			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj runtime.Object) error {
-				tt := obj.(*v1.TestType)
-				tt.TestField = "testvalue"
-				return nil
+			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj *unstructured.Unstructured) error {
+				return unstructured.SetNestedField(obj.Object, "testvalue", "testField1")
 			},
 		},
 		// this handler should not be called
 		mutatingImplementation{
 			handles: handles(false).Handles,
-			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj runtime.Object) error {
-				tt := obj.(*v1.TestType)
-				tt.TestFieldImmutable = "hopefully-not-set"
-				return nil
+			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj *unstructured.Unstructured) error {
+				return unstructured.SetNestedField(obj.Object, "hopefully-not-set", "testField2")
 			},
 		},
 	})
-	tt := &v1.TestType{}
-	err := pc.Mutate(context.Background(), admissionv1.AdmissionRequest{}, tt)
+	tt := &unstructured.Unstructured{Object: map[string]any{}}
+	err := pc.Mutate(t.Context(), admissionv1.AdmissionRequest{}, tt)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if tt.TestField != "testvalue" {
-		t.Errorf("expected tt.TestField=testvalue but got %q", tt.TestField)
+
+	if val, ok, err := unstructured.NestedString(tt.Object, "testField1"); err != nil || !ok || val != "testvalue" {
+		t.Errorf("expected tt.testField1=testvalue but got %q", tt.Object)
 	}
-	if tt.TestFieldImmutable != "" {
-		t.Errorf("expected tt.TestFieldImmutable to not be set, but got %q", tt.TestFieldImmutable)
+	if val, ok, err := unstructured.NestedString(tt.Object, "testField2"); err != nil || ok || val != "" {
+		t.Errorf("expected tt.testField2 to not be set, but got %q", tt.Object)
 	}
 }
 
@@ -165,13 +160,12 @@ func TestChainMutate_Fails(t *testing.T) {
 		// this handler should be called and should error
 		mutatingImplementation{
 			handles: handles(true).Handles,
-			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj runtime.Object) error {
+			mutate: func(ctx context.Context, request admissionv1.AdmissionRequest, obj *unstructured.Unstructured) error {
 				return fmt.Errorf("error")
 			},
 		},
 	})
-	tt := &v1.TestType{}
-	err := pc.Mutate(context.Background(), admissionv1.AdmissionRequest{}, tt)
+	err := pc.Mutate(t.Context(), admissionv1.AdmissionRequest{}, &unstructured.Unstructured{Object: map[string]any{}})
 	if err == nil {
 		t.Errorf("expected error but got none")
 	}

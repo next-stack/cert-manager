@@ -23,7 +23,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
@@ -42,7 +41,7 @@ func Apply(ctx context.Context, cl cmclient.Interface, fieldManager string, req 
 
 	return cl.CertmanagerV1().CertificateRequests(req.Namespace).Patch(
 		ctx, req.Name, apitypes.ApplyPatchType, reqData,
-		metav1.PatchOptions{Force: pointer.Bool(true), FieldManager: fieldManager})
+		metav1.PatchOptions{Force: new(true), FieldManager: fieldManager})
 }
 
 // ApplyStatus will make an Apply API call with the given client to the
@@ -59,7 +58,7 @@ func ApplyStatus(ctx context.Context, cl cmclient.Interface, fieldManager string
 
 	_, err = cl.CertmanagerV1().CertificateRequests(req.Namespace).Patch(
 		ctx, req.Name, apitypes.ApplyPatchType, reqData,
-		metav1.PatchOptions{Force: pointer.Bool(true), FieldManager: fieldManager}, "status",
+		metav1.PatchOptions{Force: new(true), FieldManager: fieldManager}, "status",
 	)
 
 	return err
@@ -73,7 +72,8 @@ func ApplyStatus(ctx context.Context, cl cmclient.Interface, fieldManager string
 // API call for the cert-manager client.
 func serializeApply(req *cmapi.CertificateRequest) ([]byte, error) {
 	req = &cmapi.CertificateRequest{
-		TypeMeta:   metav1.TypeMeta{Kind: cmapi.CertificateRequestKind, APIVersion: cmapi.SchemeGroupVersion.Identifier()},
+		Kind:       cmapi.CertificateRequestKind,
+		APIVersion: cmapi.SchemeGroupVersion.Identifier(),
 		ObjectMeta: *req.ObjectMeta.DeepCopy(),
 		Spec:       *req.Spec.DeepCopy(),
 		Status:     cmapi.CertificateRequestStatus{},
@@ -97,8 +97,10 @@ func serializeApply(req *cmapi.CertificateRequest) ([]byte, error) {
 // API call for the cert-manager client.
 func serializeApplyStatus(req *cmapi.CertificateRequest) ([]byte, error) {
 	req = &cmapi.CertificateRequest{
-		TypeMeta:   metav1.TypeMeta{Kind: cmapi.CertificateRequestKind, APIVersion: cmapi.SchemeGroupVersion.Identifier()},
-		ObjectMeta: metav1.ObjectMeta{Namespace: req.Namespace, Name: req.Name},
+		Kind:       cmapi.CertificateRequestKind,
+		APIVersion: cmapi.SchemeGroupVersion.Identifier(),
+		Namespace:  req.Namespace,
+		Name:       req.Name,
 		Spec:       cmapi.CertificateRequestSpec{},
 		Status:     *req.Status.DeepCopy(),
 	}

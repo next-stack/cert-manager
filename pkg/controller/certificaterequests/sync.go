@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/kr/pretty"
+	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
@@ -63,6 +63,12 @@ func (c *Controller) Sync(ctx context.Context, cr *cmapi.CertificateRequest) (er
 		return nil
 	}
 
+	// If CertificateRequest is invalid, do not process it
+	if apiutil.CertificateRequestHasInvalidRequest(cr) {
+		dbg.Info("certificate request is invalid and will not be further processed")
+		return nil
+	}
+
 	// If CertificateRequest has not been approved, exit early.
 	if !apiutil.CertificateRequestIsApproved(cr) {
 		dbg.Info("certificate request has not been approved")
@@ -73,11 +79,11 @@ func (c *Controller) Sync(ctx context.Context, cr *cmapi.CertificateRequest) (er
 	switch apiutil.CertificateRequestReadyReason(cr) {
 	case cmapi.CertificateRequestReasonFailed:
 		dbg.Info("certificate request Ready condition failed so skipping processing")
-		return
+		return nil
 
 	case cmapi.CertificateRequestReasonIssued:
 		dbg.Info("certificate request Ready condition true so skipping processing")
-		return
+		return nil
 	}
 
 	dbg.Info("fetching issuer object referenced by CertificateRequest")
@@ -152,7 +158,11 @@ func (c *Controller) Sync(ctx context.Context, cr *cmapi.CertificateRequest) (er
 	// invalid cert
 	_, err = pki.DecodeX509CertificateBytes(crCopy.Status.Certificate)
 	if err != nil {
-		c.reporter.Failed(crCopy, err, "DecodeError", "Failed to decode returned certificate")
+		message := "Failed to decode returned certificate"
+		if issuerType == apiutil.IssuerCA {
+			message = "Failed to decode returned certificate: with CA issuers, ensure the Certificate's secretName is different from the CA issuer's secretName to avoid overwriting the CA secret"
+		}
+		c.reporter.Failed(crCopy, err, "DecodeError", message)
 		return nil
 	}
 
@@ -162,21 +172,21 @@ func (c *Controller) Sync(ctx context.Context, cr *cmapi.CertificateRequest) (er
 	return nil
 }
 
-func (c *Controller) updateCertificateRequestStatusAndAnnotations(ctx context.Context, old, new *cmapi.CertificateRequest) error {
+func (c *Controller) updateCertificateRequestStatusAndAnnotations(ctx context.Context, oldCR, newCR *cmapi.CertificateRequest) error {
 	log := logf.FromContext(ctx, "updateStatus")
 
 	// if annotations changed we have to call .Update() and not .UpdateStatus()
-	if !reflect.DeepEqual(old.Annotations, new.Annotations) {
-		log.V(logf.DebugLevel).Info("updating resource due to change in annotations", "diff", pretty.Diff(old.Annotations, new.Annotations))
-		return c.updateOrApply(ctx, new)
+	if !reflect.DeepEqual(oldCR.Annotations, newCR.Annotations) {
+		log.V(logf.DebugLevel).Info("updating resource due to change in annotations", "diff", cmp.Diff(oldCR.Annotations, newCR.Annotations))
+		return c.updateOrApply(ctx, newCR)
 	}
 
-	if apiequality.Semantic.DeepEqual(old.Status, new.Status) {
+	if apiequality.Semantic.DeepEqual(oldCR.Status, newCR.Status) {
 		return nil
 	}
 
-	log.V(logf.DebugLevel).Info("updating resource due to change in status", "diff", pretty.Diff(old.Status, new.Status))
-	return c.updateStatusOrApply(ctx, new)
+	log.V(logf.DebugLevel).Info("updating resource due to change in status", "diff", cmp.Diff(oldCR.Status, newCR.Status))
+	return c.updateStatusOrApply(ctx, newCR)
 }
 
 func (c *Controller) updateOrApply(ctx context.Context, cr *cmapi.CertificateRequest) error {

@@ -17,19 +17,16 @@ limitations under the License.
 package acme
 
 import (
-	"context"
 	"crypto"
-	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"math/big"
-	"net"
-	"reflect"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	coretesting "k8s.io/client-go/testing"
@@ -38,8 +35,7 @@ import (
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	"github.com/cert-manager/cert-manager/pkg/apis/certmanager"
-	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmapiv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	cmacmelisters "github.com/cert-manager/cert-manager/pkg/client/listers/acme/v1"
 	"github.com/cert-manager/cert-manager/pkg/controller"
@@ -48,6 +44,7 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 	testlisters "github.com/cert-manager/cert-manager/test/unit/listers"
+	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
 )
 
 var (
@@ -56,49 +53,26 @@ var (
 )
 
 func generateCSR(t *testing.T, secretKey crypto.Signer, commonName string, dnsNames ...string) []byte {
-	// The CommonName of the certificate request must also be present in the DNS
-	// Names.
-	template := x509.CertificateRequest{
-		Subject: pkix.Name{
-			CommonName: commonName,
-		},
-		SignatureAlgorithm: x509.SHA256WithRSA,
-		DNSNames:           dnsNames,
-	}
-
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, secretKey)
+	csr, err := gen.CSRWithSigner(secretKey,
+		gen.SetCSRCommonName(commonName),
+		gen.SetCSRDNSNames(dnsNames...),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	csr := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
 
 	return csr
 }
 
 func generateCSRWithIPs(t *testing.T, secretKey crypto.Signer, commonName string, dnsNames []string, ips []string) []byte {
-	// The CommonName of the certificate request must also be present in the DNS
-	// Names.
-
-	var certIPs []net.IP
-	for _, ip := range ips {
-		certIPs = append(certIPs, net.ParseIP(ip))
-	}
-	template := x509.CertificateRequest{
-		Subject: pkix.Name{
-			CommonName: commonName,
-		},
-		SignatureAlgorithm: x509.SHA256WithRSA,
-		DNSNames:           dnsNames,
-		IPAddresses:        certIPs,
-	}
-
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, secretKey)
+	csr, err := gen.CSRWithSigner(secretKey,
+		gen.SetCSRCommonName(commonName),
+		gen.SetCSRDNSNames(dnsNames...),
+		gen.SetCSRIPAddressesFromStrings(ips...),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	csr := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
 
 	return csr
 }
@@ -107,8 +81,8 @@ func TestSign(t *testing.T) {
 	metaFixedClockStart := metav1.NewTime(fixedClockStart)
 	baseIssuer := gen.Issuer("test-issuer",
 		gen.SetIssuerACME(cmacme.ACMEIssuer{}),
-		gen.AddIssuerCondition(cmapi.IssuerCondition{
-			Type:   cmapi.IssuerConditionReady,
+		gen.AddIssuerCondition(cmapiv1.IssuerCondition{
+			Type:   cmapiv1.IssuerConditionReady,
 			Status: cmmeta.ConditionTrue,
 		}),
 	)
@@ -119,7 +93,6 @@ func TestSign(t *testing.T) {
 	}
 
 	rootTmpl := &x509.Certificate{
-		Version:               2,
 		BasicConstraintsValid: true,
 		SerialNumber:          big.NewInt(0),
 		Subject: pkix.Name{
@@ -149,15 +122,15 @@ func TestSign(t *testing.T) {
 		gen.SetCertificateRequestCSR(csrPEM),
 		gen.SetCertificateRequestIsCA(false),
 		gen.SetCertificateRequestDuration(&metav1.Duration{Duration: time.Hour * 24 * 60}),
-		gen.SetCertificateRequestIssuer(cmmeta.ObjectReference{
+		gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{
 			Name:  baseIssuer.Name,
 			Group: certmanager.GroupName,
 			Kind:  "Issuer",
 		}),
 	)
 	baseCRDenied := gen.CertificateRequestFrom(baseCRNotApproved,
-		gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-			Type:               cmapi.CertificateRequestConditionDenied,
+		gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+			Type:               cmapiv1.CertificateRequestConditionDenied,
 			Status:             cmmeta.ConditionTrue,
 			Reason:             "Foo",
 			Message:            "Certificate request has been denied by cert-manager.io",
@@ -165,8 +138,8 @@ func TestSign(t *testing.T) {
 		}),
 	)
 	baseCR := gen.CertificateRequestFrom(baseCRNotApproved,
-		gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-			Type:               cmapi.CertificateRequestConditionApproved,
+		gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+			Type:               cmapiv1.CertificateRequestConditionApproved,
 			Status:             cmmeta.ConditionTrue,
 			Reason:             "cert-manager.io",
 			Message:            "Certificate request has been approved by cert-manager.io",
@@ -179,7 +152,7 @@ func TestSign(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	template, err := pki.GenerateTemplateFromCertificateRequest(baseCR)
+	template, err := pki.CertificateTemplateFromCertificateRequest(baseCR)
 	if err != nil {
 		t.Errorf("error generating template: %v", err)
 	}
@@ -195,7 +168,12 @@ func TestSign(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	template2, err := pki.GenerateTemplateFromCSRPEM(generateCSR(t, sk2, "example.com", "example.com", "foo.com"), time.Hour, false)
+	template2, err := pki.CertificateTemplateFromCSRPEM(
+		generateCSR(t, sk2, "example.com", "example.com", "foo.com"),
+		pki.CertificateTemplateOverrideDuration(time.Hour),
+		pki.CertificateTemplateValidateAndOverrideBasicConstraints(false, nil),
+		pki.CertificateTemplateValidateAndOverrideKeyUsages(0, nil),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,12 +188,12 @@ func TestSign(t *testing.T) {
 		t.Fatal(err)
 	}
 	ipBaseCR := gen.CertificateRequestFrom(baseCR, gen.SetCertificateRequestCSR(ipCSRPEM))
-	ipBaseOrder, err := buildOrder(ipBaseCR, ipCSR, baseIssuer.GetSpec().ACME.EnableDurationFeature)
+	ipBaseOrder, err := buildOrder(ipBaseCR, ipCSR, baseIssuer.GetSpec().ACME.EnableDurationFeature, "", "")
 	if err != nil {
 		t.Fatalf("failed to build order during testing: %s", err)
 	}
 
-	baseOrder, err := buildOrder(baseCR, csr, baseIssuer.GetSpec().ACME.EnableDurationFeature)
+	baseOrder, err := buildOrder(baseCR, csr, baseIssuer.GetSpec().ACME.EnableDurationFeature, "", "")
 	if err != nil {
 		t.Fatalf("failed to build order during testing: %s", err)
 	}
@@ -239,12 +217,12 @@ func TestSign(t *testing.T) {
 				ExpectedEvents:     []string{},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCRDenied,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
 								Reason:             "Denied",
 								Message:            "The CertificateRequest was denied by an approval controller",
@@ -264,20 +242,20 @@ func TestSign(t *testing.T) {
 				KubeObjects:        []runtime.Object{},
 				CertManagerObjects: []runtime.Object{baseCR.DeepCopy(), baseIssuer.DeepCopy()},
 				ExpectedEvents: []string{
-					"Warning RequestParsingError Failed to decode CSR in spec.request: error decoding certificate request PEM block",
+					"Warning RequestParsingError Failed to decode CSR in spec.request: error decoding certificate request PEM block: no PEM data was found in given input",
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
 							gen.SetCertificateRequestCSR([]byte("a bad csr")),
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonFailed,
-								Message:            "Failed to decode CSR in spec.request: error decoding certificate request PEM block",
+								Reason:             cmapiv1.CertificateRequestReasonFailed,
+								Message:            "Failed to decode CSR in spec.request: error decoding certificate request PEM block: no PEM data was found in given input",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
 							gen.SetCertificateRequestFailureTime(metaFixedClockStart),
@@ -297,15 +275,15 @@ func TestSign(t *testing.T) {
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
 							gen.SetCertificateRequestCSR(csrPEMExampleNotPresent),
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonFailed,
+								Reason:             cmapiv1.CertificateRequestReasonFailed,
 								Message:            `The CSR PEM requests a commonName that is not present in the list of dnsNames or ipAddresses. If a commonName is set, ACME requires that the value is also present in the list of dnsNames or ipAddresses: "example.com" does not exist in [foo.com] or []`,
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -327,15 +305,15 @@ func TestSign(t *testing.T) {
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
 							gen.SetCertificateRequestCSR(generateCSR(t, sk, "10.0.0.1", "example.com")),
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonFailed,
+								Reason:             cmapiv1.CertificateRequestReasonFailed,
 								Message:            `The CSR PEM requests a commonName that is not present in the list of dnsNames or ipAddresses. If a commonName is set, ACME requires that the value is also present in the list of dnsNames or ipAddresses: "10.0.0.1" does not exist in [example.com] or []`,
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -356,21 +334,22 @@ func TestSign(t *testing.T) {
 					"Normal OrderCreated Created Order resource default-unit-test-ns/test-cr-3104426127",
 				},
 				ExpectedActions: []testpkg.Action{
-					testpkg.NewAction(coretesting.NewCreateAction(
+					testpkg.NewAction(coretesting.NewCreateActionWithOptions(
 						cmacme.SchemeGroupVersion.WithResource("orders"),
 						gen.DefaultTestNamespace,
 						ipBaseOrder,
+						metav1.CreateOptions{FieldManager: testpkg.FieldManager},
 					)),
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(ipBaseCR,
 							gen.SetCertificateRequestCSR(ipCSRPEM),
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonPending,
+								Reason:             cmapiv1.CertificateRequestReasonPending,
 								Message:            "Created Order resource default-unit-test-ns/test-cr-3104426127",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -390,20 +369,21 @@ func TestSign(t *testing.T) {
 					"Normal OrderCreated Created Order resource default-unit-test-ns/test-cr-1733622556",
 				},
 				ExpectedActions: []testpkg.Action{
-					testpkg.NewAction(coretesting.NewCreateAction(
+					testpkg.NewAction(coretesting.NewCreateActionWithOptions(
 						cmacme.SchemeGroupVersion.WithResource("orders"),
 						gen.DefaultTestNamespace,
 						baseOrder,
+						metav1.CreateOptions{FieldManager: testpkg.FieldManager},
 					)),
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonPending,
+								Reason:             cmapiv1.CertificateRequestReasonPending,
 								Message:            "Created Order resource default-unit-test-ns/test-cr-1733622556",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -425,12 +405,12 @@ func TestSign(t *testing.T) {
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
 								Reason:             "Pending",
 								Message:            "Referenced issuer does not have a Ready status condition",
@@ -451,14 +431,14 @@ func TestSign(t *testing.T) {
 				CertManagerObjects: []runtime.Object{baseCR.DeepCopy(), baseIssuer.DeepCopy()},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonPending,
+								Reason:             cmapiv1.CertificateRequestReasonPending,
 								Message:            "Failed to get order resource default-unit-test-ns/test-cr-1733622556: this is a network error",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -492,14 +472,14 @@ func TestSign(t *testing.T) {
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonFailed,
+								Reason:             cmapiv1.CertificateRequestReasonFailed,
 								Message:            `Failed to wait for order resource "test-cr-1733622556" to become ready: order is in "invalid" state: simulated failure`,
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -523,14 +503,14 @@ func TestSign(t *testing.T) {
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonPending,
+								Reason:             cmapiv1.CertificateRequestReasonPending,
 								Message:            `Waiting on certificate issuance from order default-unit-test-ns/test-cr-1733622556: "pending"`,
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -551,14 +531,14 @@ func TestSign(t *testing.T) {
 				), baseCR.DeepCopy(), baseIssuer.DeepCopy()},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
-								Reason:             cmapi.CertificateRequestReasonPending,
+								Reason:             cmapiv1.CertificateRequestReasonPending,
 								Message:            "Waiting for order-controller to add certificate data to Order default-unit-test-ns/test-cr-1733622556",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -614,14 +594,14 @@ func TestSign(t *testing.T) {
 				), baseCR.DeepCopy(), baseIssuer.DeepCopy()},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
-						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						cmapiv1.SchemeGroupVersion.WithResource("certificaterequests"),
 						"status",
 						gen.DefaultTestNamespace,
 						gen.CertificateRequestFrom(baseCR,
-							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
-								Type:               cmapi.CertificateRequestConditionReady,
+							gen.SetCertificateRequestStatusCondition(cmapiv1.CertificateRequestCondition{
+								Type:               cmapiv1.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionTrue,
-								Reason:             cmapi.CertificateRequestReasonIssued,
+								Reason:             cmapiv1.CertificateRequestReasonIssued,
 								Message:            "Certificate fetched from issuer successfully",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
@@ -644,7 +624,7 @@ func TestSign(t *testing.T) {
 
 type testT struct {
 	builder            *testpkg.Builder
-	certificateRequest *cmapi.CertificateRequest
+	certificateRequest *cmapiv1.CertificateRequest
 
 	expectedErr bool
 
@@ -671,7 +651,7 @@ func runTest(t *testing.T, test testT) {
 	}
 	test.builder.Start()
 
-	err = controller.Sync(context.Background(), test.certificateRequest)
+	err = controller.Sync(t.Context(), test.certificateRequest)
 	if err != nil && !test.expectedErr {
 		t.Errorf("expected to not get an error, but got: %v", err)
 	}
@@ -694,11 +674,22 @@ func Test_buildOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cr := gen.CertificateRequest("test", gen.SetCertificateRequestDuration(&metav1.Duration{Duration: time.Hour}), gen.SetCertificateRequestCSR(csrPEM))
+	cr := gen.CertificateRequest("test",
+		gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{Name: "test-issuer"}),
+		gen.SetCertificateRequestDuration(&metav1.Duration{Duration: time.Hour}),
+		gen.SetCertificateRequestCSR(csrPEM))
+	baseOrder := gen.Order("",
+		gen.SetOrderCsr(csrPEM),
+		gen.SetOrderCommonName("example.com"),
+		gen.SetOrderDNSNames("example.com"),
+		gen.SetOrderIssuer(cmmeta.IssuerReference{Name: "test-issuer"}))
+
 	type args struct {
-		cr                    *v1.CertificateRequest
+		cr                    *cmapiv1.CertificateRequest
 		csr                   *x509.CertificateRequest
 		enableDurationFeature bool
+		profile               string
+		replaces              string
 	}
 	tests := []struct {
 		name    string
@@ -713,13 +704,7 @@ func Test_buildOrder(t *testing.T) {
 				csr:                   csr,
 				enableDurationFeature: false,
 			},
-			want: &cmacme.Order{
-				Spec: cmacme.OrderSpec{
-					Request:    csrPEM,
-					CommonName: "example.com",
-					DNSNames:   []string{"example.com"},
-				},
-			},
+			want:    baseOrder,
 			wantErr: false,
 		},
 		{
@@ -729,29 +714,43 @@ func Test_buildOrder(t *testing.T) {
 				csr:                   csr,
 				enableDurationFeature: true,
 			},
-			want: &cmacme.Order{
-				Spec: cmacme.OrderSpec{
-					Request:    csrPEM,
-					CommonName: "example.com",
-					DNSNames:   []string{"example.com"},
-					Duration:   &metav1.Duration{Duration: time.Hour},
-				},
+			want: gen.OrderFrom(baseOrder,
+				gen.SetOrderDuration(time.Hour)),
+			wantErr: false,
+		},
+		{
+			name: "Building with profile",
+			args: args{
+				cr:      cr,
+				csr:     csr,
+				profile: "shortlived",
 			},
+			want: gen.OrderFrom(baseOrder,
+				gen.SetOrderProfile("shortlived")),
+			wantErr: false,
+		},
+		{
+			name: "Building with replaces",
+			args: args{
+				cr:       cr,
+				csr:      csr,
+				replaces: "wohgioegjewjg.wogjrpwojg",
+			},
+			want: gen.OrderFrom(baseOrder,
+				gen.SetOrderReplacesID("wohgioegjewjg.wogjrpwojg")),
 			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := buildOrder(tt.args.cr, tt.args.csr, tt.args.enableDurationFeature)
+			got, err := buildOrder(tt.args.cr, tt.args.csr, tt.args.enableDurationFeature, tt.args.profile, tt.args.replaces)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("buildOrder() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 
 			// for the current purpose we only test the spec
-			if !reflect.DeepEqual(got.Spec, tt.want.Spec) {
-				t.Errorf("buildOrder() got = %v, want %v", got.Spec, tt.want.Spec)
-			}
+			assert.Equal(t, tt.want.Spec, got.Spec)
 		})
 	}
 
@@ -759,7 +758,7 @@ func Test_buildOrder(t *testing.T) {
 		"test-comparison-that-is-at-the-fifty-two-character-l",
 		gen.SetCertificateRequestDuration(&metav1.Duration{Duration: time.Hour}),
 		gen.SetCertificateRequestCSR(csrPEM))
-	orderOne, err := buildOrder(longCrOne, csr, false)
+	orderOne, err := buildOrder(longCrOne, csr, false, "", "")
 	if err != nil {
 		t.Errorf("buildOrder() received error %v", err)
 		return
@@ -771,7 +770,7 @@ func Test_buildOrder(t *testing.T) {
 			gen.SetCertificateRequestDuration(&metav1.Duration{Duration: time.Hour}),
 			gen.SetCertificateRequestCSR(csrPEM))
 
-		orderTwo, err := buildOrder(longCrTwo, csr, false)
+		orderTwo, err := buildOrder(longCrTwo, csr, false, "", "")
 		if err != nil {
 			t.Errorf("buildOrder() received error %v", err)
 			return
@@ -786,13 +785,13 @@ func Test_buildOrder(t *testing.T) {
 	})
 
 	t.Run("Builds two orders from the same long CRs to guarantee same name", func(t *testing.T) {
-		orderOne, err := buildOrder(longCrOne, csr, false)
+		orderOne, err := buildOrder(longCrOne, csr, false, "", "")
 		if err != nil {
 			t.Errorf("buildOrder() received error %v", err)
 			return
 		}
 
-		orderTwo, err := buildOrder(longCrOne, csr, false)
+		orderTwo, err := buildOrder(longCrOne, csr, false, "", "")
 		if err != nil {
 			t.Errorf("buildOrder() received error %v", err)
 			return
@@ -804,4 +803,182 @@ func Test_buildOrder(t *testing.T) {
 				orderTwo.Name)
 		}
 	})
+}
+
+func Test_resolveReplacesCertID(t *testing.T) {
+	const (
+		certificateName = "test-cert"
+		secretName      = "test-cert-tls"
+	)
+
+	// A leaf signed by a CA. CreateCertificate derives a SubjectKeyId for IsCA
+	// templates and copies it to the leaf's AuthorityKeyId, which is what
+	// acmeapi.CertificateARIID requires.
+	rootPK, err := pki.GenerateECPrivateKey(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTmpl := &x509.Certificate{
+		BasicConstraintsValid: true,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "root"},
+		NotBefore:             fixedClockStart,
+		NotAfter:              fixedClockStart.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		PublicKey:             rootPK.Public(),
+		IsCA:                  true,
+	}
+	_, rootCert, err := pki.SignCertificate(rootTmpl, rootTmpl, rootPK.Public(), rootPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leafPK, err := pki.GenerateRSAPrivateKey(2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafCSRPEM := generateCSR(t, leafPK, "example.com", "example.com")
+	leafTmpl, err := pki.CertificateTemplateFromCSRPEM(
+		leafCSRPEM,
+		pki.CertificateTemplateOverrideDuration(time.Hour),
+		pki.CertificateTemplateValidateAndOverrideBasicConstraints(false, nil),
+		pki.CertificateTemplateValidateAndOverrideKeyUsages(0, nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafBundle, err := pki.SignCSRTemplate([]*x509.Certificate{rootCert}, rootPK, leafTmpl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := pki.DecodeX509CertificateBytes(leafBundle.ChainPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCertID, err := acmeapi.CertificateARIID(leaf)
+	if err != nil {
+		t.Fatalf("test fixture leaf has no usable ARI CertID: %v", err)
+	}
+
+	issuerRef := func(name, kind string) cmmeta.IssuerReference {
+		return cmmeta.IssuerReference{Name: name, Kind: kind, Group: certmanager.GroupName}
+	}
+	issuerAnnotations := func(name, kind string) map[string]string {
+		return map[string]string{
+			cmapiv1.IssuerNameAnnotationKey:  name,
+			cmapiv1.IssuerKindAnnotationKey:  kind,
+			cmapiv1.IssuerGroupAnnotationKey: certmanager.GroupName,
+		}
+	}
+	secretFor := func(annotations map[string]string, data map[string][]byte) *corev1.Secret {
+		s := gen.Secret(secretName, gen.SetSecretData(data))
+		if annotations != nil {
+			s = gen.SecretFrom(s, gen.SetSecretAnnotations(annotations))
+		}
+		return s
+	}
+
+	certificate := gen.Certificate(certificateName,
+		gen.SetCertificateSecretName(secretName),
+	)
+	validData := map[string][]byte{corev1.TLSCertKey: leafBundle.ChainPEM}
+	crAnnotations := map[string]string{cmapiv1.CertificateNameKey: certificateName}
+
+	tests := map[string]struct {
+		crIssuerRef   cmmeta.IssuerReference
+		crAnnotations map[string]string
+		certificate   *cmapiv1.Certificate
+		secret        *corev1.Secret
+		want          string
+	}{
+		"returns the CertID when the Secret was issued by the same issuer": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			certificate:   certificate,
+			secret:        secretFor(issuerAnnotations("letsencrypt", "ClusterIssuer"), validData),
+			want:          wantCertID,
+		},
+		"returns empty when the Secret was issued by a different issuer name": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			certificate:   certificate,
+			secret:        secretFor(issuerAnnotations("digicert-acme", "ClusterIssuer"), validData),
+			want:          "",
+		},
+		"returns empty when the Secret was issued by a different issuer kind": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			certificate:   certificate,
+			secret:        secretFor(issuerAnnotations("letsencrypt", "Issuer"), validData),
+			want:          "",
+		},
+		"returns empty when the CertificateRequest has no certificate-name annotation": {
+			crIssuerRef: issuerRef("letsencrypt", "ClusterIssuer"),
+			certificate: certificate,
+			secret:      secretFor(issuerAnnotations("letsencrypt", "ClusterIssuer"), validData),
+			want:        "",
+		},
+		"returns empty when the parent Certificate does not exist": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			secret:        secretFor(issuerAnnotations("letsencrypt", "ClusterIssuer"), validData),
+			want:          "",
+		},
+		"returns empty when the Secret does not exist": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			certificate:   certificate,
+			want:          "",
+		},
+		"returns empty when the Secret has no tls.crt": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			certificate:   certificate,
+			secret: secretFor(issuerAnnotations("letsencrypt", "ClusterIssuer"),
+				map[string][]byte{corev1.TLSPrivateKeyKey: []byte("key")}),
+			want: "",
+		},
+		"returns empty when tls.crt cannot be decoded": {
+			crIssuerRef:   issuerRef("letsencrypt", "ClusterIssuer"),
+			crAnnotations: crAnnotations,
+			certificate:   certificate,
+			secret: secretFor(issuerAnnotations("letsencrypt", "ClusterIssuer"),
+				map[string][]byte{corev1.TLSCertKey: []byte("not a certificate")}),
+			want: "",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			var kubeObjects []runtime.Object
+			if test.secret != nil {
+				kubeObjects = append(kubeObjects, test.secret)
+			}
+			var cmObjects []runtime.Object
+			if test.certificate != nil {
+				cmObjects = append(cmObjects, test.certificate)
+			}
+
+			builder := &testpkg.Builder{
+				T:                  t,
+				KubeObjects:        kubeObjects,
+				CertManagerObjects: cmObjects,
+			}
+			builder.Init()
+			defer builder.Stop()
+
+			// NewACME must run before Start so the informers it requests from
+			// the shared factories are actually started and synced.
+			a := NewACME(builder.Context).(*ACME)
+			builder.Start()
+
+			cr := gen.CertificateRequest("test-cr",
+				gen.SetCertificateRequestCSR(leafCSRPEM),
+				gen.SetCertificateRequestIssuer(test.crIssuerRef),
+				gen.SetCertificateRequestAnnotations(test.crAnnotations),
+			)
+
+			assert.Equal(t, test.want, a.resolveReplacesCertID(t.Context(), cr))
+		})
+	}
 }

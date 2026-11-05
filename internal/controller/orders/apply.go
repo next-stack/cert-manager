@@ -23,13 +23,12 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
 
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
 )
 
-// ApplyStatus will make a Apply API call with the given client to the order's
+// ApplyStatus will make an Apply API call with the given client to the order's
 // status sub-resource endpoint. All data in the given Order object is dropped;
 // expect for the name, namespace, and status object. The given fieldManager is
 // will be used as the FieldManager in the Apply call.
@@ -42,7 +41,7 @@ func ApplyStatus(ctx context.Context, cl cmclient.Interface, fieldManager string
 
 	_, err = cl.AcmeV1().Orders(order.Namespace).Patch(
 		ctx, order.Name, apitypes.ApplyPatchType, orderData,
-		metav1.PatchOptions{Force: pointer.Bool(true), FieldManager: fieldManager}, "status",
+		metav1.PatchOptions{Force: new(true), FieldManager: fieldManager}, "status",
 	)
 
 	return err
@@ -55,8 +54,10 @@ func ApplyStatus(ctx context.Context, cl cmclient.Interface, fieldManager string
 // "acme.cert-manager.io/v1" respectively.
 func serializeApplyStatus(order *cmacme.Order) ([]byte, error) {
 	order = &cmacme.Order{
-		TypeMeta:   metav1.TypeMeta{Kind: cmacme.OrderKind, APIVersion: cmacme.SchemeGroupVersion.Identifier()},
-		ObjectMeta: metav1.ObjectMeta{Namespace: order.Namespace, Name: order.Name},
+		Kind:       cmacme.OrderKind,
+		APIVersion: cmacme.SchemeGroupVersion.Identifier(),
+		Namespace:  order.Namespace,
+		Name:       order.Name,
 		Status:     order.Status,
 	}
 	orderData, err := json.Marshal(order)

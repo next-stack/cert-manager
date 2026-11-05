@@ -25,34 +25,55 @@ import (
 	"os"
 	"time"
 
+	config "github.com/cert-manager/cert-manager/internal/apis/config/controller"
+	"github.com/cert-manager/cert-manager/internal/apis/config/shared"
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	"github.com/cert-manager/cert-manager/internal/pem"
+	"github.com/cert-manager/cert-manager/pkg/controller"
+	clusterissuerscontroller "github.com/cert-manager/cert-manager/pkg/controller/clusterissuers"
+	"github.com/cert-manager/cert-manager/pkg/healthz"
+	dnsutil "github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
+	logf "github.com/cert-manager/cert-manager/pkg/logs"
+	"github.com/cert-manager/cert-manager/pkg/server"
+	"github.com/cert-manager/cert-manager/pkg/server/tls"
+	"github.com/cert-manager/cert-manager/pkg/server/tls/authority"
+	"github.com/cert-manager/cert-manager/pkg/util"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
+	"github.com/cert-manager/cert-manager/pkg/util/profiling"
+	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/api/resource"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/utils/clock"
 
-	"github.com/cert-manager/cert-manager/cmd/controller/app/options"
-	cmdutil "github.com/cert-manager/cert-manager/cmd/util"
-	"github.com/cert-manager/cert-manager/internal/controller/feature"
-	"github.com/cert-manager/cert-manager/pkg/acme/accounts"
-	"github.com/cert-manager/cert-manager/pkg/controller"
-	"github.com/cert-manager/cert-manager/pkg/controller/clusterissuers"
-	dnsutil "github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
-	logf "github.com/cert-manager/cert-manager/pkg/logs"
-	"github.com/cert-manager/cert-manager/pkg/metrics"
-	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
-	"github.com/cert-manager/cert-manager/pkg/util/profiling"
+	"github.com/cert-manager/cert-manager/controller-binary/app/options"
 )
 
-func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
-	rootCtx, cancelContext := context.WithCancel(cmdutil.ContextWithStopCh(context.Background(), stopCh))
+const (
+	// This is intended to mitigate "slowloris" attacks by limiting the time a
+	// deliberately slow client can spend sending HTTP headers.
+	// This default value is copied from:
+	// * kubernetes api-server:
+	//   https://github.com/kubernetes/kubernetes/blob/9e028b40b9e970142191259effe796b3dab39828/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go#L165-L173
+	// * controller-runtime:
+	//   https://github.com/kubernetes-sigs/controller-runtime/blob/1ea2be573f7887a9fbd766e9a921c5af344da6eb/pkg/internal/httpserver/server.go#L14
+	defaultReadHeaderTimeout = 32 * time.Second
+)
+
+func Run(rootCtx context.Context, opts *config.ControllerConfiguration) error {
+	rootCtx, cancelContext := context.WithCancel(rootCtx)
 	defer cancelContext()
-	rootCtx = logf.NewContext(rootCtx, logf.Log, "controller")
+
 	log := logf.FromContext(rootCtx)
 	g, rootCtx := errgroup.WithContext(rootCtx)
+
+	versionInfo := util.VersionInfo()
+	log.Info("starting cert-manager controller", "version", versionInfo.GitVersion, "git_commit", versionInfo.GitCommit, "go_version", versionInfo.GoVersion, "platform", versionInfo.Platform)
 
 	ctxFactory, err := buildControllerContextFactory(rootCtx, opts)
 	if err != nil {
@@ -66,26 +87,54 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 		return err
 	}
 
-	enabledControllers := opts.EnabledControllers()
-	log.Info(fmt.Sprintf("enabled controllers: %s", enabledControllers.List()))
+	// Configure PEM size limits from controller configuration
+	if err := configurePEMSizeLimits(opts, log); err != nil {
+		return fmt.Errorf("failed to configure PEM size limits: %w", err)
+	}
+
+	enabledControllers := options.EnabledControllers(opts)
+	log.Info(fmt.Sprintf("enabled controllers: %s", sets.List(enabledControllers)))
+
+	// start the CertificateSource if provided
+	certificateSource := buildCertificateSource(log, opts.MetricsTLSConfig, ctx.RESTConfig)
+	if certificateSource != nil {
+		log.V(logf.InfoLevel).Info("listening for secure connections", "address", opts.MetricsListenAddress)
+		g.Go(func() error {
+			if err := certificateSource.Start(rootCtx); (err != nil) && !errors.Is(err, context.Canceled) {
+				return err
+			}
+			return nil
+		})
+	} else {
+		log.V(logf.InfoLevel).Info("listening for insecure connections", "address", opts.MetricsListenAddress)
+	}
 
 	// Start metrics server
-	metricsLn, err := net.Listen("tcp", opts.MetricsListenAddress)
+	metricsLn, err := server.Listen(rootCtx, "tcp", opts.MetricsListenAddress,
+		server.WithCertificateSource(certificateSource),
+		server.WithTLSCipherSuites(opts.MetricsTLSConfig.CipherSuites),
+		server.WithTLSMinVersion(opts.MetricsTLSConfig.MinTLSVersion),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to listen on prometheus address %s: %v", opts.MetricsListenAddress, err)
+	}
+
+	ctx.Metrics.SetupACMECollector(ctx.SharedInformerFactory.Acme().V1().Challenges().Lister())
+	ctx.Metrics.SetupCertificateCollector(ctx.SharedInformerFactory.Certmanager().V1().Certificates().Lister())
+	ctx.Metrics.SetupIssuerCollector(ctx.SharedInformerFactory.Certmanager().V1().Issuers().Lister())
+	if enabledControllers.Has(clusterissuerscontroller.ControllerName) {
+		ctx.Metrics.SetupClusterIssuerCollector(ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Lister())
 	}
 	metricsServer := ctx.Metrics.NewServer(metricsLn)
 
 	g.Go(func() error {
 		<-rootCtx.Done()
 		// allow a timeout for graceful shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		if err := metricsServer.Shutdown(ctx); err != nil {
-			return err
-		}
-		return nil
+		//nolint: contextcheck
+		return metricsServer.Shutdown(shutdownCtx)
 	})
 	g.Go(func() error {
 		log.V(logf.InfoLevel).Info("starting metrics server", "address", metricsLn.Addr())
@@ -97,7 +146,8 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 
 	// Start profiler if it is enabled
 	if opts.EnablePprof {
-		profilerLn, err := net.Listen("tcp", opts.PprofAddress)
+		lc := net.ListenConfig{}
+		profilerLn, err := lc.Listen(rootCtx, "tcp", opts.PprofAddress)
 		if err != nil {
 			return fmt.Errorf("failed to listen on profiler address %s: %v", opts.PprofAddress, err)
 		}
@@ -105,19 +155,18 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 		// Add pprof endpoints to this mux
 		profiling.Install(profilerMux)
 		profilerServer := &http.Server{
-			Handler: profilerMux,
+			Handler:           profilerMux,
+			ReadHeaderTimeout: defaultReadHeaderTimeout, // Mitigation for G112: Potential slowloris attack
 		}
 
 		g.Go(func() error {
 			<-rootCtx.Done()
 			// allow a timeout for graceful shutdown
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			if err := profilerServer.Shutdown(ctx); err != nil {
-				return err
-			}
-			return nil
+			//nolint: contextcheck
+			return profilerServer.Shutdown(shutdownCtx)
 		})
 		g.Go(func() error {
 			log.V(logf.InfoLevel).Info("starting profiler", "address", profilerLn.Addr())
@@ -127,16 +176,25 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 			return nil
 		})
 	}
+	lc := net.ListenConfig{}
+	healthzListener, err := lc.Listen(rootCtx, "tcp", opts.HealthzListenAddress)
+	if err != nil {
+		return fmt.Errorf("failed to listen on healthz address %s: %v", opts.HealthzListenAddress, err)
+	}
+	healthzServer := healthz.NewServer(opts.LeaderElectionConfig.HealthzTimeout)
+	g.Go(func() error {
+		log.V(logf.InfoLevel).Info("starting healthz server", "address", healthzListener.Addr())
+		return healthzServer.Start(rootCtx, healthzListener)
+	})
 
 	elected := make(chan struct{})
-	if opts.LeaderElect {
+	if opts.LeaderElectionConfig.Enabled {
 		g.Go(func() error {
 			log.V(logf.InfoLevel).Info("starting leader election")
 			ctx, err := ctxFactory.Build("leader-election")
 			if err != nil {
 				return err
 			}
-
 			errorCh := make(chan error, 1)
 			if err := startLeaderElection(rootCtx, opts, ctx.Client, ctx.Recorder, leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(_ context.Context) {
@@ -151,7 +209,7 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 						errorCh <- errors.New("leader election lost")
 					}
 				},
-			}); err != nil {
+			}, healthzServer.LeaderHealthzAdaptor); err != nil {
 				return err
 			}
 
@@ -179,13 +237,7 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 
 		// only run a controller if it's been enabled
 		if !enabledControllers.Has(n) {
-			log.V(logf.InfoLevel).Info("not starting controller as it's disabled")
-			continue
-		}
-
-		// don't run clusterissuers controller if scoped to a single namespace
-		if ctx.Namespace != "" && n == clusterissuers.ControllerName {
-			log.V(logf.InfoLevel).Info("not starting controller as cert-manager has been scoped to a single namespace")
+			log.V(logf.InfoLevel).Info("skipping disabled controller")
 			continue
 		}
 
@@ -204,17 +256,20 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 		g.Go(func() error {
 			log.V(logf.InfoLevel).Info("starting controller")
 
-			// TODO: make this either a constant or a command line flag
-			workers := 5
-			return iface.Run(workers, rootCtx.Done())
+			return iface.Run(opts.NumberOfConcurrentWorkers, rootCtx)
 		})
 	}
 
 	log.V(logf.DebugLevel).Info("starting shared informer factories")
 	ctx.SharedInformerFactory.Start(rootCtx.Done())
 	ctx.KubeSharedInformerFactory.Start(rootCtx.Done())
+	ctx.HTTP01ResourceMetadataInformersFactory.Start(rootCtx.Done())
 
-	if utilfeature.DefaultFeatureGate.Enabled(feature.ExperimentalGatewayAPISupport) {
+	g.Go(func() error {
+		return ctx.DNSResolver.Start(rootCtx)
+	})
+
+	if utilfeature.DefaultFeatureGate.Enabled(feature.ExperimentalGatewayAPISupport) && opts.GatewayAPIConfig.Enabled {
 		ctx.GWShared.Start(rootCtx.Done())
 	}
 
@@ -224,15 +279,23 @@ func Run(opts *options.ControllerOptions, stopCh <-chan struct{}) error {
 	}
 	log.V(logf.InfoLevel).Info("control loops exited")
 
+	if utilfeature.DefaultFeatureGate.Enabled(feature.ExperimentalGatewayAPISupport) && opts.GatewayAPIConfig.Enabled {
+		ctx.GWShared.Shutdown()
+	}
+
+	ctx.HTTP01ResourceMetadataInformersFactory.Shutdown()
+	ctx.KubeSharedInformerFactory.Shutdown()
+	ctx.SharedInformerFactory.Shutdown()
+
 	return nil
 }
 
 // buildControllerContextFactory builds a new controller ContextFactory which
 // can build controller contexts for each component.
-func buildControllerContextFactory(ctx context.Context, opts *options.ControllerOptions) (*controller.ContextFactory, error) {
+func buildControllerContextFactory(ctx context.Context, opts *config.ControllerConfiguration) (*controller.ContextFactory, error) {
 	log := logf.FromContext(ctx)
 
-	nameservers := opts.DNS01RecursiveNameservers
+	nameservers := opts.ACMEDNS01Config.RecursiveNameservers
 	if len(nameservers) == 0 {
 		nameservers = dnsutil.RecursiveNameservers
 	}
@@ -241,53 +304,52 @@ func buildControllerContextFactory(ctx context.Context, opts *options.Controller
 		WithValues("nameservers", nameservers).
 		Info("configured acme dns01 nameservers")
 
-	http01SolverResourceRequestCPU, err := resource.ParseQuantity(opts.ACMEHTTP01SolverResourceRequestCPU)
+	http01SolverResourceRequestCPU, err := resource.ParseQuantity(opts.ACMEHTTP01Config.SolverResourceRequestCPU)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing ACMEHTTP01SolverResourceRequestCPU: %w", err)
 	}
 
-	http01SolverResourceRequestMemory, err := resource.ParseQuantity(opts.ACMEHTTP01SolverResourceRequestMemory)
+	http01SolverResourceRequestMemory, err := resource.ParseQuantity(opts.ACMEHTTP01Config.SolverResourceRequestMemory)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing ACMEHTTP01SolverResourceRequestMemory: %w", err)
 	}
 
-	http01SolverResourceLimitsCPU, err := resource.ParseQuantity(opts.ACMEHTTP01SolverResourceLimitsCPU)
+	http01SolverResourceLimitsCPU, err := resource.ParseQuantity(opts.ACMEHTTP01Config.SolverResourceLimitsCPU)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing ACMEHTTP01SolverResourceLimitsCPU: %w", err)
 	}
 
-	http01SolverResourceLimitsMemory, err := resource.ParseQuantity(opts.ACMEHTTP01SolverResourceLimitsMemory)
+	http01SolverResourceLimitsMemory, err := resource.ParseQuantity(opts.ACMEHTTP01Config.SolverResourceLimitsMemory)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing ACMEHTTP01SolverResourceLimitsMemory: %w", err)
 	}
 
-	acmeAccountRegistry := accounts.NewDefaultRegistry()
+	ACMEHTTP01SolverRunAsNonRoot := opts.ACMEHTTP01Config.SolverRunAsNonRoot
 
+	//nolint:modernize // embedlit: the group names document which options struct each field belongs to
 	ctxFactory, err := controller.NewContextFactory(ctx, controller.ContextOptions{
-		Kubeconfig:         opts.Kubeconfig,
+		Kubeconfig:         opts.KubeConfig,
 		KubernetesAPIQPS:   opts.KubernetesAPIQPS,
 		KubernetesAPIBurst: opts.KubernetesAPIBurst,
 		APIServerHost:      opts.APIServerHost,
 
 		Namespace: opts.Namespace,
 
-		Clock:   clock.RealClock{},
-		Metrics: metrics.New(log, clock.RealClock{}),
-
 		ACMEOptions: controller.ACMEOptions{
 			HTTP01SolverResourceRequestCPU:    http01SolverResourceRequestCPU,
 			HTTP01SolverResourceRequestMemory: http01SolverResourceRequestMemory,
 			HTTP01SolverResourceLimitsCPU:     http01SolverResourceLimitsCPU,
 			HTTP01SolverResourceLimitsMemory:  http01SolverResourceLimitsMemory,
-			HTTP01SolverImage:                 opts.ACMEHTTP01SolverImage,
+			ACMEHTTP01SolverRunAsNonRoot:      ACMEHTTP01SolverRunAsNonRoot,
+			HTTP01SolverImage:                 opts.ACMEHTTP01Config.SolverImage,
 			// Allows specifying a list of custom nameservers to perform HTTP01 checks on.
-			HTTP01SolverNameservers: opts.ACMEHTTP01SolverNameservers,
+			HTTP01SolverNameservers:      opts.ACMEHTTP01Config.SolverNameservers,
+			HTTP01SolverExtraLabels:      opts.ACMEHTTP01Config.SolverExtraLabels,
+			HTTP01SolverRuntimeClassName: opts.ACMEHTTP01Config.SolverRuntimeClassName,
 
 			DNS01Nameservers:        nameservers,
-			DNS01CheckRetryPeriod:   opts.DNS01CheckRetryPeriod,
-			DNS01CheckAuthoritative: !opts.DNS01RecursiveNameserversOnly,
-
-			AccountRegistry: acmeAccountRegistry,
+			DNS01CheckRetryPeriod:   opts.ACMEDNS01Config.CheckRetryPeriod,
+			DNS01CheckAuthoritative: !opts.ACMEDNS01Config.RecursiveNameserversOnly,
 		},
 
 		SchedulerOptions: controller.SchedulerOptions{
@@ -301,15 +363,24 @@ func buildControllerContextFactory(ctx context.Context, opts *options.Controller
 		},
 
 		IngressShimOptions: controller.IngressShimOptions{
-			DefaultIssuerName:                 opts.DefaultIssuerName,
-			DefaultIssuerKind:                 opts.DefaultIssuerKind,
-			DefaultIssuerGroup:                opts.DefaultIssuerGroup,
-			DefaultAutoCertificateAnnotations: opts.DefaultAutoCertificateAnnotations,
+			DefaultIssuerName:                 opts.IngressShimConfig.DefaultIssuerName,
+			DefaultIssuerKind:                 opts.IngressShimConfig.DefaultIssuerKind,
+			DefaultIssuerGroup:                opts.IngressShimConfig.DefaultIssuerGroup,
+			DefaultAutoCertificateAnnotations: opts.IngressShimConfig.DefaultAutoCertificateAnnotations,
+			ExtraCertificateAnnotations:       opts.IngressShimConfig.ExtraCertificateAnnotations,
+			GatewayAPIExtraProtocols:          sets.New[string](opts.GatewayAPIConfig.ExtraProtocols...),
 		},
 
 		CertificateOptions: controller.CertificateOptions{
-			EnableOwnerRef:           opts.EnableCertificateOwnerRef,
-			CopiedAnnotationPrefixes: opts.CopiedAnnotationPrefixes,
+			EnableOwnerRef:                           opts.EnableCertificateOwnerRef,
+			CopiedAnnotationPrefixes:                 opts.CopiedAnnotationPrefixes,
+			CertificateRequestMinimumBackoffDuration: opts.CertificateRequestMinimumBackoffDuration,
+			CertificateRequestMaximumBackoffDuration: opts.CertificateRequestMaximumBackoffDuration,
+		},
+
+		ConfigOptions: controller.ConfigOptions{
+			EnableGatewayAPI:            opts.GatewayAPIConfig.Enabled,
+			EnableGatewayAPIListenerSet: opts.GatewayAPIConfig.EnableListenerSet,
 		},
 	})
 	if err != nil {
@@ -319,7 +390,7 @@ func buildControllerContextFactory(ctx context.Context, opts *options.Controller
 	return ctxFactory, nil
 }
 
-func startLeaderElection(ctx context.Context, opts *options.ControllerOptions, leaderElectionClient kubernetes.Interface, recorder record.EventRecorder, callbacks leaderelection.LeaderCallbacks) error {
+func startLeaderElection(ctx context.Context, opts *config.ControllerConfiguration, leaderElectionClient kubernetes.Interface, recorder record.EventRecorder, callbacks leaderelection.LeaderCallbacks, healthzAdaptor *leaderelection.HealthzAdaptor) error {
 	// Identity used to distinguish between multiple controller manager instances
 	id, err := os.Hostname()
 	if err != nil {
@@ -334,12 +405,13 @@ func startLeaderElection(ctx context.Context, opts *options.ControllerOptions, l
 
 	// We only support leases for leader election. Previously we supported ConfigMap & Lease objects for leader
 	// election.
-	ml, err := resourcelock.New(resourcelock.LeasesResourceLock,
-		opts.LeaderElectionNamespace,
+	ml, err := resourcelock.NewWithLabels(resourcelock.LeasesResourceLock,
+		opts.LeaderElectionConfig.Namespace,
 		lockName,
 		leaderElectionClient.CoreV1(),
 		leaderElectionClient.CoordinationV1(),
 		lc,
+		map[string]string{"app.kubernetes.io/managed-by": "cert-manager"},
 	)
 	if err != nil {
 		return fmt.Errorf("error creating leader election lock: %v", err)
@@ -348,17 +420,96 @@ func startLeaderElection(ctx context.Context, opts *options.ControllerOptions, l
 	// Try and become the leader and start controller manager loops
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:            ml,
-		LeaseDuration:   opts.LeaderElectionLeaseDuration,
-		RenewDeadline:   opts.LeaderElectionRenewDeadline,
-		RetryPeriod:     opts.LeaderElectionRetryPeriod,
+		LeaseDuration:   opts.LeaderElectionConfig.LeaseDuration,
+		RenewDeadline:   opts.LeaderElectionConfig.RenewDeadline,
+		RetryPeriod:     opts.LeaderElectionConfig.RetryPeriod,
 		ReleaseOnCancel: true,
 		Callbacks:       callbacks,
+		WatchDog:        healthzAdaptor,
 	})
 	if err != nil {
 		return err
 	}
 
 	le.Run(ctx)
+
+	return nil
+}
+
+func buildCertificateSource(log logr.Logger, tlsConfig shared.TLSConfig, restCfg *rest.Config) tls.CertificateSource {
+	switch {
+	case tlsConfig.FilesystemConfigProvided():
+		log.V(logf.InfoLevel).Info("using TLS certificate from local filesystem", "private_key_path", tlsConfig.Filesystem.KeyFile, "certificate", tlsConfig.Filesystem.CertFile)
+		return &tls.FileCertificateSource{
+			CertPath: tlsConfig.Filesystem.CertFile,
+			KeyPath:  tlsConfig.Filesystem.KeyFile,
+		}
+	case tlsConfig.DynamicConfigProvided():
+		log.V(logf.InfoLevel).Info("using dynamic certificate generating using CA stored in Secret resource", "secret_namespace", tlsConfig.Dynamic.SecretNamespace, "secret_name", tlsConfig.Dynamic.SecretName)
+		return &tls.DynamicSource{
+			DNSNames: tlsConfig.Dynamic.DNSNames,
+			Authority: &authority.DynamicAuthority{
+				SecretNamespace: tlsConfig.Dynamic.SecretNamespace,
+				SecretName:      tlsConfig.Dynamic.SecretName,
+				SecretLabels:    map[string]string{"app.kubernetes.io/managed-by": "cert-manager"},
+				LeafDuration:    tlsConfig.Dynamic.LeafDuration,
+				RESTConfig:      restCfg,
+			},
+		}
+	default:
+		log.V(logf.WarnLevel).Info("serving insecurely as tls certificate data not provided")
+	}
+	return nil
+}
+
+// configurePEMSizeLimits sets the global PEM size limits from the controller configuration
+func configurePEMSizeLimits(opts *config.ControllerConfiguration, log logr.Logger) error {
+	// Validate that the configuration is not nil
+	if opts == nil {
+		return fmt.Errorf("controller configuration is nil")
+	}
+
+	// Additional runtime validation beyond what the validation package does
+	// This catches cases where values might have been modified after validation
+	if opts.PEMSizeLimitsConfig.MaxCertificateSize <= 0 {
+		return fmt.Errorf("maxCertificateSize must be greater than 0, got %d", opts.PEMSizeLimitsConfig.MaxCertificateSize)
+	}
+	if opts.PEMSizeLimitsConfig.MaxPrivateKeySize <= 0 {
+		return fmt.Errorf("maxPrivateKeySize must be greater than 0, got %d", opts.PEMSizeLimitsConfig.MaxPrivateKeySize)
+	}
+	if opts.PEMSizeLimitsConfig.MaxChainLength <= 0 {
+		return fmt.Errorf("maxChainLength must be greater than 0, got %d", opts.PEMSizeLimitsConfig.MaxChainLength)
+	}
+	if opts.PEMSizeLimitsConfig.MaxBundleSize <= 0 {
+		return fmt.Errorf("maxBundleSize must be greater than 0, got %d", opts.PEMSizeLimitsConfig.MaxBundleSize)
+	}
+
+	// Check relationships between values
+	if opts.PEMSizeLimitsConfig.MaxCertificateSize > opts.PEMSizeLimitsConfig.MaxBundleSize {
+		return fmt.Errorf("maxCertificateSize (%d) must not be larger than maxBundleSize (%d)",
+			opts.PEMSizeLimitsConfig.MaxCertificateSize, opts.PEMSizeLimitsConfig.MaxBundleSize)
+	}
+
+	// MaxChainLength is in bytes (total chain size), not a count
+	if opts.PEMSizeLimitsConfig.MaxChainLength > opts.PEMSizeLimitsConfig.MaxBundleSize {
+		return fmt.Errorf("maxChainLength (%d) must not exceed maxBundleSize (%d)",
+			opts.PEMSizeLimitsConfig.MaxChainLength, opts.PEMSizeLimitsConfig.MaxBundleSize)
+	}
+
+	limits := pem.NewSizeLimitsFromConfig(
+		opts.PEMSizeLimitsConfig.MaxCertificateSize,
+		opts.PEMSizeLimitsConfig.MaxPrivateKeySize,
+		opts.PEMSizeLimitsConfig.MaxChainLength,
+		opts.PEMSizeLimitsConfig.MaxBundleSize,
+	)
+
+	pem.SetGlobalSizeLimits(limits)
+
+	log.V(logf.InfoLevel).Info("configured PEM size limits",
+		"maxCertificateSize", limits.MaxCertificateSize,
+		"maxPrivateKeySize", limits.MaxPrivateKeySize,
+		"maxChainLength", limits.MaxChainLength,
+		"maxBundleSize", limits.MaxBundleSize)
 
 	return nil
 }

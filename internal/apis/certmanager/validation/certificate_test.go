@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -32,11 +33,10 @@ import (
 	"github.com/cert-manager/cert-manager/internal/webhook/feature"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
-	"github.com/stretchr/testify/assert"
 )
 
 var (
-	validIssuerRef = cmmeta.ObjectReference{
+	validIssuerRef = cmmeta.IssuerReference{
 		Name: "name",
 		Kind: "ClusterIssuer",
 	}
@@ -50,21 +50,13 @@ var (
 	maxSecretTemplateAnnotationsBytesLimit = 256 * (1 << 10) // 256 kB
 )
 
-func strPtr(s string) *string {
-	return &s
-}
-
-func int32Ptr(i int32) *int32 {
-	return &i
-}
-
 func TestValidateCertificate(t *testing.T) {
 	fldPath := field.NewPath("spec")
 	scenarios := map[string]struct {
-		cfg      *internalcmapi.Certificate
-		a        *admissionv1.AdmissionRequest
-		errs     []*field.Error
-		warnings []string
+		cfg                           *internalcmapi.Certificate
+		a                             *admissionv1.AdmissionRequest
+		errs                          []*field.Error
+		nameConstraintsFeatureEnabled bool
 	}{
 		"valid basic certificate": {
 			cfg: &internalcmapi.Certificate{
@@ -76,24 +68,24 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 		},
-		"valid with blank issuerRef kind": {
+		"valid with blank issuerRef kind and no group": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
 					CommonName: "testcn",
 					SecretName: "abc",
-					IssuerRef: cmmeta.ObjectReference{
+					IssuerRef: cmmeta.IssuerReference{
 						Name: "valid",
 					},
 				},
 			},
 			a: someAdmissionRequest,
 		},
-		"valid with 'Issuer' issuerRef kind": {
+		"valid with 'Issuer' issuerRef kind and no group": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
 					CommonName: "testcn",
 					SecretName: "abc",
-					IssuerRef: cmmeta.ObjectReference{
+					IssuerRef: cmmeta.IssuerReference{
 						Name: "valid",
 						Kind: "Issuer",
 					},
@@ -114,21 +106,49 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 		},
-		"invalid issuerRef kind": {
+		"valid with 'Issuer' issuerRef kind and explicit internal group": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
 					CommonName: "testcn",
 					SecretName: "abc",
-					IssuerRef: cmmeta.ObjectReference{
-						Name: "valid",
-						Kind: "invalid",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "valid",
+						Kind:  "Issuer",
+						Group: "cert-manager.io",
+					},
+				},
+			},
+			a: someAdmissionRequest,
+		},
+		"invalid with external issuerRef kind and empty group": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef: cmmeta.IssuerReference{
+						Name: "abc",
+						Kind: "AWSPCAClusterIssuer",
 					},
 				},
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("issuerRef", "kind"), "invalid", "must be one of Issuer or ClusterIssuer"),
+				field.Invalid(fldPath.Child("issuerRef", "kind"), "AWSPCAClusterIssuer", "must be one of Issuer or ClusterIssuer (did you forget to set spec.issuerRef.kind.group?)"),
 			},
+		},
+		"valid with external issuerRef kind and external group": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "abc",
+						Kind:  "AWSPCAClusterIssuer",
+						Group: "awspca.cert-manager.io",
+					},
+				},
+			},
+			a: someAdmissionRequest,
 		},
 		"certificate missing secretName": {
 			cfg: &internalcmapi.Certificate{
@@ -142,6 +162,19 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 		},
+		"certificate invalid secretName": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					IssuerRef:  validIssuerRef,
+					SecretName: "testFoo",
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("secretName"), "testFoo", "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')"),
+			},
+			a: someAdmissionRequest,
+		},
 		"certificate with no domains, URIs or common name": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
@@ -151,10 +184,10 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath, "", "at least one of commonName, dnsNames, uris ipAddresses, or emailAddresses must be set"),
+				field.Invalid(fldPath, "", "at least one of commonName (from the commonName field or from a literalSubject), dnsNames, emailSANs, ipAddresses, otherNames, or uriSANs must be set"),
 			},
 		},
-		"certificate with no issuerRef": {
+		"invalid with no issuerRef": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
 					CommonName: "testcn",
@@ -286,6 +319,20 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 		},
+		"valid certificate with ed25519 keyAlgorithm": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Size:      521,
+						Algorithm: internalcmapi.Ed25519KeyAlgorithm,
+					},
+				},
+			},
+			a: someAdmissionRequest,
+		},
 		"valid certificate with keyAlgorithm not specified and keySize specified": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
@@ -313,7 +360,7 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("privateKey", "size"), 1024, "must be between 2048 & 8192 for rsa keyAlgorithm"),
+				field.Invalid(fldPath.Child("privateKey", "size"), 1024, "must be between 2048 and 8192 for rsa keyAlgorithm"),
 			},
 		},
 		"certificate with rsa keyAlgorithm specified and invalid keysize 8196": {
@@ -330,7 +377,7 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("privateKey", "size"), 8196, "must be between 2048 & 8192 for rsa keyAlgorithm"),
+				field.Invalid(fldPath.Child("privateKey", "size"), 8196, "must be between 2048 and 8192 for rsa keyAlgorithm"),
 			},
 		},
 		"certificate with ecdsa keyAlgorithm specified and invalid keysize": {
@@ -363,7 +410,7 @@ func TestValidateCertificate(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("privateKey", "algorithm"), internalcmapi.PrivateKeyAlgorithm("blah"), "must be either empty or one of rsa or ecdsa"),
+				field.Invalid(fldPath.Child("privateKey", "algorithm"), internalcmapi.PrivateKeyAlgorithm("blah"), "must be either empty or one of rsa, ecdsa, ed25519 or mldsa"),
 			},
 		},
 		"valid certificate with ipAddresses": {
@@ -483,7 +530,7 @@ func TestValidateCertificate(t *testing.T) {
 				Spec: internalcmapi.CertificateSpec{
 					SecretName: "abc",
 					IssuerRef:  validIssuerRef,
-					URISANs: []string{
+					URIs: []string{
 						"foo.bar",
 					},
 				},
@@ -493,9 +540,9 @@ func TestValidateCertificate(t *testing.T) {
 		"valid certificate with only email SAN": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
-					EmailSANs:  []string{"alice@example.com"},
-					SecretName: "abc",
-					IssuerRef:  validIssuerRef,
+					EmailAddresses: []string{"alice@example.com"},
+					SecretName:     "abc",
+					IssuerRef:      validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -503,22 +550,22 @@ func TestValidateCertificate(t *testing.T) {
 		"invalid certificate with incorrect email": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
-					EmailSANs:  []string{"aliceexample.com"},
-					SecretName: "abc",
-					IssuerRef:  validIssuerRef,
+					EmailAddresses: []string{"alice.example.com"},
+					SecretName:     "abc",
+					IssuerRef:      validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("emailAddresses").Index(0), "aliceexample.com", "invalid email address: mail: missing '@' or angle-addr"),
+				field.Invalid(fldPath.Child("emailAddresses").Index(0), "alice.example.com", "invalid email address: mail: missing '@' or angle-addr"),
 			},
 		},
 		"invalid certificate with email formatted with name": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
-					EmailSANs:  []string{"Alice <alice@example.com>"},
-					SecretName: "abc",
-					IssuerRef:  validIssuerRef,
+					EmailAddresses: []string{"Alice <alice@example.com>"},
+					SecretName:     "abc",
+					IssuerRef:      validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -529,9 +576,9 @@ func TestValidateCertificate(t *testing.T) {
 		"invalid certificate with email formatted with mailto": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
-					EmailSANs:  []string{"mailto:alice@example.com"},
-					SecretName: "abc",
-					IssuerRef:  validIssuerRef,
+					EmailAddresses: []string{"mailto:alice@example.com"},
+					SecretName:     "abc",
+					IssuerRef:      validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -545,7 +592,7 @@ func TestValidateCertificate(t *testing.T) {
 					CommonName:           "abc",
 					SecretName:           "abc",
 					IssuerRef:            validIssuerRef,
-					RevisionHistoryLimit: int32Ptr(1),
+					RevisionHistoryLimit: new(int32(1)),
 				},
 			},
 			a: someAdmissionRequest,
@@ -556,7 +603,7 @@ func TestValidateCertificate(t *testing.T) {
 					CommonName:           "abc",
 					SecretName:           "abc",
 					IssuerRef:            validIssuerRef,
-					RevisionHistoryLimit: int32Ptr(0),
+					RevisionHistoryLimit: new(int32(0)),
 				},
 			},
 			a: someAdmissionRequest,
@@ -573,9 +620,7 @@ func TestValidateCertificate(t *testing.T) {
 						Annotations: map[string]string{},
 						Labels:      map[string]string{},
 					},
-					IssuerRef: cmmeta.ObjectReference{
-						Name: "valid",
-					},
+					IssuerRef: validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -593,9 +638,7 @@ func TestValidateCertificate(t *testing.T) {
 							"my-label.com/foo": "evn-production",
 						},
 					},
-					IssuerRef: cmmeta.ObjectReference{
-						Name: "valid",
-					},
+					IssuerRef: validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -607,14 +650,13 @@ func TestValidateCertificate(t *testing.T) {
 					SecretName: "abc",
 					SecretTemplate: &internalcmapi.CertificateSecretTemplate{
 						Annotations: map[string]string{
-							"app.com/valid":                    "valid",
-							"cert-manager.io/alt-names":        "example.com",
-							"cert-manager.io/certificate-name": "selfsigned-cert",
+							"app.com/valid":                          "valid",
+							"cert-manager.io/alt-names":              "example.com",
+							"cert-manager.io/certificate-name":       "selfsigned-cert",
+							"cert-manager.io/allow-direct-injection": "true",
 						},
 					},
-					IssuerRef: cmmeta.ObjectReference{
-						Name: "invalid",
-					},
+					IssuerRef: validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -633,9 +675,7 @@ func TestValidateCertificate(t *testing.T) {
 							"app.com/invalid": strings.Repeat("0", maxSecretTemplateAnnotationsBytesLimit),
 						},
 					},
-					IssuerRef: cmmeta.ObjectReference{
-						Name: "invalid",
-					},
+					IssuerRef: validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -653,9 +693,7 @@ func TestValidateCertificate(t *testing.T) {
 							"app.com/invalid-chars": "invalid=chars",
 						},
 					},
-					IssuerRef: cmmeta.ObjectReference{
-						Name: "invalid",
-					},
+					IssuerRef: validIssuerRef,
 				},
 			},
 			a: someAdmissionRequest,
@@ -663,15 +701,540 @@ func TestValidateCertificate(t *testing.T) {
 				field.Invalid(
 					fldPath.Child("secretTemplate", "labels"),
 					"invalid=chars", "a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an "+
-						"alphanumeric character (e.g. 'MyValue',  or 'my_value',  or '12345', regex used for validation is '(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?')"),
+						"alphanumeric character (e.g. 'MyValue',  or 'my_value',  or '12345', regex used for validation is '(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?')").
+					WithOrigin("format=k8s-label-value"),
+			},
+		},
+		"valid with name constraints": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IsCA:       true,
+					NameConstraints: &internalcmapi.NameConstraints{
+						Permitted: &internalcmapi.NameConstraintItem{
+							DNSDomains: []string{"example.com"},
+						},
+					},
+					IssuerRef: validIssuerRef,
+				},
+			},
+			a:                             someAdmissionRequest,
+			nameConstraintsFeatureEnabled: true,
+		},
+		"invalid with name constraints": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName:      "testcn",
+					SecretName:      "abc",
+					IsCA:            true,
+					NameConstraints: &internalcmapi.NameConstraints{},
+					IssuerRef:       validIssuerRef,
+				},
+			},
+			a: someAdmissionRequest,
+			errs: []*field.Error{
+				field.Invalid(
+					fldPath.Child("nameConstraints"), &internalcmapi.NameConstraints{}, "either permitted or excluded must be set"),
+			},
+			nameConstraintsFeatureEnabled: true,
+		},
+		"valid name constraints with feature gate disabled": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IsCA:       true,
+					NameConstraints: &internalcmapi.NameConstraints{
+						Permitted: &internalcmapi.NameConstraintItem{
+							DNSDomains: []string{"example.com"},
+							// The invalid CIDR must not be reported: the feature
+							// gate check short-circuits all other nameConstraints
+							// validation.
+							IPRanges: []string{"10.0.0.0"},
+						},
+					},
+					IssuerRef: validIssuerRef,
+				},
+			},
+			a: someAdmissionRequest,
+			errs: []*field.Error{
+				field.Forbidden(
+					fldPath.Child("nameConstraints"), "feature gate NameConstraints must be enabled"),
+			},
+		},
+		"valid with name constraints ipRanges": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IsCA:       true,
+					NameConstraints: &internalcmapi.NameConstraints{
+						Permitted: &internalcmapi.NameConstraintItem{
+							IPRanges: []string{"10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32"},
+						},
+						Excluded: &internalcmapi.NameConstraintItem{
+							IPRanges: []string{"172.16.0.0/12", "fd00::/8"},
+						},
+					},
+					IssuerRef: validIssuerRef,
+				},
+			},
+			a:                             someAdmissionRequest,
+			nameConstraintsFeatureEnabled: true,
+		},
+		"invalid with name constraints ipRanges": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IsCA:       true,
+					NameConstraints: &internalcmapi.NameConstraints{
+						Permitted: &internalcmapi.NameConstraintItem{
+							IPRanges: []string{"10.0.0.0", "10.0.0.0/8", "not-a-cidr"},
+						},
+						Excluded: &internalcmapi.NameConstraintItem{
+							IPRanges: []string{"2001:db8::/32", "192.168.0.1"},
+						},
+					},
+					IssuerRef: validIssuerRef,
+				},
+			},
+			a: someAdmissionRequest,
+			errs: []*field.Error{
+				field.Invalid(
+					fldPath.Child("nameConstraints", "permitted", "ipRanges").Index(0), "10.0.0.0", "invalid CIDR address"),
+				field.Invalid(
+					fldPath.Child("nameConstraints", "permitted", "ipRanges").Index(2), "not-a-cidr", "invalid CIDR address"),
+				field.Invalid(
+					fldPath.Child("nameConstraints", "excluded", "ipRanges").Index(1), "192.168.0.1", "invalid CIDR address"),
+			},
+			nameConstraintsFeatureEnabled: true,
+		},
+		"signature algorithm SHA+RSA allowed for empty key (RSA)": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName:         "testcn",
+					SecretName:         "abc",
+					IssuerRef:          validIssuerRef,
+					SignatureAlgorithm: internalcmapi.SHA256WithRSA,
+				},
+			},
+		},
+		"signature algorithm SHA+RSA allowed for RSA key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.RSAKeyAlgorithm,
+						Size:      3072,
+					},
+					SignatureAlgorithm: internalcmapi.SHA256WithRSA,
+				},
+			},
+		},
+		"signature algorithm SHA+RSA not allowed for ECDSA key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.ECDSAKeyAlgorithm,
+					},
+					SignatureAlgorithm: internalcmapi.SHA256WithRSA,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("signatureAlgorithm"), internalcmapi.SHA256WithRSA,
+					"for key algorithm ECDSA the allowed signature algorithms are [ECDSAWithSHA256 ECDSAWithSHA384 ECDSAWithSHA512]"),
+			},
+		},
+		"signature algorithm SHA+ECDSA allowed for ECDSA key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.ECDSAKeyAlgorithm,
+					},
+					SignatureAlgorithm: internalcmapi.ECDSAWithSHA256,
+				},
+			},
+		},
+		"signature algorithm SHA+ECDSA not allowed for RSA key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.RSAKeyAlgorithm,
+					},
+					SignatureAlgorithm: internalcmapi.ECDSAWithSHA256,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("signatureAlgorithm"), internalcmapi.ECDSAWithSHA256,
+					"for key algorithm RSA the allowed signature algorithms are [SHA256WithRSA SHA384WithRSA SHA512WithRSA]"),
+			},
+		},
+		"signature algorithm Ed25519 not allowed for RSA key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.RSAKeyAlgorithm,
+					},
+					SignatureAlgorithm: internalcmapi.PureEd25519,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("signatureAlgorithm"), internalcmapi.PureEd25519,
+					"for key algorithm RSA the allowed signature algorithms are [SHA256WithRSA SHA384WithRSA SHA512WithRSA]"),
+			},
+		},
+		"signature algorithm Ed25519 not allowed for ECDSA key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.ECDSAKeyAlgorithm,
+					},
+					SignatureAlgorithm: internalcmapi.PureEd25519,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("signatureAlgorithm"), internalcmapi.PureEd25519,
+					"for key algorithm ECDSA the allowed signature algorithms are [ECDSAWithSHA256 ECDSAWithSHA384 ECDSAWithSHA512]"),
+			},
+		},
+		"signature algorithm Ed25519 allowed for Ed25519 key": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						Algorithm: internalcmapi.Ed25519KeyAlgorithm,
+					},
+					SignatureAlgorithm: internalcmapi.PureEd25519,
+				},
+			},
+		},
+		"explicit rotation policy": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						RotationPolicy: internalcmapi.RotationPolicyNever,
+					},
+				},
+			},
+		},
+		"invalid windows when renewal policy is disabled": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						RotationPolicy: internalcmapi.RotationPolicyNever,
+					},
+					Renewal: &internalcmapi.CertificateRenewal{
+						Policy: internalcmapi.Disabled,
+						Windows: []internalcmapi.CertificateRenewalWindows{
+							{
+								WindowDuration: &metav1.Duration{Duration: time.Hour * 2},
+								Cron:           "0 12 * * *",
+							},
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("renewal", "windows"), "windows cannot be set when `renewal.policy` is set to Disabled"),
+			},
+		},
+		"valid renewal config with single window": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						RotationPolicy: internalcmapi.RotationPolicyNever,
+					},
+					Renewal: &internalcmapi.CertificateRenewal{
+						Policy: internalcmapi.RenewBefore,
+						Windows: []internalcmapi.CertificateRenewalWindows{
+							{
+								WindowDuration: &metav1.Duration{Duration: time.Hour * 2},
+								Cron:           "0 12 * * *",
+							},
+						},
+					},
+				},
+			},
+		},
+		"invalid renewal cron with timezone prefix and no schedule": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					PrivateKey: &internalcmapi.CertificatePrivateKey{
+						RotationPolicy: internalcmapi.RotationPolicyNever,
+					},
+					Renewal: &internalcmapi.CertificateRenewal{
+						Policy: internalcmapi.RenewBefore,
+						Windows: []internalcmapi.CertificateRenewalWindows{
+							{
+								WindowDuration: &metav1.Duration{Duration: time.Hour * 2},
+								Cron:           "CRON_TZ=UTC",
+							},
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("renewal", "windows").Index(0).Child("cron"), "CRON_TZ=UTC", "invalid cron syntax: failed to parse cron spec 'CRON_TZ=UTC': expected timezone prefix to be followed by a cron spec: CRON_TZ=UTC. cron needs to follow: cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow"),
 			},
 		},
 	}
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.NameConstraints, s.nameConstraintsFeatureEnabled)
 			errs, warnings := ValidateCertificate(s.a, s.cfg)
 			assert.ElementsMatch(t, errs, s.errs)
-			assert.ElementsMatch(t, warnings, s.warnings)
+			assert.Empty(t, warnings)
+		})
+	}
+}
+
+func TestValidateUpdateCertificatePreservesLegacyRenewBeforePercentageOnUnchangedUpdate(t *testing.T) {
+	oldCert := &internalcmapi.Certificate{
+		Spec: internalcmapi.CertificateSpec{
+			Duration:              &metav1.Duration{Duration: time.Hour},
+			RenewBeforePercentage: new(int32(5)),
+			CommonName:            "testcn",
+			SecretName:            "abc",
+			IssuerRef:             validIssuerRef,
+		},
+	}
+	newCert := &internalcmapi.Certificate{Spec: oldCert.Spec}
+
+	errs, warnings := ValidateUpdateCertificate(&admissionv1.AdmissionRequest{
+		Operation:   admissionv1.Update,
+		SubResource: "status",
+	}, oldCert, newCert)
+
+	assert.Empty(t, errs)
+	assert.Empty(t, warnings)
+}
+
+func TestValidateUpdateCertificateRejectsChangedRenewBeforePercentageBelowMinimum(t *testing.T) {
+	fldPath := field.NewPath("spec")
+	oldCert := &internalcmapi.Certificate{
+		Spec: internalcmapi.CertificateSpec{
+			Duration:              &metav1.Duration{Duration: time.Hour},
+			RenewBeforePercentage: new(int32(5)),
+			CommonName:            "testcn",
+			SecretName:            "abc",
+			IssuerRef:             validIssuerRef,
+		},
+	}
+	newCert := &internalcmapi.Certificate{
+		Spec: internalcmapi.CertificateSpec{
+			Duration:              &metav1.Duration{Duration: time.Hour},
+			RenewBeforePercentage: new(int32(6)),
+			CommonName:            "testcn",
+			SecretName:            "abc",
+			IssuerRef:             validIssuerRef,
+		},
+	}
+
+	errs, warnings := ValidateUpdateCertificate(someAdmissionRequest, oldCert, newCert)
+
+	assert.ElementsMatch(t, []*field.Error{
+		field.Invalid(fldPath.Child("renewBeforePercentage"), int32(6), fmt.Sprintf("certificate renewBeforePercentage must result in a renewBefore of at least %s; 6%% of %s is %s", cmapi.MinimumRenewBefore, time.Hour, time.Minute*3+time.Second*36)),
+	}, errs)
+	assert.Empty(t, warnings)
+}
+
+func TestValidateCertificateMLDSA(t *testing.T) {
+	fldPath := field.NewPath("spec")
+	mldsaCert := func(size int, sigAlg internalcmapi.SignatureAlgorithm, usages ...internalcmapi.KeyUsage) *internalcmapi.Certificate {
+		return &internalcmapi.Certificate{
+			Spec: internalcmapi.CertificateSpec{
+				CommonName:         "testcn",
+				SecretName:         "abc",
+				IssuerRef:          validIssuerRef,
+				SignatureAlgorithm: sigAlg,
+				Usages:             usages,
+				PrivateKey: &internalcmapi.CertificatePrivateKey{
+					Algorithm: internalcmapi.MLDSAKeyAlgorithm,
+					Size:      size,
+				},
+			},
+		}
+	}
+	gateErr := field.Forbidden(fldPath.Child("privateKey", "algorithm"), "MLDSA requires the MLDSAPrivateKeys feature gate to be enabled")
+
+	scenarios := map[string]struct {
+		cfg            *internalcmapi.Certificate
+		featureEnabled bool
+		errs           []*field.Error
+	}{
+		"valid ML-DSA certificate with defaulted size and usages": {
+			cfg:            mldsaCert(0, ""),
+			featureEnabled: true,
+		},
+		"valid ML-DSA-44 certificate": {
+			cfg:            mldsaCert(44, ""),
+			featureEnabled: true,
+		},
+		"valid ML-DSA-65 certificate": {
+			cfg:            mldsaCert(65, ""),
+			featureEnabled: true,
+		},
+		"valid ML-DSA-87 certificate with allowed usages": {
+			cfg:            mldsaCert(87, "", internalcmapi.UsageDigitalSignature, internalcmapi.UsageCertSign, internalcmapi.UsageServerAuth),
+			featureEnabled: true,
+		},
+		"ML-DSA certificate with feature gate disabled": {
+			cfg:  mldsaCert(0, ""),
+			errs: []*field.Error{gateErr},
+		},
+		"ML-DSA certificate with unsupported size": {
+			cfg:            mldsaCert(256, ""),
+			featureEnabled: true,
+			errs: []*field.Error{
+				field.NotSupported(fldPath.Child("privateKey", "size"), 256, []string{"44", "65", "87"}),
+			},
+		},
+		"ML-DSA certificate with negative size": {
+			cfg:            mldsaCert(-1, ""),
+			featureEnabled: true,
+			errs: []*field.Error{
+				field.NotSupported(fldPath.Child("privateKey", "size"), -1, []string{"44", "65", "87"}),
+			},
+		},
+		"ML-DSA certificate with signature algorithm": {
+			cfg:            mldsaCert(0, internalcmapi.PureEd25519),
+			featureEnabled: true,
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("signatureAlgorithm"), internalcmapi.PureEd25519, "must not be set for key algorithm MLDSA: the signature algorithm follows from the key's parameter set"),
+			},
+		},
+		"ML-DSA certificate with forbidden usages": {
+			cfg: mldsaCert(0, "",
+				internalcmapi.UsageDigitalSignature,
+				internalcmapi.UsageKeyEncipherment,
+				internalcmapi.UsageDataEncipherment,
+				internalcmapi.UsageKeyAgreement,
+				internalcmapi.UsageEncipherOnly,
+				internalcmapi.UsageDecipherOnly,
+			),
+			featureEnabled: true,
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("usages").Index(1), internalcmapi.UsageKeyEncipherment, "not allowed for ML-DSA keys (RFC 9881)"),
+				field.Invalid(fldPath.Child("usages").Index(2), internalcmapi.UsageDataEncipherment, "not allowed for ML-DSA keys (RFC 9881)"),
+				field.Invalid(fldPath.Child("usages").Index(3), internalcmapi.UsageKeyAgreement, "not allowed for ML-DSA keys (RFC 9881)"),
+				field.Invalid(fldPath.Child("usages").Index(4), internalcmapi.UsageEncipherOnly, "not allowed for ML-DSA keys (RFC 9881)"),
+				field.Invalid(fldPath.Child("usages").Index(5), internalcmapi.UsageDecipherOnly, "not allowed for ML-DSA keys (RFC 9881)"),
+			},
+		},
+		"ML-DSA certificate with forbidden usages and feature gate disabled": {
+			cfg: mldsaCert(0, "", internalcmapi.UsageKeyEncipherment),
+			errs: []*field.Error{
+				gateErr,
+				field.Invalid(fldPath.Child("usages").Index(0), internalcmapi.UsageKeyEncipherment, "not allowed for ML-DSA keys (RFC 9881)"),
+			},
+		},
+	}
+	for n, s := range scenarios {
+		t.Run(n, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.MLDSAPrivateKeys, s.featureEnabled)
+			errs, warnings := ValidateCertificate(someAdmissionRequest, s.cfg)
+			assert.ElementsMatch(t, errs, s.errs)
+			assert.Empty(t, warnings)
+		})
+	}
+}
+
+func TestValidateUpdateCertificateMLDSA(t *testing.T) {
+	fldPath := field.NewPath("spec")
+	certWithAlgorithm := func(algorithm internalcmapi.PrivateKeyAlgorithm) *internalcmapi.Certificate {
+		return &internalcmapi.Certificate{
+			Spec: internalcmapi.CertificateSpec{
+				CommonName: "testcn",
+				SecretName: "abc",
+				IssuerRef:  validIssuerRef,
+				PrivateKey: &internalcmapi.CertificatePrivateKey{
+					Algorithm: algorithm,
+				},
+			},
+		}
+	}
+	gateErr := field.Forbidden(fldPath.Child("privateKey", "algorithm"), "MLDSA requires the MLDSAPrivateKeys feature gate to be enabled")
+
+	scenarios := map[string]struct {
+		old, new       *internalcmapi.Certificate
+		a              *admissionv1.AdmissionRequest
+		featureEnabled bool
+		errs           []*field.Error
+	}{
+		"existing ML-DSA certificate can be updated with feature gate disabled": {
+			old: certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm),
+			new: func() *internalcmapi.Certificate {
+				crt := certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm)
+				crt.Spec.CommonName = "updated"
+				return crt
+			}(),
+			a: someAdmissionRequest,
+		},
+		"existing ML-DSA certificate status can be updated with feature gate disabled": {
+			old: certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm),
+			new: certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm),
+			a: &admissionv1.AdmissionRequest{
+				Operation:   admissionv1.Update,
+				SubResource: "status",
+			},
+		},
+		"certificate can't be changed to ML-DSA with feature gate disabled": {
+			old:  certWithAlgorithm(internalcmapi.ECDSAKeyAlgorithm),
+			new:  certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm),
+			a:    someAdmissionRequest,
+			errs: []*field.Error{gateErr},
+		},
+		"certificate can be changed to ML-DSA with feature gate enabled": {
+			old:            certWithAlgorithm(internalcmapi.ECDSAKeyAlgorithm),
+			new:            certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm),
+			a:              someAdmissionRequest,
+			featureEnabled: true,
+		},
+		"certificate can be changed from ML-DSA with feature gate disabled": {
+			old: certWithAlgorithm(internalcmapi.MLDSAKeyAlgorithm),
+			new: certWithAlgorithm(internalcmapi.ECDSAKeyAlgorithm),
+			a:   someAdmissionRequest,
+		},
+	}
+	for n, s := range scenarios {
+		t.Run(n, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.MLDSAPrivateKeys, s.featureEnabled)
+			errs, warnings := ValidateUpdateCertificate(s.a, s.old, s.new)
+			assert.ElementsMatch(t, errs, s.errs)
+			assert.Empty(t, warnings)
 		})
 	}
 }
@@ -767,6 +1330,126 @@ func TestValidateDuration(t *testing.T) {
 			},
 			errs: []*field.Error{field.Invalid(fldPath.Child("renewBefore"), usefulDurations["one second"].Duration, fmt.Sprintf("certificate renewBefore must be greater than %s", cmapi.MinimumRenewBefore))},
 		},
+		"renewBefore and renewBeforePercentage both set": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					RenewBefore:           usefulDurations["one month"],
+					RenewBeforePercentage: new(int32(95)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("renewBefore"), usefulDurations["one month"].Duration, "renewBefore and renewBeforePercentage are mutually exclusive and cannot both be set"),
+				field.Invalid(fldPath.Child("renewBeforePercentage"), int32(95), "renewBefore and renewBeforePercentage are mutually exclusive and cannot both be set"),
+			},
+		},
+		"valid duration and renewBeforePercentage": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              usefulDurations["one year"],
+					RenewBeforePercentage: new(int32(95)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
+		"unset duration, valid renewBeforePercentage for default": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					RenewBeforePercentage: new(int32(95)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
+		"renewBeforePercentage of zero is outside the allowed range": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					RenewBeforePercentage: new(int32(0)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+			errs: []*field.Error{field.Invalid(fldPath.Child("renewBeforePercentage"), int32(0), "must be an integer in the range (0,100)")},
+		},
+		"renewBeforePercentage of one hundred is outside the allowed range": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					RenewBeforePercentage: new(int32(100)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+			errs: []*field.Error{field.Invalid(fldPath.Child("renewBeforePercentage"), int32(100), "must be an integer in the range (0,100)")},
+		},
+		"negative renewBeforePercentage is outside the allowed range": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					RenewBeforePercentage: new(int32(-5)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+			errs: []*field.Error{field.Invalid(fldPath.Child("renewBeforePercentage"), int32(-5), "must be an integer in the range (0,100)")},
+		},
+		"renewBeforePercentage over one hundred is outside the allowed range": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					RenewBeforePercentage: new(int32(150)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+			errs: []*field.Error{field.Invalid(fldPath.Child("renewBeforePercentage"), int32(150), "must be an integer in the range (0,100)")},
+		},
+		"renewBeforePercentage resulting in exactly the minimum renewBefore is accepted": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              &metav1.Duration{Duration: time.Hour*8 + time.Minute*20},
+					RenewBeforePercentage: new(int32(1)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
+		// The effective renewBefore is duration * percentage / 100. A small
+		// percentage that results in a renewBefore below the 5 minute minimum
+		// must be rejected: 1h * 5% = 3m < 5m.
+		"small renewBeforePercentage resulting in a renewBefore below the minimum is rejected": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              &metav1.Duration{Duration: time.Hour},
+					RenewBeforePercentage: new(int32(5)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+			errs: []*field.Error{field.Invalid(fldPath.Child("renewBeforePercentage"), int32(5), fmt.Sprintf("certificate renewBeforePercentage must result in a renewBefore of at least %s; 5%% of %s is %s", cmapi.MinimumRenewBefore, time.Hour, time.Minute*3))},
+		},
+		// A large percentage yields a large, valid renewBefore and must be
+		// accepted: 1h * 95% = 57m, which is above the minimum and below the
+		// duration.
+		"large renewBeforePercentage resulting in a valid renewBefore is accepted": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              &metav1.Duration{Duration: time.Hour},
+					RenewBeforePercentage: new(int32(95)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
 		"duration is less than the minimum permitted value": {
 			cfg: &internalcmapi.Certificate{
 				Spec: internalcmapi.CertificateSpec{
@@ -779,6 +1462,41 @@ func TestValidateDuration(t *testing.T) {
 			},
 			errs: []*field.Error{field.Invalid(fldPath.Child("duration"), usefulDurations["half hour"].Duration, fmt.Sprintf("certificate duration must be greater than %s", cmapi.MinimumCertificateDuration))},
 		},
+		"renewBeforePercentage=1 with 10-year duration is accepted": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              usefulDurations["ten years"],
+					RenewBeforePercentage: new(int32(1)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
+		// Regression tests for int64 overflow: duration * pct can overflow int64
+		// for long durations with a large renewBeforePercentage.
+		"renewBeforePercentage=99 with 10-year duration does not overflow int64": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              usefulDurations["ten years"],
+					RenewBeforePercentage: new(int32(99)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
+		"renewBeforePercentage=99 with 3-year duration does not overflow int64": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					Duration:              &metav1.Duration{Duration: time.Hour * 24 * 365 * 3},
+					RenewBeforePercentage: new(int32(99)),
+					CommonName:            "testcn",
+					SecretName:            "abc",
+					IssuerRef:             validIssuerRef,
+				},
+			},
+		},
 	}
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
@@ -790,50 +1508,16 @@ func TestValidateDuration(t *testing.T) {
 
 func Test_validateAdditionalOutputFormats(t *testing.T) {
 	tests := map[string]struct {
-		featureEnabled bool
-		spec           *internalcmapi.CertificateSpec
-		expErr         field.ErrorList
+		spec   *internalcmapi.CertificateSpec
+		expErr field.ErrorList
 	}{
-		"if feature disabled and no formats defined, expect no error": {
-			featureEnabled: false,
+		"if no formats defined, expect no error": {
 			spec: &internalcmapi.CertificateSpec{
 				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{},
 			},
 			expErr: nil,
 		},
-		"if feature disabled and 1 format defined, expect error": {
-			featureEnabled: false,
-			spec: &internalcmapi.CertificateSpec{
-				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{
-					{Type: internalcmapi.CertificateOutputFormatType("foo")},
-				},
-			},
-			expErr: field.ErrorList{
-				field.Forbidden(field.NewPath("spec", "additionalOutputFormats"), "feature gate AdditionalCertificateOutputFormats must be enabled"),
-			},
-		},
-		"if feature disabled and multiple formats defined, expect error": {
-			featureEnabled: false,
-			spec: &internalcmapi.CertificateSpec{
-				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{
-					{Type: internalcmapi.CertificateOutputFormatType("foo")},
-					{Type: internalcmapi.CertificateOutputFormatType("bar")},
-					{Type: internalcmapi.CertificateOutputFormatType("random")},
-				},
-			},
-			expErr: field.ErrorList{
-				field.Forbidden(field.NewPath("spec", "additionalOutputFormats"), "feature gate AdditionalCertificateOutputFormats must be enabled"),
-			},
-		},
-		"if feature enabled and no formats defined, expect no error": {
-			featureEnabled: true,
-			spec: &internalcmapi.CertificateSpec{
-				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{},
-			},
-			expErr: nil,
-		},
-		"if feature enabled and single format defined, expect no error": {
-			featureEnabled: true,
+		"if single format defined, expect no error": {
 			spec: &internalcmapi.CertificateSpec{
 				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{
 					{Type: internalcmapi.CertificateOutputFormatType("foo")},
@@ -841,8 +1525,7 @@ func Test_validateAdditionalOutputFormats(t *testing.T) {
 			},
 			expErr: nil,
 		},
-		"if feature enabled and multiple unique formats defined, expect no error": {
-			featureEnabled: true,
+		"if multiple unique formats defined, expect no error": {
 			spec: &internalcmapi.CertificateSpec{
 				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{
 					{Type: internalcmapi.CertificateOutputFormatType("foo")},
@@ -852,8 +1535,7 @@ func Test_validateAdditionalOutputFormats(t *testing.T) {
 			},
 			expErr: nil,
 		},
-		"if feature enabled and multiple formats defined but 2 non-unique, expect error": {
-			featureEnabled: true,
+		"if multiple formats defined but 2 non-unique, expect error": {
 			spec: &internalcmapi.CertificateSpec{
 				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{
 					{Type: internalcmapi.CertificateOutputFormatType("foo")},
@@ -866,8 +1548,7 @@ func Test_validateAdditionalOutputFormats(t *testing.T) {
 				field.Duplicate(field.NewPath("spec", "additionalOutputFormats").Key("type"), "foo"),
 			},
 		},
-		"if feature enabled and multiple formats defined but multiple non-unique, expect error": {
-			featureEnabled: true,
+		"if multiple formats defined but multiple non-unique, expect error": {
 			spec: &internalcmapi.CertificateSpec{
 				AdditionalOutputFormats: []internalcmapi.CertificateAdditionalOutputFormat{
 					{Type: internalcmapi.CertificateOutputFormatType("foo")},
@@ -892,7 +1573,6 @@ func Test_validateAdditionalOutputFormats(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.AdditionalCertificateOutputFormats, test.featureEnabled)()
 			gotErr := validateAdditionalOutputFormats(test.spec, field.NewPath("spec"))
 			assert.Equal(t, test.expErr, gotErr)
 		})
@@ -942,6 +1622,22 @@ func Test_validateLiteralSubject(t *testing.T) {
 					IssuerRef:      validIssuerRef,
 				},
 			},
+			errs: []*field.Error{
+				field.Invalid(
+					fldPath.Child("subject"),
+					&internalcmapi.X509Subject{SerialNumber: "1"}, "When providing a `LiteralSubject` no `Subject` properties may be provided."),
+			},
+			a: someAdmissionRequest,
+		},
+		"valid with a `literalSubject` containing CN with special characters, multiple DC and well-known rfc4514 and rfc5280 RDN OIDs": {
+			featureEnabled: true,
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					LiteralSubject: "CN=James \\\"Jim\\\" Smith\\, III,DC=dc,DC=net,UID=jamessmith,STREET=La Rambla,L=Barcelona,C=Spain,O=Acme,OU=IT,OU=Admins",
+					SecretName:     "abc",
+					IssuerRef:      validIssuerRef,
+				},
+			},
 			a: someAdmissionRequest,
 		},
 		"invalid with a `literalSubject` without CN and no dnsNames, ipAddresses, or emailAddress": {
@@ -955,7 +1651,7 @@ func Test_validateLiteralSubject(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			errs: []*field.Error{
-				field.Invalid(fldPath, "", "at least one of commonName, dnsNames, uris ipAddresses, or emailAddresses must be set"),
+				field.Invalid(fldPath, "", "at least one of commonName (from the commonName field or from a literalSubject), dnsNames, emailSANs, ipAddresses, otherNames, or uriSANs must be set"),
 			},
 		},
 		"invalid with a `literalSubject` and any `Subject` other than serialNumber": {
@@ -972,7 +1668,7 @@ func Test_validateLiteralSubject(t *testing.T) {
 			errs: []*field.Error{
 				field.Invalid(
 					fldPath.Child("subject"),
-					&internalcmapi.X509Subject{Organizations: []string{"US"}}, "When providing a `LiteralSubject` no `Subject` properties may be provided with the exception of `Subject.serialNumber`"),
+					&internalcmapi.X509Subject{Organizations: []string{"US"}}, "When providing a `LiteralSubject` no `Subject` properties may be provided."),
 			},
 		},
 		"invalid with a `literalSubject` and a `commonName`": {
@@ -1012,10 +1708,161 @@ func Test_validateLiteralSubject(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.LiteralCertificateSubject, test.featureEnabled)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.LiteralCertificateSubject, test.featureEnabled)
 			errs, warnings := ValidateCertificate(test.a, test.cfg)
 			assert.ElementsMatch(t, errs, test.errs)
-			assert.ElementsMatch(t, warnings, []string{})
+			assert.Empty(t, warnings)
+		})
+	}
+}
+
+func Test_validateKeystores(t *testing.T) {
+	emptyString := ""
+	keystorePassword := "changeit"
+
+	fldPath := field.NewPath("spec")
+	tests := map[string]struct {
+		cfg  *internalcmapi.Certificate
+		a    *admissionv1.AdmissionRequest
+		errs []*field.Error
+	}{
+		"JKS PasswordSecretRef and Password are mutually exclusive": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					Keystores: &internalcmapi.CertificateKeystores{
+						JKS: &internalcmapi.JKSKeystore{
+							PasswordSecretRef: cmmeta.SecretKeySelector{
+								LocalObjectReference: cmmeta.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+							Password: &keystorePassword,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("keystores", "jks"), fmt.Sprintf(keystoresMutuallyExclusivePasswordsFmt, "JKS")),
+			},
+			a: someAdmissionRequest,
+		},
+		"JKS one of PasswordSecretRef / Password is required (nil password)": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					Keystores: &internalcmapi.CertificateKeystores{
+						JKS: &internalcmapi.JKSKeystore{
+							PasswordSecretRef: cmmeta.SecretKeySelector{},
+							Password:          nil,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("keystores", "jks"), fmt.Sprintf(keystoresPasswordRequiredFmt, "JKS")),
+			},
+			a: someAdmissionRequest,
+		},
+		"JKS one of PasswordSecretRef / Password is required (empty strings)": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					Keystores: &internalcmapi.CertificateKeystores{
+						JKS: &internalcmapi.JKSKeystore{
+							PasswordSecretRef: cmmeta.SecretKeySelector{
+								LocalObjectReference: cmmeta.LocalObjectReference{
+									Name: "",
+								},
+							},
+							Password: &emptyString,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("keystores", "jks", "password"), fmt.Sprintf(keystoresLiteralPasswordMustNotBeEmptyFmt, "JKS")),
+			},
+			a: someAdmissionRequest,
+		},
+		"PKCS12 PasswordSecretRef and Password are mutually exclusive": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					Keystores: &internalcmapi.CertificateKeystores{
+						PKCS12: &internalcmapi.PKCS12Keystore{
+							PasswordSecretRef: cmmeta.SecretKeySelector{
+								LocalObjectReference: cmmeta.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+							Password: &keystorePassword,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("keystores", "pkcs12"), fmt.Sprintf(keystoresMutuallyExclusivePasswordsFmt, "PKCS#12")),
+			},
+			a: someAdmissionRequest,
+		},
+		"PKCS12 one of PasswordSecretRef / Password is required (nil password)": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					Keystores: &internalcmapi.CertificateKeystores{
+						PKCS12: &internalcmapi.PKCS12Keystore{
+							PasswordSecretRef: cmmeta.SecretKeySelector{},
+							Password:          nil,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("keystores", "pkcs12"), fmt.Sprintf(keystoresPasswordRequiredFmt, "PKCS#12")),
+			},
+			a: someAdmissionRequest,
+		},
+		"PKCS12 one of PasswordSecretRef / Password is required (empty strings)": {
+			cfg: &internalcmapi.Certificate{
+				Spec: internalcmapi.CertificateSpec{
+					CommonName: "testcn",
+					SecretName: "abc",
+					IssuerRef:  validIssuerRef,
+					Keystores: &internalcmapi.CertificateKeystores{
+						PKCS12: &internalcmapi.PKCS12Keystore{
+							PasswordSecretRef: cmmeta.SecretKeySelector{
+								LocalObjectReference: cmmeta.LocalObjectReference{
+									Name: "",
+								},
+							},
+							Password: &emptyString,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("keystores", "pkcs12", "password"), fmt.Sprintf(keystoresLiteralPasswordMustNotBeEmptyFmt, "PKCS#12")),
+			},
+			a: someAdmissionRequest,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			errs, warnings := ValidateCertificate(test.a, test.cfg)
+			assert.ElementsMatch(t, errs, test.errs)
+			assert.Empty(t, warnings)
 		})
 	}
 }

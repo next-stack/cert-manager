@@ -19,12 +19,16 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"time"
 
-	cf "github.com/cloudflare/cloudflare-go"
-
-	"github.com/cert-manager/cert-manager/cmd/util"
+	"github.com/cert-manager/cert-manager/internal/cmd/util"
+	cf "github.com/cloudflare/cloudflare-go/v7"
+	"github.com/cloudflare/cloudflare-go/v7/dns"
+	"github.com/cloudflare/cloudflare-go/v7/option"
+	"github.com/cloudflare/cloudflare-go/v7/packages/pagination"
+	cfz "github.com/cloudflare/cloudflare-go/v7/zones"
 )
 
 var (
@@ -37,34 +41,45 @@ var (
 )
 
 func main() {
-	stopCh, exit := util.SetupExitHandler(util.GracefulShutdown)
+	ctx, exit := util.SetupExitHandler(context.Background(), util.GracefulShutdown)
 	defer exit() // This function might call os.Exit, so defer last
 
 	flag.Parse()
 
-	ctx := util.ContextWithStopCh(context.Background(), stopCh)
+	if err := Main(ctx); err != nil {
+		log.Print(err)
+		util.SetExitCode(err)
+	}
+}
 
-	cl, err := cf.New(*apiKey, *email)
-	if err != nil {
-		log.Fatalf("error creating cloudflare client: %v", err)
+func Main(ctx context.Context) error {
+	cl := cf.NewClient(
+		option.WithAPIKey(*apiKey),
+		option.WithAPIEmail(*email),
+	)
+	if cl.Zones == nil || cl.DNS == nil {
+		return fmt.Errorf("error creating cloudflare client; check permissions related to the client.")
 	}
 
-	zones, err := cl.ListZones(ctx, *zoneName)
+	zones, err := convertPagerToSlice(cl.Zones.ListAutoPaging(ctx, cfz.ZoneListParams{
+		Name: cf.F(*zoneName),
+	}))
 	if err != nil {
-		log.Fatalf("error listing zones: %v", err)
+		return fmt.Errorf("error listing zones: %v", err)
 	}
 	if len(zones) == 0 {
-		log.Fatalf("could not find zone with name %q", *zoneName)
+		return fmt.Errorf("could not find zone with name %q", *zoneName)
 	}
 	if len(zones) > 1 {
-		log.Fatalf("found multiple zones for name %q", *zoneName)
+		return fmt.Errorf("found multiple zones for name %q", *zoneName)
 	}
 	zone := zones[0]
-	rrs, err := cl.DNSRecords(ctx, zone.ID, cf.DNSRecord{
-		Type: "TXT",
-	})
+	rrs, err := convertPagerToSlice(cl.DNS.Records.ListAutoPaging(ctx, dns.RecordListParams{
+		ZoneID: cf.F(zone.ID),
+		Type:   cf.F(dns.RecordListParamsTypeTXT),
+	}))
 	if err != nil {
-		log.Fatalf("error listing TXT records in zone: %v", err)
+		return fmt.Errorf("error listing TXT records in zone: %v", err)
 	}
 
 	log.Printf("Evaluating %d records", len(rrs))
@@ -84,7 +99,9 @@ func main() {
 			continue
 		}
 
-		err := cl.DeleteDNSRecord(ctx, rr.ZoneID, rr.ID)
+		_, err := cl.DNS.Records.Delete(ctx, rr.ID, dns.RecordDeleteParams{
+			ZoneID: cf.F(zone.ID),
+		})
 		if err != nil {
 			log.Printf("Error deleting record: %v", err)
 			errs = append(errs, err)
@@ -95,16 +112,18 @@ func main() {
 	}
 
 	if len(errs) > 0 {
-		log.Fatalf("Encountered %d errors whilst cleaning up zone", len(errs))
+		return fmt.Errorf("encountered %d errors whilst cleaning up zone", len(errs))
 	}
 
 	log.Print()
 	log.Printf("Skipped: %d", skipped)
 	log.Printf("Deleted: %d", deleted)
 	log.Printf("Cleanup complete!")
+
+	return nil
 }
 
-func shouldDelete(rr cf.DNSRecord) bool {
+func shouldDelete(rr dns.RecordResponse) bool {
 	// be extra safe about only deleting TXT records
 	if rr.Type != "TXT" {
 		return false
@@ -119,4 +138,18 @@ func shouldDelete(rr cf.DNSRecord) bool {
 		return false
 	}
 	return true
+}
+
+func convertPagerToSlice[T any](arr *pagination.V4PagePaginationArrayAutoPager[T]) ([]T, error) {
+	var rtArr []T
+
+	for arr.Next() {
+		rtArr = append(rtArr, arr.Current())
+	}
+
+	if arr.Err() != nil {
+		return nil, arr.Err()
+	}
+
+	return rtArr, nil
 }

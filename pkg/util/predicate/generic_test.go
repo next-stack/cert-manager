@@ -30,13 +30,11 @@ import (
 func TestResourceOwnedBy(t *testing.T) {
 	baseGVK := cmapi.SchemeGroupVersion.WithKind("CertificateRequest")
 	request := func(name string) *cmapi.CertificateRequest {
-		return &cmapi.CertificateRequest{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name)}}
+		return &cmapi.CertificateRequest{Name: name, UID: types.UID(name)}
 	}
 	requestWithOwner := func(owner metav1.Object, gvk schema.GroupVersionKind) *cmapi.CertificateRequest {
 		return &cmapi.CertificateRequest{
-			ObjectMeta: metav1.ObjectMeta{
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, gvk)},
-			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, gvk)},
 		}
 	}
 	tests := map[string]struct {
@@ -57,7 +55,7 @@ func TestResourceOwnedBy(t *testing.T) {
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			got := ResourceOwnedBy(test.owner)(test.obj)
+			got := ResourceOwnedBy[*cmapi.CertificateRequest](test.owner.(metav1.Object))(test.obj.(*cmapi.CertificateRequest))
 			if got != test.expected {
 				t.Errorf("unexpected response: got=%t, exp=%t", got, test.expected)
 			}
@@ -68,13 +66,11 @@ func TestResourceOwnedBy(t *testing.T) {
 func TestResourceOwnerOf(t *testing.T) {
 	baseGVK := cmapi.SchemeGroupVersion.WithKind("CertificateRequest")
 	request := func(name string) *cmapi.CertificateRequest {
-		return &cmapi.CertificateRequest{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name)}}
+		return &cmapi.CertificateRequest{Name: name, UID: types.UID(name)}
 	}
 	requestWithOwner := func(owner metav1.Object, gvk schema.GroupVersionKind) *cmapi.CertificateRequest {
 		return &cmapi.CertificateRequest{
-			ObjectMeta: metav1.ObjectMeta{
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, gvk)},
-			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, gvk)},
 		}
 	}
 	tests := map[string]struct {
@@ -95,7 +91,7 @@ func TestResourceOwnerOf(t *testing.T) {
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			got := ResourceOwnerOf(test.ownee)(test.obj)
+			got := ResourceOwnerOf[*cmapi.CertificateRequest](test.ownee.(metav1.Object))(test.obj.(*cmapi.CertificateRequest))
 			if got != test.expected {
 				t.Errorf("unexpected response: got=%t, exp=%t", got, test.expected)
 			}

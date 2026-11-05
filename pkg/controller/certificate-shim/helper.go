@@ -17,17 +17,25 @@ limitations under the License.
 package shimhelper
 
 import (
+	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/mail"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	"github.com/cert-manager/cert-manager/pkg/util"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
+	"github.com/cert-manager/cert-manager/pkg/util/pki"
 )
 
 var (
@@ -64,13 +72,129 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 	}
 
 	if commonName, found := ingLikeAnnotations[cmapi.CommonNameAnnotationKey]; found {
+		if len(commonName) > 64 {
+			return fmt.Errorf("%w %q: common name may not be more than 64 bytes", errInvalidIngressAnnotation, cmapi.CommonNameAnnotationKey)
+		}
 		crt.Spec.CommonName = commonName
+	}
+
+	if altNames, found := ingLikeAnnotations[cmapi.AltNamesAnnotationKey]; found && altNames != "" {
+		addDnsNames := strings.Split(altNames, ",")
+		crt.Spec.DNSNames = append(crt.Spec.DNSNames, addDnsNames...)
+	}
+
+	if ipSANs, found := ingLikeAnnotations[cmapi.IPSANAnnotationKey]; found && ipSANs != "" {
+		ipAddresses := strings.Split(ipSANs, ",")
+		trimmedIPs := make([]string, 0, len(ipAddresses))
+		for _, ipStr := range ipAddresses {
+			ipStr = strings.TrimSpace(ipStr)
+			if net.ParseIP(ipStr) == nil {
+				return fmt.Errorf("%w %q: %q is not a valid IP address", errInvalidIngressAnnotation, cmapi.IPSANAnnotationKey, ipStr)
+			}
+			trimmedIPs = append(trimmedIPs, ipStr)
+		}
+		crt.Spec.IPAddresses = append(crt.Spec.IPAddresses, trimmedIPs...)
+	}
+
+	if emailAddresses, found := ingLikeAnnotations[cmapi.EmailsAnnotationKey]; found && emailAddresses != "" {
+		emails := strings.Split(emailAddresses, ",")
+		trimmedEmails := make([]string, 0, len(emails))
+		for _, email := range emails {
+			email = strings.TrimSpace(email)
+			e, err := mail.ParseAddress(email)
+			if err != nil {
+				return fmt.Errorf("%w %q: %q is not a valid email address", errInvalidIngressAnnotation, cmapi.EmailsAnnotationKey, email)
+			}
+			// Mirror the cert-manager webhook: reject display-name forms
+			// (e.g. "Name <a@b.com>") so the stored value is exactly the address.
+			if e.Address != email {
+				return fmt.Errorf("%w %q: %q must only contain the email address itself", errInvalidIngressAnnotation, cmapi.EmailsAnnotationKey, email)
+			}
+			trimmedEmails = append(trimmedEmails, email)
+		}
+		crt.Spec.EmailAddresses = trimmedEmails
+	}
+
+	subject := &cmapi.X509Subject{}
+	if organizations, found := ingLikeAnnotations[cmapi.SubjectOrganizationsAnnotationKey]; found {
+		organizations, err := util.SplitWithEscapeCSV(organizations)
+		subject.Organizations = organizations
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectOrganizationsAnnotationKey, err)
+		}
+	}
+
+	if organizationalUnits, found := ingLikeAnnotations[cmapi.SubjectOrganizationalUnitsAnnotationKey]; found {
+		organizationalUnits, err := util.SplitWithEscapeCSV(organizationalUnits)
+		subject.OrganizationalUnits = organizationalUnits
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectOrganizationsAnnotationKey, err)
+		}
+	}
+
+	if countries, found := ingLikeAnnotations[cmapi.SubjectCountriesAnnotationKey]; found {
+		countries, err := util.SplitWithEscapeCSV(countries)
+		subject.Countries = countries
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectCountriesAnnotationKey, err)
+		}
+	}
+
+	if provinces, found := ingLikeAnnotations[cmapi.SubjectProvincesAnnotationKey]; found {
+		provinces, err := util.SplitWithEscapeCSV(provinces)
+		subject.Provinces = provinces
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectProvincesAnnotationKey, err)
+		}
+	}
+
+	if localities, found := ingLikeAnnotations[cmapi.SubjectLocalitiesAnnotationKey]; found {
+		localities, err := util.SplitWithEscapeCSV(localities)
+		subject.Localities = localities
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectLocalitiesAnnotationKey, err)
+		}
+	}
+
+	if postalCodes, found := ingLikeAnnotations[cmapi.SubjectPostalCodesAnnotationKey]; found {
+		postalCodes, err := util.SplitWithEscapeCSV(postalCodes)
+		subject.PostalCodes = postalCodes
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectPostalCodesAnnotationKey, err)
+		}
+	}
+
+	if streetAddresses, found := ingLikeAnnotations[cmapi.SubjectStreetAddressesAnnotationKey]; found {
+		streetAddresses, err := util.SplitWithEscapeCSV(streetAddresses)
+		subject.StreetAddresses = streetAddresses
+
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.SubjectStreetAddressesAnnotationKey, err)
+		}
+	}
+
+	if serialNumber, found := ingLikeAnnotations[cmapi.SubjectSerialNumberAnnotationKey]; found {
+		subject.SerialNumber = serialNumber
+	}
+
+	emptySubject := &cmapi.X509Subject{}
+	if !reflect.DeepEqual(emptySubject, subject) {
+		crt.Spec.Subject = subject
 	}
 
 	if duration, found := ingLikeAnnotations[cmapi.DurationAnnotationKey]; found {
 		duration, err := time.ParseDuration(duration)
 		if err != nil {
 			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.DurationAnnotationKey, err)
+		}
+		if duration < cmapi.MinimumCertificateDuration {
+			return fmt.Errorf("%w %q: duration must be greater than or equal to %s", errInvalidIngressAnnotation, cmapi.DurationAnnotationKey, cmapi.MinimumCertificateDuration)
 		}
 		crt.Spec.Duration = &metav1.Duration{Duration: duration}
 	}
@@ -80,12 +204,23 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 		if err != nil {
 			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.RenewBeforeAnnotationKey, err)
 		}
+		if duration < cmapi.MinimumRenewBefore {
+			return fmt.Errorf("%w %q: renewBefore must be greater than or equal to %s", errInvalidIngressAnnotation, cmapi.RenewBeforeAnnotationKey, cmapi.MinimumRenewBefore)
+		}
 		crt.Spec.RenewBefore = &metav1.Duration{Duration: duration}
+	}
+
+	if renewBeforePercentage, found := ingLikeAnnotations[cmapi.RenewBeforePercentageAnnotationKey]; found {
+		pct, err := strconv.ParseInt(renewBeforePercentage, 10, 32)
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidIngressAnnotation, cmapi.RenewBeforePercentageAnnotationKey, err)
+		}
+		crt.Spec.RenewBeforePercentage = new(int32(pct))
 	}
 
 	if usages, found := ingLikeAnnotations[cmapi.UsagesAnnotationKey]; found {
 		var newUsages []cmapi.KeyUsage
-		for _, usageName := range strings.Split(usages, ",") {
+		for usageName := range strings.SplitSeq(usages, ",") {
 			usage := cmapi.KeyUsage(strings.Trim(usageName, " "))
 			_, isKU := apiutil.KeyUsageType(usage)
 			_, isEKU := apiutil.ExtKeyUsageType(usage)
@@ -107,7 +242,7 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 			return fmt.Errorf("%w %q: revision history limit must be a positive number %q", errInvalidIngressAnnotation, cmapi.RevisionHistoryLimitAnnotationKey, revisionHistoryLimit)
 		}
 
-		crt.Spec.RevisionHistoryLimit = pointer.Int32(int32(limit))
+		crt.Spec.RevisionHistoryLimit = new(int32(limit))
 	}
 
 	if privateKeyAlgorithm, found := ingLikeAnnotations[cmapi.PrivateKeyAlgorithmAnnotationKey]; found {
@@ -117,6 +252,26 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 			cmapi.ECDSAKeyAlgorithm,
 			cmapi.Ed25519KeyAlgorithm:
 			// ok
+		case cmapi.MLDSAKeyAlgorithm:
+			if !utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) {
+				return fmt.Errorf("%w %q: private key algorithm %q requires the MLDSAPrivateKeys feature gate to be enabled", errInvalidIngressAnnotation, cmapi.PrivateKeyAlgorithmAnnotationKey, privateKeyAlgorithm)
+			}
+
+			if _, found := ingLikeAnnotations[cmapi.UsagesAnnotationKey]; !found {
+				// The default usages include key encipherment, which RFC 9881
+				// forbids for ML-DSA keys.
+				crt.Spec.Usages = pki.DefaultKeyUsagesForPublicKeyAlgorithm(x509.MLDSA)
+			} else {
+				var forbidden []cmapi.KeyUsage
+				for _, u := range crt.Spec.Usages {
+					if !pki.KeyUsageAllowedForPublicKeyAlgorithm(u, x509.MLDSA) {
+						forbidden = append(forbidden, u)
+					}
+				}
+				if len(forbidden) > 0 {
+					return fmt.Errorf("%w %q: key usages %v are not allowed for private key algorithm %q", errInvalidIngressAnnotation, cmapi.UsagesAnnotationKey, forbidden, privateKeyAlgorithm)
+				}
+			}
 		default:
 			return fmt.Errorf("%w %q: invalid private key algorithm %q", errInvalidIngressAnnotation, cmapi.PrivateKeyAlgorithmAnnotationKey, privateKeyAlgorithm)
 		}
@@ -156,7 +311,7 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 
 		switch algorithm {
 		case cmapi.RSAKeyAlgorithm:
-			if size < 2048 || size > 8192 {
+			if size < pki.MinRSAKeySize || size > pki.MaxRSAKeySize {
 				return fmt.Errorf("%w %q: invalid private key size for RSA algorithm %q", errInvalidIngressAnnotation, cmapi.PrivateKeySizeAnnotationKey, privateKeySize)
 			}
 		case cmapi.ECDSAKeyAlgorithm:
@@ -166,6 +321,15 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 			default:
 				return fmt.Errorf("%w %q: invalid private key size for ECDSA algorithm %q", errInvalidIngressAnnotation, cmapi.PrivateKeySizeAnnotationKey, privateKeySize)
 			}
+		case cmapi.MLDSAKeyAlgorithm:
+			switch size {
+			case pki.MLDSA44, pki.MLDSA65, pki.MLDSA87:
+				// ok
+			default:
+				return fmt.Errorf("%w %q: invalid private key size for ML-DSA algorithm %q", errInvalidIngressAnnotation, cmapi.PrivateKeySizeAnnotationKey, privateKeySize)
+			}
+		default:
+			// ok
 		}
 
 		if crt.Spec.PrivateKey == nil {
@@ -186,6 +350,24 @@ func translateAnnotations(crt *cmapi.Certificate, ingLikeAnnotations map[string]
 			crt.Spec.PrivateKey = &cmapi.CertificatePrivateKey{RotationPolicy: rotationPolicy}
 		} else {
 			crt.Spec.PrivateKey.RotationPolicy = rotationPolicy
+		}
+	}
+
+	if secretTemplateJson, found := ingLikeAnnotations[cmapi.IngressSecretTemplate]; found {
+		decoder := json.NewDecoder(strings.NewReader(secretTemplateJson))
+		decoder.DisallowUnknownFields()
+
+		secretTemplate := new(cmapi.CertificateSecretTemplate)
+		if err := decoder.Decode(secretTemplate); err != nil {
+			return fmt.Errorf("%w %q: error parsing secret template JSON: %v", errInvalidIngressAnnotation, cmapi.IngressSecretTemplate, err)
+		}
+		for annotationKey := range secretTemplate.Annotations {
+			if strings.HasPrefix(annotationKey, "cert-manager.io/") {
+				return fmt.Errorf("%w %q: secretTemplate must not have cert-manager.io/ annotations: %q", errInvalidIngressAnnotation, cmapi.IngressSecretTemplate, annotationKey)
+			}
+		}
+		if len(secretTemplate.Annotations) > 0 || len(secretTemplate.Labels) > 0 {
+			crt.Spec.SecretTemplate = secretTemplate
 		}
 	}
 

@@ -19,14 +19,15 @@ package dnsproviders
 import (
 	"context"
 
+	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/addon/base"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/config"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/util/errors"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/addon"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/addon/base"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/config"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/util/errors"
 )
 
 // Cloudflare provisions cloudflare credentials in a namespace for cert-manager
@@ -44,24 +45,24 @@ type Cloudflare struct {
 	createdSecret *corev1.Secret
 }
 
-func (b *Cloudflare) Setup(c *config.Config) error {
-	if c.Suite.ACME.Cloudflare.APIKey == "" ||
-		c.Suite.ACME.Cloudflare.Domain == "" ||
-		c.Suite.ACME.Cloudflare.Email == "" {
-		return errors.NewSkip(ErrNoCredentials)
+func (b *Cloudflare) Setup(ctx context.Context, cfg *config.Config, _ ...addon.AddonTransferableData) (addon.AddonTransferableData, error) {
+	if cfg.Suite.ACME.Cloudflare.APIKey == "" ||
+		cfg.Suite.ACME.Cloudflare.Domain == "" ||
+		cfg.Suite.ACME.Cloudflare.Email == "" {
+		return nil, errors.NewSkip(ErrNoCredentials)
 	}
 
 	if b.Base == nil {
 		b.Base = &base.Base{}
-		err := b.Base.Setup(c)
+		_, err := b.Base.Setup(ctx, cfg)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	b.cf = c.Suite.ACME.Cloudflare
+	b.cf = cfg.Suite.ACME.Cloudflare
 
-	return nil
+	return nil, nil
 }
 
 // Provision will create a copy of the DNS provider credentials in a secret in
@@ -69,10 +70,8 @@ func (b *Cloudflare) Setup(c *config.Config) error {
 // utilise these credentials in tests.
 func (b *Cloudflare) Provision() error {
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "cm-e2e-cloudflare-",
-			Namespace:    b.Namespace,
-		},
+		GenerateName: "cm-e2e-cloudflare-",
+		Namespace:    b.Namespace,
 		Data: map[string][]byte{
 			"email":   []byte(b.cf.Email),
 			"api-key": []byte(b.cf.APIKey),
@@ -89,10 +88,8 @@ func (b *Cloudflare) Provision() error {
 		Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 			Email: b.cf.Email,
 			APIKey: &cmmeta.SecretKeySelector{
-				LocalObjectReference: cmmeta.LocalObjectReference{
-					Name: b.createdSecret.Name,
-				},
-				Key: "api-key",
+				Name: b.createdSecret.Name,
+				Key:  "api-key",
 			},
 		},
 	}
@@ -102,8 +99,7 @@ func (b *Cloudflare) Provision() error {
 }
 
 func (b *Cloudflare) Deprovision() error {
-	b.Base.Details().KubeClient.CoreV1().Secrets(b.createdSecret.Namespace).Delete(context.TODO(), b.createdSecret.Name, metav1.DeleteOptions{})
-	return nil
+	return b.Base.Details().KubeClient.CoreV1().Secrets(b.createdSecret.Namespace).Delete(context.TODO(), b.createdSecret.Name, metav1.DeleteOptions{})
 }
 
 func (b *Cloudflare) Details() *Details {

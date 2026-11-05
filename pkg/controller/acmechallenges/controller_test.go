@@ -17,21 +17,15 @@ limitations under the License.
 package acmechallenges
 
 import (
-	"context"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
 	coretesting "k8s.io/client-go/testing"
 
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
-	"github.com/stretchr/testify/require"
-)
-
-const (
-	randomFinalizer         = "random.acme.cert-manager.io"
-	maxConcurrentChallenges = 60
 )
 
 func TestRunScheduler(t *testing.T) {
@@ -137,7 +131,7 @@ func TestRunScheduler(t *testing.T) {
 			_, _, err := c.Register(test.builder.Context)
 			require.NoError(t, err)
 			test.builder.Start()
-			c.runScheduler(context.Background())
+			c.runScheduler(t.Context())
 			test.builder.CheckAndFinish()
 		})
 	}

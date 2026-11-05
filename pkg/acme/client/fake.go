@@ -18,9 +18,10 @@ package client
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 
-	"golang.org/x/crypto/acme"
+	"github.com/cert-manager/cert-manager/third_party/forked/acme"
 )
 
 // TODO: expand this out one day to be backed by the pebble wfe package
@@ -34,6 +35,7 @@ type FakeACME struct {
 	FakeListCertAlternates      func(ctx context.Context, url string) ([]string, error)
 	FakeWaitOrder               func(ctx context.Context, url string) (*acme.Order, error)
 	FakeCreateOrderCert         func(ctx context.Context, finalizeURL string, csr []byte, bundle bool) (der [][]byte, certURL string, err error)
+	FakeCreateCertFromOrder     func(ctx context.Context, order *acme.Order, csr []byte, bundle bool) (der [][]byte, certURL string, err error)
 	FakeAccept                  func(ctx context.Context, chal *acme.Challenge) (*acme.Challenge, error)
 	FakeGetChallenge            func(ctx context.Context, url string) (*acme.Challenge, error)
 	FakeGetAuthorization        func(ctx context.Context, url string) (*acme.Authorization, error)
@@ -44,6 +46,7 @@ type FakeACME struct {
 	FakeDNS01ChallengeRecord    func(token string) (string, error)
 	FakeDiscover                func(ctx context.Context) (acme.Directory, error)
 	FakeUpdateReg               func(ctx context.Context, a *acme.Account) (*acme.Account, error)
+	FakeGetRenewalInfo          func(ctx context.Context, cert *x509.Certificate) (*acme.RenewalInfoResponse, error)
 }
 
 var _ Interface = &FakeACME{}
@@ -81,6 +84,13 @@ func (f *FakeACME) CreateOrderCert(ctx context.Context, finalizeURL string, csr 
 		return f.FakeCreateOrderCert(ctx, finalizeURL, csr, bundle)
 	}
 	return nil, "", fmt.Errorf("CreateOrderCert not implemented")
+}
+
+func (f *FakeACME) CreateCertFromOrder(ctx context.Context, order *acme.Order, csr []byte, bundle bool) (der [][]byte, certURL string, err error) {
+	if f.FakeCreateCertFromOrder != nil {
+		return f.FakeCreateCertFromOrder(ctx, order, csr, bundle)
+	}
+	return nil, "", fmt.Errorf("CreateCertFromOrder not implemented")
 }
 
 func (f *FakeACME) Accept(ctx context.Context, chal *acme.Challenge) (*acme.Challenge, error) {
@@ -160,4 +170,11 @@ func (f *FakeACME) ListCertAlternates(ctx context.Context, url string) ([]string
 		return f.FakeListCertAlternates(ctx, url)
 	}
 	return nil, fmt.Errorf("ListCertAlternates not implemented")
+}
+
+func (f *FakeACME) GetRenewalInfo(ctx context.Context, cert *x509.Certificate) (*acme.RenewalInfoResponse, error) {
+	if f.FakeGetRenewalInfo != nil {
+		return f.FakeGetRenewalInfo(ctx, cert)
+	}
+	return nil, fmt.Errorf("GetRenewalInfo not implemented")
 }

@@ -18,11 +18,24 @@ package solver
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
+)
+
+const (
+	// This is intended to mitigate "slowloris" attacks by limiting the time a
+	// deliberately slow client can spend sending HTTP headers.
+	// This default value is copied from:
+	// * kubernetes api-server:
+	//   https://github.com/kubernetes/kubernetes/blob/9e028b40b9e970142191259effe796b3dab39828/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go#L165-L173
+	// * controller-runtime:
+	//   https://github.com/kubernetes-sigs/controller-runtime/blob/1ea2be573f7887a9fbd766e9a921c5af344da6eb/pkg/internal/httpserver/server.go#L14
+	defaultReadHeaderTimeout = 32 * time.Second
 )
 
 type HTTP01Solver struct {
@@ -43,9 +56,19 @@ func (h *HTTP01Solver) Listen(log logr.Logger) error {
 		"listen_port", h.ListenPort,
 	)
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.Server = http.Server{
+		Addr:              fmt.Sprintf(":%d", h.ListenPort),
+		Handler:           h.challengeHandler(log),
+		ReadHeaderTimeout: defaultReadHeaderTimeout, // Mitigation for G112: Potential slowloris attack
+	}
+
+	return h.Server.ListenAndServe()
+}
+
+func (h *HTTP01Solver) challengeHandler(log logr.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// extract vars from the request
-		host := strings.Split(r.Host, ":")[0]
+		host := parseHost(r.Host)
 		basePath := path.Dir(r.URL.EscapedPath())
 		token := path.Base(r.URL.EscapedPath())
 
@@ -54,7 +77,9 @@ func (h *HTTP01Solver) Listen(log logr.Logger) error {
 			"path", r.URL.EscapedPath(),
 			"base_path", basePath,
 			"token", token,
+			"headers", r.Header,
 		)
+
 		if r.URL.EscapedPath() == "/" || r.URL.EscapedPath() == "/healthz" {
 			log.Info("responding OK to health check")
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -88,12 +113,19 @@ func (h *HTTP01Solver) Listen(log logr.Logger) error {
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, h.Key)
-	})
+	}
+}
 
-	h.Server = http.Server{
-		Addr:    fmt.Sprintf(":%d", h.ListenPort),
-		Handler: handler,
+func parseHost(s string) string {
+	// According to RFC 3986 Section 3.2.2, IPv6 address literals must be enclosed in square brackets.
+	// In addition, per RFC 9110, the HTTP Host header follows URI host syntax.
+	// Therefore, square brackets are required for IPv6 addresses.
+
+	// with port
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return host
 	}
 
-	return h.Server.ListenAndServe()
+	// without port
+	return strings.Trim(s, "[]")
 }

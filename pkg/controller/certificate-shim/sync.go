@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"reflect"
 	"strconv"
 	"strings"
@@ -32,9 +34,12 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
-	gwapi "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	gwapi "sigs.k8s.io/gateway-api/apis/v1"
 
 	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
@@ -49,14 +54,28 @@ import (
 )
 
 const (
-	reasonBadConfig         = "BadConfig"
-	reasonCreateCertificate = "CreateCertificate"
-	reasonUpdateCertificate = "UpdateCertificate"
-	reasonDeleteCertificate = "DeleteCertificate"
+	reasonBadConfig                 = "BadConfig"
+	reasonSkippedListenerAnnotation = "SkippedListenerAnnotation"
+	reasonCreateCertificate         = "CreateCertificate"
+	reasonUpdateCertificate         = "UpdateCertificate"
+	reasonDeleteCertificate         = "DeleteCertificate"
 )
 
-var ingressV1GVK = networkingv1.SchemeGroupVersion.WithKind("Ingress")
-var gatewayGVK = gwapi.SchemeGroupVersion.WithKind("Gateway")
+const applysetLabel = "applyset.kubernetes.io/part-of"
+
+var (
+	ingressV1GVK = networkingv1.SchemeGroupVersion.WithKind("Ingress")
+	gatewayGVK   = schema.GroupVersionKind{
+		Group:   gwapi.GroupVersion.Group,
+		Version: gwapi.GroupVersion.Version,
+		Kind:    "Gateway",
+	}
+	listenerSetGVK = schema.GroupVersionKind{
+		Group:   gwapi.GroupVersion.Group,
+		Version: gwapi.GroupVersion.Version,
+		Kind:    "ListenerSet",
+	}
+)
 
 // SyncFn is the reconciliation function passed to a certificate-shim's
 // controller.
@@ -91,14 +110,18 @@ func SyncFnFor(
 		// "kubernetes.io/tls-acme" annotation are only enabled for the Ingress
 		// resource.
 		var autoAnnotations []string
-		switch ingLike.(type) {
-		case *networkingv1.Ingress:
+		if _, ok := ingLike.(*networkingv1.Ingress); ok {
 			autoAnnotations = defaults.DefaultAutoCertificateAnnotations
 		}
 
 		if !hasShimAnnotation(ingLike, autoAnnotations) {
-			logf.V(logf.DebugLevel).Infof("not syncing ingress resource as it does not contain a %q or %q annotation",
-				cmapi.IngressIssuerNameAnnotationKey, cmapi.IngressClusterIssuerNameAnnotationKey)
+			log.V(logf.DebugLevel).Info("not syncing ingress resource",
+				"reason", fmt.Sprintf("it does not contain a %q or %q annotation", cmapi.IngressIssuerNameAnnotationKey, cmapi.IngressClusterIssuerNameAnnotationKey))
+			return nil
+		}
+
+		if isDeletedInForeground(ingLike) {
+			log.V(logf.DebugLevel).Info("not syncing ingress resource", "reason", "it is being deleted via foreground cascading")
 			return nil
 		}
 
@@ -112,17 +135,34 @@ func SyncFnFor(
 
 		err = validateIngressLike(ingLike).ToAggregate()
 		if err != nil {
-			rec.Eventf(ingLikeObj, corev1.EventTypeWarning, reasonBadConfig, err.Error())
+			rec.Eventf(ingLikeObj, corev1.EventTypeWarning, reasonBadConfig, "%s", err.Error())
 			return nil
 		}
 
-		newCrts, updateCrts, err := buildCertificates(rec, log, cmLister, ingLike, issuerName, issuerKind, issuerGroup)
+		extraAnnotations := extractExtraAnnotations(ingLike, defaults.ExtraCertificateAnnotations)
+		newCrts, updateCrts, err := buildCertificates(rec, log, cmLister, ingLike, issuerName, issuerKind, issuerGroup, extraAnnotations, defaults)
+		if errors.Is(err, errInvalidIngressAnnotation) {
+			// Retrying won't help. Fixing an invalid annotation means changing
+			// the annotation, which triggers a new sync, or changing a feature
+			// gate, which restarts the controller and resyncs everything.
+			log.Error(err, "not creating or updating Certificates because of an invalid annotation")
+			rec.Eventf(ingLikeObj, corev1.EventTypeWarning, reasonBadConfig, "%s", err.Error())
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 
 		for _, crt := range newCrts {
-			_, err := cmClient.CertmanagerV1().Certificates(crt.Namespace).Create(ctx, crt, metav1.CreateOptions{FieldManager: fieldManager})
+			if utilfeature.DefaultFeatureGate.Enabled(feature.ServerSideApply) {
+				// Apply, not Create, so the Certificate is born owned by an
+				// operation:Apply entry that the update path can prune from.
+				// Not forced, so a Certificate the shim does not own conflicts
+				// rather than being adopted; the error requeues the item.
+				err = internalcertificates.ApplyNonForced(ctx, cmClient, fieldManager, crt)
+			} else {
+				_, err = cmClient.CertmanagerV1().Certificates(crt.Namespace).Create(ctx, crt, metav1.CreateOptions{FieldManager: fieldManager})
+			}
 			if err != nil {
 				return err
 			}
@@ -132,20 +172,7 @@ func SyncFnFor(
 		for _, crt := range updateCrts {
 
 			if utilfeature.DefaultFeatureGate.Enabled(feature.ServerSideApply) {
-				err = internalcertificates.Apply(ctx, cmClient, fieldManager, &cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            crt.Name,
-						Namespace:       crt.Namespace,
-						Labels:          crt.Labels,
-						OwnerReferences: crt.OwnerReferences,
-					},
-					Spec: cmapi.CertificateSpec{
-						DNSNames:   crt.Spec.DNSNames,
-						SecretName: crt.Spec.SecretName,
-						IssuerRef:  crt.Spec.IssuerRef,
-						Usages:     crt.Spec.Usages,
-					},
-				})
+				err = internalcertificates.Apply(ctx, cmClient, fieldManager, crt)
 			} else {
 				_, err = cmClient.CertmanagerV1().Certificates(crt.Namespace).Update(ctx, crt, metav1.UpdateOptions{})
 			}
@@ -180,8 +207,10 @@ func validateIngressLike(ingLike metav1.Object) field.ErrorList {
 		return checkForDuplicateSecretNames(field.NewPath("spec", "tls"), o.Spec.TLS)
 	case *gwapi.Gateway:
 		return nil
+	case *gwapi.ListenerSet:
+		return nil
 	default:
-		panic(fmt.Errorf("programmer mistake: validateIngressLike can't handle %T, expected Ingress or Gateway", ingLike))
+		panic(fmt.Errorf("programmer mistake: validateIngressLike can't handle %T, expected Ingress, Gateway or ListenerSet", ingLike))
 	}
 }
 
@@ -239,7 +268,7 @@ func validateIngressTLSBlock(path *field.Path, tlsBlock networkingv1.IngressTLS)
 	return errs
 }
 
-func validateGatewayListenerBlock(path *field.Path, l gwapi.Listener) field.ErrorList {
+func validateGatewayListenerBlock(path *field.Path, l gwapi.Listener, ingLike metav1.Object) field.ErrorList {
 	var errs field.ErrorList
 
 	if l.Hostname == nil || *l.Hostname == "" {
@@ -266,20 +295,48 @@ func validateGatewayListenerBlock(path *field.Path, l gwapi.Listener) field.Erro
 				errs = append(errs, field.NotSupported(path.Child("tls").Child("certificateRef").Index(i).Child("kind"),
 					*secretRef.Kind, []string{"Secret", ""}))
 			}
+
+			if secretRef.Namespace != nil && string(*secretRef.Namespace) != ingLike.GetNamespace() {
+				errs = append(errs, field.Invalid(path.Child("tls").Child("certificateRef").Index(i).Child("namespace"),
+					*secretRef.Namespace, "cross-namespace secret references are not allowed in listeners"))
+			}
 		}
 	}
 
 	if l.TLS.Mode == nil {
 		errs = append(errs, field.Required(path.Child("tls").Child("mode"),
 			"the mode field is required"))
-	} else {
-		if *l.TLS.Mode != gwapi.TLSModeTerminate {
-			errs = append(errs, field.NotSupported(path.Child("tls").Child("mode"),
-				*l.TLS.Mode, []string{string(gwapi.TLSModeTerminate)}))
-		}
+	} else if *l.TLS.Mode != gwapi.TLSModeTerminate {
+		errs = append(errs, field.NotSupported(path.Child("tls").Child("mode"),
+			*l.TLS.Mode, []string{string(gwapi.TLSModeTerminate)}))
 	}
 
 	return errs
+}
+
+// isGatewayAPITLSProtocol reports whether protocol is a TLS-capable Gateway
+// listener protocol. It returns true for the built-in types (HTTPS and TLS) and
+// for any value in extra. The comparison is case-sensitive.
+func isGatewayAPITLSProtocol(protocol gwapi.ProtocolType, extra sets.Set[string]) bool {
+	if protocol == gwapi.HTTPSProtocolType || protocol == gwapi.TLSProtocolType {
+		return true
+	}
+	return extra.Has(string(protocol))
+}
+
+// isGatewayAPIListenerIgnoredThroughAnnotation reports whether a listener with the given name should be ignored for certificate creation. The value of the annotation should be a comma-separated list of listener names to ignore. The listener name(s) on the annotation should match EXACTLY with the listener name(s) defined in the Gateway/ListenerSet spec.
+func isGatewayAPIListenerIgnoredThroughAnnotation(objAnn map[string]string, listenerName string) bool {
+	ignoredListeners, ok := objAnn[cmapi.CertificateIgnoreTLSListeners]
+	if !ok {
+		return false
+	}
+
+	for ignoredListener := range strings.SplitSeq(ignoredListeners, ",") {
+		if strings.TrimSpace(ignoredListener) == listenerName {
+			return true
+		}
+	}
+	return false
 }
 
 func buildCertificates(
@@ -288,19 +345,18 @@ func buildCertificates(
 	cmLister cmlisters.CertificateLister,
 	ingLike metav1.Object,
 	issuerName, issuerKind, issuerGroup string,
-) (new, update []*cmapi.Certificate, _ error) {
-
-	var newCrts []*cmapi.Certificate
-	var updateCrts []*cmapi.Certificate
-
+	annotations map[string]string,
+	defaults controller.IngressShimOptions,
+) (newCrts, updateCrts []*cmapi.Certificate, _ error) {
 	tlsHosts := make(map[corev1.ObjectReference][]string)
+
 	switch ingLike := ingLike.(type) {
 	case *networkingv1.Ingress:
 		for i, tls := range ingLike.Spec.TLS {
 			path := field.NewPath("spec", "tls").Index(i)
 			err := validateIngressTLSBlock(path, tls).ToAggregate()
 			if err != nil {
-				rec.Eventf(ingLike, corev1.EventTypeWarning, reasonBadConfig, "Skipped a TLS block: "+err.Error())
+				rec.Eventf(ingLike, corev1.EventTypeWarning, reasonBadConfig, "Skipped a TLS block: %s", err.Error())
 				continue
 			}
 			tlsHosts[corev1.ObjectReference{
@@ -308,30 +364,12 @@ func buildCertificates(
 				Name:      tls.SecretName,
 			}] = tls.Hosts
 		}
+	case *gwapi.ListenerSet:
+		handleGatewayAPIListeners(ingLike.Spec.Listeners, ingLike, rec, tlsHosts, defaults)
 	case *gwapi.Gateway:
-		for i, l := range ingLike.Spec.Listeners {
-			err := validateGatewayListenerBlock(field.NewPath("spec", "listeners").Index(i), l).ToAggregate()
-			if err != nil {
-				rec.Eventf(ingLike, corev1.EventTypeWarning, reasonBadConfig, "Skipped a listener block: "+err.Error())
-				continue
-			}
-
-			for _, certRef := range l.TLS.CertificateRefs {
-				secretRef := corev1.ObjectReference{
-					Name: string(certRef.Name),
-				}
-				if certRef.Namespace != nil {
-					secretRef.Namespace = string(*certRef.Namespace)
-				} else {
-					secretRef.Namespace = ingLike.GetNamespace()
-				}
-				// Gateway API hostname explicitly disallows IP addresses, so this
-				// should be OK.
-				tlsHosts[secretRef] = append(tlsHosts[secretRef], fmt.Sprintf("%s", *l.Hostname))
-			}
-		}
+		handleGatewayAPIListeners(ingLike.Spec.Listeners, ingLike, rec, tlsHosts, defaults)
 	default:
-		return nil, nil, fmt.Errorf("buildCertificates: expected ingress or gateway, got %T", ingLike)
+		return nil, nil, fmt.Errorf("buildCertificates: expected ingress or gateway or xlistenerset, got %T", ingLike)
 	}
 
 	for secretRef, hosts := range tlsHosts {
@@ -344,21 +382,48 @@ func buildCertificates(
 		switch ingLike.(type) {
 		case *networkingv1.Ingress:
 			controllerGVK = ingressV1GVK
+		case *gwapi.ListenerSet:
+			controllerGVK = listenerSetGVK
 		case *gwapi.Gateway:
 			controllerGVK = gatewayGVK
 		}
 
+		dnsNames, ipAddress := splitHosts(hosts)
+
+		// The ingresses and gateways controllers pass the informer-cached
+		// object straight in, so clone its labels before deleting from them
+		// and never let the Certificate alias the cached map.
+		labels := maps.Clone(ingLike.GetLabels())
+
+		// Remove applyset labels, as they cause certificates to be
+		// incorrectly pruned.
+		//
+		// See https://github.com/cert-manager/cert-manager/issues/7306
+		//
+		// TODO: Use a more generic annotation on ingress-like resources
+		// to exclude labels. Something like:
+		//
+		//	cert-manager.io/exclude-labels: "applyset.kubernetes.io/*,abc.com/efg"
+		//
+		// Or, something like:
+		//
+		//	cert-manager.io/propagate-labels: "false"
+		//
+		delete(labels, applysetLabel)
+
+		// annotations is one map shared by every Certificate built in this loop,
+		// so clone it: setIssuerSpecificConfig below writes into crt.Annotations.
 		crt := &cmapi.Certificate{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            secretRef.Name,
-				Namespace:       secretRef.Namespace,
-				Labels:          ingLike.GetLabels(),
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ingLike, controllerGVK)},
-			},
+			Name:            secretRef.Name,
+			Namespace:       secretRef.Namespace,
+			Labels:          labels,
+			Annotations:     maps.Clone(annotations),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ingLike, controllerGVK)},
 			Spec: cmapi.CertificateSpec{
-				DNSNames:   hosts,
-				SecretName: secretRef.Name,
-				IssuerRef: cmmeta.ObjectReference{
+				DNSNames:    dnsNames,
+				IPAddresses: ipAddress,
+				SecretName:  secretRef.Name,
+				IssuerRef: cmmeta.IssuerReference{
 					Name:  issuerName,
 					Kind:  issuerKind,
 					Group: issuerGroup,
@@ -369,6 +434,8 @@ func buildCertificates(
 
 		switch o := ingLike.(type) {
 		case *networkingv1.Ingress:
+			ingLike = o.DeepCopy()
+		case *gwapi.ListenerSet:
 			ingLike = o.DeepCopy()
 		case *gwapi.Gateway:
 			ingLike = o.DeepCopy()
@@ -400,20 +467,90 @@ func buildCertificates(
 				continue
 			}
 
+			// An Apply declares only the fields this manager owns, so crt goes
+			// out as built. An Update replaces the whole object, so the shim's
+			// fields have to be merged into a copy of the live Certificate.
+			if utilfeature.DefaultFeatureGate.Enabled(feature.ServerSideApply) {
+				updateCrts = append(updateCrts, crt)
+				continue
+			}
+
 			updateCrt := existingCrt.DeepCopy()
 
 			updateCrt.Spec = crt.Spec
 			updateCrt.Labels = crt.Labels
 
-			setIssuerSpecificConfig(crt, ingLike)
+			if len(crt.GetAnnotations()) > 0 {
+				updateCrt.SetAnnotations(mergeAnnotations(updateCrt.GetAnnotations(), crt.GetAnnotations()))
+			}
 
 			updateCrts = append(updateCrts, updateCrt)
 		} else {
-
 			newCrts = append(newCrts, crt)
 		}
 	}
 	return newCrts, updateCrts, nil
+}
+
+func handleGatewayAPIListeners[L gwapi.Listener | gwapi.ListenerEntry](listeners []L, ingLike client.Object, rec record.EventRecorder, tlsHosts map[corev1.ObjectReference][]string, defaults controller.IngressShimOptions) {
+	for i, raw := range listeners {
+		l := gwapi.Listener(raw)
+		// TLS is only supported for a limited set of protocol types: https://gateway-api.sigs.k8s.io/guides/tls/#listeners-and-tls
+		if !isGatewayAPITLSProtocol(l.Protocol, defaults.GatewayAPIExtraProtocols) {
+			continue
+		}
+
+		// We never issue certificates for TLS Passthrough mode
+		if l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwapi.TLSModePassthrough {
+			continue
+		}
+
+		if ann := ingLike.GetAnnotations(); ann != nil {
+			if isGatewayAPIListenerIgnoredThroughAnnotation(ann, string(l.Name)) {
+				continue
+			}
+		}
+
+		err := validateGatewayListenerBlock(field.NewPath("spec", "listeners").Index(i), l, ingLike).ToAggregate()
+		if err != nil {
+			rec.Eventf(ingLike, corev1.EventTypeWarning, reasonBadConfig, "Skipped a listener block: %s", err.Error())
+			continue
+		}
+
+		for _, certRef := range l.TLS.CertificateRefs {
+			secretRef := corev1.ObjectReference{
+				Name: string(certRef.Name),
+			}
+			if certRef.Namespace != nil {
+				secretRef.Namespace = string(*certRef.Namespace)
+			} else {
+				secretRef.Namespace = ingLike.GetNamespace()
+			}
+			// Gateway API hostname explicitly disallows IP addresses, so this
+			// should be OK.
+			tlsHosts[secretRef] = append(tlsHosts[secretRef], string(*l.Hostname))
+		}
+	}
+}
+
+// splitHosts de-duplicates hosts and splits them into DNS names and IP
+// addresses, preserving first-seen order. Duplicates arise when several
+// listeners reference the same Secret and hostname; dropping them keeps the
+// Certificate's SAN count in sync with the ACME order's identifiers.
+func splitHosts(hosts []string) (dnsNames, ipAddresses []string) {
+	seen := sets.New[string]()
+	for _, h := range hosts {
+		if seen.Has(h) {
+			continue
+		}
+		seen.Insert(h)
+		if ip := net.ParseIP(h); ip != nil {
+			ipAddresses = append(ipAddresses, h)
+		} else {
+			dnsNames = append(dnsNames, h)
+		}
+	}
+	return dnsNames, ipAddresses
 }
 
 func findCertificatesToBeRemoved(certs []*cmapi.Certificate, ingLike metav1.Object) []string {
@@ -429,12 +566,35 @@ func findCertificatesToBeRemoved(certs []*cmapi.Certificate, ingLike metav1.Obje
 	return toBeRemoved
 }
 
+func mergeAnnotations(a, b map[string]string) map[string]string {
+	merged := make(map[string]string)
+
+	// Copy annotations from the first map
+	maps.Copy(merged, a)
+
+	// Copy annotations from the second map (overwriting if key exists)
+	maps.Copy(merged, b)
+
+	return merged
+}
+
 func secretNameUsedIn(secretName string, ingLike metav1.Object) bool {
 	switch o := ingLike.(type) {
 	case *networkingv1.Ingress:
 		for _, tls := range o.Spec.TLS {
 			if secretName == tls.SecretName {
 				return true
+			}
+		}
+	case *gwapi.ListenerSet:
+		for _, l := range o.Spec.Listeners {
+			if l.TLS == nil {
+				continue
+			}
+			for _, certRef := range l.TLS.CertificateRefs {
+				if secretName == string(certRef.Name) {
+					return true
+				}
 			}
 		}
 	case *gwapi.Gateway:
@@ -493,7 +653,7 @@ func certNeedsUpdate(a, b *cmapi.Certificate) bool {
 		return true
 	}
 
-	if a.Spec.RevisionHistoryLimit != b.Spec.RevisionHistoryLimit {
+	if !ptr.Equal(a.Spec.RevisionHistoryLimit, b.Spec.RevisionHistoryLimit) {
 		return true
 	}
 
@@ -552,16 +712,24 @@ func certNeedsUpdate(a, b *cmapi.Certificate) bool {
 		}
 	}
 
+	if !ptr.Equal(a.Spec.Duration, b.Spec.Duration) {
+		return true
+	}
+
+	if !ptr.Equal(a.Spec.RenewBefore, b.Spec.RenewBefore) {
+		return true
+	}
+
 	return false
 }
 
 // setIssuerSpecificConfig configures given Certificate's annotation by reading
-// two Ingress-specific annotations.
+// three Ingress-specific annotations.
 //
 // (1)
 // The edit-in-place Ingress annotation allows the use of Ingress
 // controllers that map a single IP address to a single Ingress
-// resource, such as the GCE ingress controller. The the following
+// resource, such as the GCE ingress controller. The following
 // annotation on an Ingress named "my-ingress":
 //
 //	acme.cert-manager.io/http01-edit-in-place: "true"
@@ -581,6 +749,17 @@ func certNeedsUpdate(a, b *cmapi.Certificate) bool {
 // configures the Certificate using the override-ingress-class annotation:
 //
 //	acme.cert-manager.io/http01-override-ingress-class: traefik
+//
+// (3)
+// The ingress-ingressclassname Ingress annotation allows users to override the
+// Issuer's acme.solvers[0].http01.ingress.ingressClassName. For example, on the
+// Ingress:
+//
+//	acme.cert-manager.io/http01-ingress-ingressclassname: nginx
+//
+// configures the Certificate using the override-ingress-ingressclassname annotation:
+//
+//	acme.cert-manager.io/http01-override-ingress-ingressclassname: nginx
 func setIssuerSpecificConfig(crt *cmapi.Certificate, ingLike metav1.Object) {
 	ingAnnotations := ingLike.GetAnnotations()
 	if ingAnnotations == nil {
@@ -601,14 +780,53 @@ func setIssuerSpecificConfig(crt *cmapi.Certificate, ingLike metav1.Object) {
 	}
 
 	ingressClassVal, hasIngressClassVal := ingAnnotations[cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey]
-	if hasIngressClassVal {
+	ingressClassNameVal, hasIngressClassNameVal := ingAnnotations[cmapi.IngressACMEIssuerHTTP01IngressClassNameAnnotationKey]
+
+	if hasIngressClassVal && ingressClassVal != "" {
 		if crt.Annotations == nil {
 			crt.Annotations = make(map[string]string)
 		}
 		crt.Annotations[cmacme.ACMECertificateHTTP01IngressClassOverride] = ingressClassVal
 	}
+	if hasIngressClassNameVal && ingressClassNameVal != "" {
+		if crt.Annotations == nil {
+			crt.Annotations = make(map[string]string)
+		}
+		crt.Annotations[cmacme.ACMECertificateHTTP01IngressClassNameOverride] = ingressClassNameVal
+	}
+
+	switch ingLike := ingLike.(type) {
+	case *gwapi.Gateway:
+		if crt.Annotations == nil {
+			crt.Annotations = make(map[string]string)
+		}
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefKind] = "Gateway"
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefName] = ingLike.GetName()
+	case *gwapi.ListenerSet:
+		setListenerSetParentRefAnnotations(crt, ingLike, ingAnnotations)
+	}
 
 	ingLike.SetAnnotations(ingAnnotations)
+}
+
+func setListenerSetParentRefAnnotations(crt *cmapi.Certificate, listenerSet *gwapi.ListenerSet, ingAnnotations map[string]string) {
+	if crt.Annotations == nil {
+		crt.Annotations = make(map[string]string)
+	}
+	if enabled, _ := strconv.ParseBool(ingAnnotations[cmacme.ACMECertificateHTTP01ParentRefFallback]); enabled {
+		parentNS := listenerSet.GetNamespace()
+		if listenerSet.Spec.ParentRef.Namespace != nil && string(*listenerSet.Spec.ParentRef.Namespace) != "" {
+			parentNS = string(*listenerSet.Spec.ParentRef.Namespace)
+		}
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefKind] = "Gateway"
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefName] = string(listenerSet.Spec.ParentRef.Name)
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefNamespace] = parentNS
+	} else {
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefKind] = "ListenerSet"
+		crt.Annotations[cmacme.ACMECertificateHTTP01ParentRefName] = listenerSet.GetName()
+		// Clear any stale namespace annotation from a previous fallback configuration.
+		delete(crt.Annotations, cmacme.ACMECertificateHTTP01ParentRefNamespace)
+	}
 }
 
 // hasShimAnnotation returns true if the given ingress-like resource contains
@@ -641,6 +859,46 @@ func hasShimAnnotation(ingLike metav1.Object, autoCertificateAnnotations []strin
 		}
 	}
 	return false
+}
+
+func extractExtraAnnotations(ingLike metav1.Object, e []string) map[string]string {
+	annotations := ingLike.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	extraAnnotations := make(map[string]string)
+	for _, x := range e {
+		if s, ok := annotations[x]; ok {
+			extraAnnotations[x] = s
+		}
+	}
+	if len(extraAnnotations) == 0 {
+		return nil
+	}
+
+	return extraAnnotations
+}
+
+// isDeletedInForeground returns true if the given ingressLike resource
+// contains either
+//
+// metadata.deletionTimestamp, or
+// metadata.finalizers having one of the values as foregroundDeletion
+//
+// which indicates that the resource is being deleted via foreground cascading.
+// Ref: https://kubernetes.io/docs/concepts/architecture/garbage-collection/#foreground-deletion
+func isDeletedInForeground(ingLike metav1.Object) bool {
+	deletionTimestamp := ingLike.GetDeletionTimestamp()
+	finalizers := ingLike.GetFinalizers()
+	foregroundDeletion := false
+
+	for _, v := range finalizers {
+		if v == metav1.FinalizerDeleteDependents {
+			foregroundDeletion = true
+		}
+	}
+
+	return deletionTimestamp != nil || foregroundDeletion
 }
 
 // issuerForIngressLike determines the Issuer that should be specified on a

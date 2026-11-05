@@ -21,8 +21,8 @@ package rfc2136
 
 import (
 	"crypto/hmac"
-	"crypto/md5"
-	"crypto/sha1"
+	"crypto/md5"  // #nosec G501 -- MD5 is a supported TSIG Algorithm
+	"crypto/sha1" // #nosec G505 -- SHA1 is a supported TSIG Algorithm
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
@@ -34,7 +34,7 @@ import (
 
 func Test_tsigHMACProvider_Generate(t *testing.T) {
 	var (
-		someSecret        = base64.StdEncoding.EncodeToString(([]byte("foo-secret")))
+		someSecret        = base64.StdEncoding.EncodeToString([]byte("foo-secret"))
 		someMessage       = "foo-message"
 		someMessageMD5    = md5Message(t, []byte("foo-secret"), []byte("foo-message"))
 		someMessageSHA1   = sha1Message(t, []byte("foo-secret"), []byte("foo-message"))

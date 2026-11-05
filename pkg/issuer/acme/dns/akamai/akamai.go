@@ -20,30 +20,32 @@ limitations under the License.
 package akamai
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	dns "github.com/akamai/AkamaiOPEN-edgegrid-golang/configdns-v2"
-	"github.com/akamai/AkamaiOPEN-edgegrid-golang/edgegrid"
-
+	dns "github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/dns"
+	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/edgegrid"
+	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/session"
 	"github.com/go-logr/logr"
-	"github.com/pkg/errors"
 
+	utiloptions "github.com/cert-manager/cert-manager/internal/options"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
 
 // OpenEdgegridDNSService enables mocking and required functions
 type OpenEdgegridDNSService interface {
-	GetRecord(zone string, name string, recordType string) (*dns.RecordBody, error)
-	RecordSave(rec *dns.RecordBody, zone string) error
-	RecordUpdate(rec *dns.RecordBody, zone string) error
-	RecordDelete(rec *dns.RecordBody, zone string) error
+	GetRecord(ctx context.Context, zone string, name string, recordType string) (*dns.RecordBody, error)
+	RecordSave(ctx context.Context, rec *dns.RecordBody, zone string) error
+	RecordUpdate(ctx context.Context, rec *dns.RecordBody, zone string) error
+	RecordDelete(ctx context.Context, rec *dns.RecordBody, zone string) error
 }
 
-// OpenDNSConfig contains akamai's config to create authorization header.
-type OpenDNSConfig struct {
-	config edgegrid.Config
+// OpenDNSClient holds Akamai's client to create authorization header.
+type OpenDNSClient struct {
+	client dns.DNS
 }
 
 // DNSProvider is an implementation of the acme.ChallengeProvider interface
@@ -52,71 +54,122 @@ type DNSProvider struct {
 	serviceConsumerDomain  string
 	dnsclient              OpenEdgegridDNSService
 	TTL                    int
-	findHostedDomainByFqdn func(string, []string) (string, error)
+	findHostedDomainByFqdn func(context.Context, string, []string) (string, error)
 	isNotFound             func(error) bool
 	log                    logr.Logger
 }
 
-// NewDNSProvider returns a DNSProvider instance configured for Akamai.
-func NewDNSProvider(serviceConsumerDomain, clientToken, clientSecret, accessToken string, dns01Nameservers []string) (*DNSProvider, error) {
+// NewDNSProviderFromOptions constructs an ACME DNS provider for Akamai.
+//
+// All options are passed via the variadic options parameter.
+//
+// Required options:
+// - ServiceConsumerDomain
+// - ClientToken
+// - ClientSecret
+// - AccessToken
+// - Nameservers
+// - Resolver
+//
+// ctx is not used by this provider; it is accepted to standardize the constructor signature across all providers.
+func NewDNSProviderFromOptions(_ context.Context, options ...DNSProviderOption) (*DNSProvider, error) {
+	var opt DNSProviderOptions
+	for _, o := range options {
+		o.ApplyToDNSProviderOptions(&opt)
+	}
 
-	// required Aka OpenEdgegrid creds + non empty dnsservers list
-	if serviceConsumerDomain == "" || clientToken == "" || clientSecret == "" || accessToken == "" || len(dns01Nameservers) < 1 {
-		return nil, fmt.Errorf("edgedns: Provider creation failed. Missing required arguments.")
+	err := errors.Join(
+		utiloptions.Required(&opt.ServiceConsumerDomain, "service consumer domain is required"),
+		utiloptions.Required(&opt.ClientToken, "client token is required"),
+		utiloptions.Required(&opt.ClientSecret, "client secret is required"),
+		utiloptions.Required(&opt.AccessToken, "access token is required"),
+		utiloptions.NotEmpty(&opt.Nameservers, "nameservers is required"),
+		utiloptions.Required(&opt.Resolver, "resolver is required"),
+	)
+
+	if err != nil {
+		return nil, err
 	}
 
 	dnsp := &DNSProvider{
-		dns01Nameservers:       dns01Nameservers,
-		serviceConsumerDomain:  serviceConsumerDomain,
-		dnsclient:              &OpenDNSConfig{},
-		findHostedDomainByFqdn: findHostedDomainByFqdn,
+		dns01Nameservers:       opt.Nameservers,
+		serviceConsumerDomain:  opt.ServiceConsumerDomain,
+		dnsclient:              &OpenDNSClient{},
+		findHostedDomainByFqdn: findHostedDomainByFqdn(opt.Resolver),
 		isNotFound:             isNotFound,
 		log:                    logf.Log.WithName("akamai-dns"),
 		TTL:                    300,
 	}
-	dnsp.dnsclient.(*OpenDNSConfig).config = edgegrid.Config{
-		Host:         serviceConsumerDomain,
-		ClientToken:  clientToken,
-		ClientSecret: clientSecret,
-		AccessToken:  accessToken,
-		MaxBody:      131072,
+
+	cfg, err := edgegrid.New(func(c *edgegrid.Config) {
+		c.Host = opt.ServiceConsumerDomain
+		c.ClientToken = opt.ClientToken
+		c.ClientSecret = opt.ClientSecret
+		c.AccessToken = opt.AccessToken
+		c.MaxBody = 131072
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("edgedns: Provider config creation failed: %w", err)
 	}
 
-	dns.Init(dnsp.dnsclient.(*OpenDNSConfig).config)
+	s, err := session.New(
+		session.WithSigner(cfg),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("edgedns: Error creating session: %w", err)
+	}
+
+	dnsp.dnsclient.(*OpenDNSClient).client = dns.Client(s)
 
 	return dnsp, nil
 }
 
-func findHostedDomainByFqdn(fqdn string, ns []string) (string, error) {
-	zone, err := util.FindZoneByFqdn(fqdn, ns)
-	if err != nil {
-		return "", err
-	}
+// NewDNSProvider returns a DNSProvider instance configured for Akamai.
+//
+// Deprecated: Use NewDNSProviderFromOptions
+func NewDNSProvider(serviceConsumerDomain, clientToken, clientSecret, accessToken string, dns01Nameservers []string) (*DNSProvider, error) {
+	return NewDNSProviderFromOptions(context.Background(),
+		ServiceConsumerDomain(serviceConsumerDomain),
+		ClientToken(clientToken),
+		ClientSecret(clientSecret),
+		AccessToken(accessToken),
+		Nameservers(dns01Nameservers),
+		Resolver(util.LegacyCachedResolver()),
+	)
+}
 
-	return util.UnFqdn(zone), nil
+func findHostedDomainByFqdn(resolver util.Resolver) func(context.Context, string, []string) (string, error) {
+	return func(ctx context.Context, fqdn string, nameservers []string) (string, error) {
+		zone, err := resolver.FindZoneByFQDN(ctx, fqdn, nameservers)
+		if err != nil {
+			return "", err
+		}
+
+		return util.UnFqdn(zone), nil
+	}
 }
 
 // Present creates/updates a TXT record to fulfill the dns-01 challenge.
-func (a *DNSProvider) Present(domain, fqdn, value string) error {
+func (a *DNSProvider) Present(ctx context.Context, domain, fqdn, value string) error {
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("entering Present", "domain", domain, "fqdn", fqdn, "value", value)
 
-	logf.V(logf.DebugLevel).Infof("entering Present. domain: %s, fqdn: %s, value: %s", domain, fqdn, value)
-
-	hostedDomain, err := a.findHostedDomainByFqdn(fqdn, a.dns01Nameservers)
+	hostedDomain, err := a.findHostedDomainByFqdn(ctx, fqdn, a.dns01Nameservers)
 	if err != nil {
-		return errors.Wrapf(err, "edgedns: failed to determine hosted domain for %q", fqdn)
+		return fmt.Errorf("edgedns: failed to determine hosted domain for %q: %w", fqdn, err)
 	}
 	hostedDomain = util.UnFqdn(hostedDomain)
-	logf.V(logf.DebugLevel).Infof("hostedDomain: %s", hostedDomain)
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("calculated hosted domain", "hostedDomain", hostedDomain)
 
 	recordName, err := makeTxtRecordName(fqdn, hostedDomain)
 	if err != nil {
-		return errors.Wrapf(err, "edgedns: failed to create TXT record name")
+		return fmt.Errorf("edgedns: failed to create TXT record name: %w", err)
 	}
-	logf.V(logf.DebugLevel).Infof("recordName: %s", recordName)
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("calculated TXT record name", "recordName", recordName)
 
-	record, err := a.dnsclient.GetRecord(hostedDomain, recordName, "TXT")
+	record, err := a.dnsclient.GetRecord(ctx, hostedDomain, recordName, "TXT")
 	if err != nil && !a.isNotFound(err) {
-		return errors.Wrapf(err, "edgedns: failed to retrieve TXT record")
+		return fmt.Errorf("edgedns: failed to retrieve TXT record: %w", err)
 	}
 
 	if err == nil && record == nil {
@@ -124,7 +177,7 @@ func (a *DNSProvider) Present(domain, fqdn, value string) error {
 	}
 
 	if record != nil {
-		logf.V(logf.InfoLevel).Infof("edgedns: TXT record already exists. Updating target")
+		logf.FromContext(ctx).V(logf.InfoLevel).Info("edgedns: TXT record already exists. Updating target")
 
 		if containsValue(record.Target, value) {
 			// have a record and have entry already
@@ -132,55 +185,56 @@ func (a *DNSProvider) Present(domain, fqdn, value string) error {
 		}
 
 		record.Target = append(record.Target, `"`+value+`"`)
-		record.TTL = a.TTL
+		ttl := a.TTL
+		record.TTL = &ttl
 
-		err = a.dnsclient.RecordUpdate(record, hostedDomain)
+		err = a.dnsclient.RecordUpdate(ctx, record, hostedDomain)
 		if err != nil {
-			return errors.Wrapf(err, "edgedns: failed to update TXT record")
+			return fmt.Errorf("edgedns: failed to update TXT record: %w", err)
 		}
 
 		return nil
 	}
 
+	ttl := a.TTL
 	record = &dns.RecordBody{
 		Name:       recordName,
 		RecordType: "TXT",
-		TTL:        a.TTL,
+		TTL:        &ttl,
 		Target:     []string{`"` + value + `"`},
 	}
 
-	err = a.dnsclient.RecordSave(record, hostedDomain)
+	err = a.dnsclient.RecordSave(ctx, record, hostedDomain)
 	if err != nil {
-		return errors.Wrapf(err, "edgedns: failed to create TXT record")
+		return fmt.Errorf("edgedns: failed to create TXT record: %w", err)
 	}
 
 	return nil
 }
 
 // CleanUp removes/updates the TXT record matching the specified parameters.
-func (a *DNSProvider) CleanUp(domain, fqdn, value string) error {
+func (a *DNSProvider) CleanUp(ctx context.Context, domain, fqdn, value string) error {
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("entering CleanUp", "domain", domain, "fqdn", fqdn, "value", value)
 
-	logf.V(logf.DebugLevel).Infof("entering CleanUp. domain: %s, fqdn: %s, value: %s", domain, fqdn, value)
-
-	hostedDomain, err := a.findHostedDomainByFqdn(fqdn, a.dns01Nameservers)
+	hostedDomain, err := a.findHostedDomainByFqdn(ctx, fqdn, a.dns01Nameservers)
 	if err != nil {
-		return errors.Wrapf(err, "edgedns: failed to determine hosted domain for %q", fqdn)
+		return fmt.Errorf("edgedns: failed to determine hosted domain for %q: %w", fqdn, err)
 	}
 	hostedDomain = util.UnFqdn(hostedDomain)
-	logf.V(logf.DebugLevel).Infof("hostedDomain: %s", hostedDomain)
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("calculated hosted domain", "hostedDomain", hostedDomain)
 
 	recordName, err := makeTxtRecordName(fqdn, hostedDomain)
 	if err != nil {
-		return errors.Wrapf(err, "edgedns: failed to create TXT record name")
+		return fmt.Errorf("edgedns: failed to create TXT record name: %w", err)
 	}
-	logf.V(logf.DebugLevel).Infof("recordName: %s", recordName)
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("calculated TXT record name", "recordName", recordName)
 
-	existingRec, err := a.dnsclient.GetRecord(hostedDomain, recordName, "TXT")
+	existingRec, err := a.dnsclient.GetRecord(ctx, hostedDomain, recordName, "TXT")
 	if err != nil {
 		if a.isNotFound(err) {
 			return nil
 		}
-		return errors.Wrapf(err, "edgedns: failed to retrieve TXT record")
+		return fmt.Errorf("edgedns: failed to retrieve TXT record: %w", err)
 	}
 
 	if existingRec == nil {
@@ -206,19 +260,19 @@ func (a *DNSProvider) CleanUp(domain, fqdn, value string) error {
 
 	if len(newRData) > 0 {
 		existingRec.Target = newRData
-		logf.V(logf.DebugLevel).Infof("updating Akamai TXT record: %s, data: %s", existingRec.Name, newRData)
-		err = a.dnsclient.RecordUpdate(existingRec, hostedDomain)
+		logf.FromContext(ctx).V(logf.DebugLevel).Info("updating Akamai TXT record", "recordName", existingRec.Name, "data", newRData)
+		err = a.dnsclient.RecordUpdate(ctx, existingRec, hostedDomain)
 		if err != nil {
-			return errors.Wrapf(err, "edgedns: TXT record update failed")
+			return fmt.Errorf("edgedns: TXT record update failed: %w", err)
 		}
 
 		return nil
 	}
 
-	logf.V(logf.DebugLevel).Infof("deleting Akamai TXT record %s", existingRec.Name)
-	err = a.dnsclient.RecordDelete(existingRec, hostedDomain)
+	logf.FromContext(ctx).V(logf.DebugLevel).Info("deleting Akamai TXT record", "recordName", existingRec.Name)
+	err = a.dnsclient.RecordDelete(ctx, existingRec, hostedDomain)
 	if err != nil {
-		return errors.Wrapf(err, "edgedns: TXT record delete failed")
+		return fmt.Errorf("edgedns: TXT record delete failed: %w", err)
 	}
 
 	return nil
@@ -235,52 +289,66 @@ func containsValue(values []string, value string) bool {
 }
 
 func isNotFound(err error) bool {
-
 	if err == nil {
 		return false
 	}
 
-	_, ok := err.(*dns.RecordError)
-	if ok {
-		return true
-	}
-
-	return false
+	_, ok := err.(*dns.Error)
+	return ok
 }
 
 func makeTxtRecordName(fqdn, hostedDomain string) (string, error) {
 
 	recName := util.UnFqdn(fqdn)
 	if !strings.HasSuffix(recName, hostedDomain) {
-		return "", errors.Errorf("fqdn %q is not part of %q", fqdn, hostedDomain)
+		return "", fmt.Errorf("fqdn %q is not part of %q", fqdn, hostedDomain)
 	}
 
 	return recName, nil
 }
 
-// GetRecord gets a single Recordset as RecordBody. Sets Akamai OPEN Edgegrid API
-// global variable.
-func (o OpenDNSConfig) GetRecord(zone string, name string, recordType string) (*dns.RecordBody, error) {
+// GetRecord gets a single Recordset as RecordBody.
+func (o OpenDNSClient) GetRecord(ctx context.Context, zone string, name string, recordType string) (*dns.RecordBody, error) {
+	recordResponse, err := o.client.GetRecord(ctx, dns.GetRecordRequest{
+		RecordType: recordType,
+		Name:       name,
+		Zone:       zone,
+	})
 
-	dns.Config = o.config
+	if err != nil {
+		return nil, err
+	}
 
-	return dns.GetRecord(zone, name, recordType)
+	return &dns.RecordBody{
+		Name:       recordResponse.Name,
+		TTL:        &recordResponse.TTL,
+		Target:     recordResponse.Target,
+		Active:     recordResponse.Active,
+		RecordType: recordResponse.RecordType,
+	}, nil
 }
 
 // RecordSave is a function that saves the given zone in the given RecordBody.
-func (o OpenDNSConfig) RecordSave(rec *dns.RecordBody, zone string) error {
-
-	return rec.Save(zone)
+func (o OpenDNSClient) RecordSave(ctx context.Context, rec *dns.RecordBody, zone string) error {
+	return o.client.CreateRecord(ctx, dns.CreateRecordRequest{
+		Record: rec,
+		Zone:   zone,
+	})
 }
 
 // RecordUpdate is a function that updates the given zone in the given RecordBody.
-func (o OpenDNSConfig) RecordUpdate(rec *dns.RecordBody, zone string) error {
-
-	return rec.Update(zone)
+func (o OpenDNSClient) RecordUpdate(ctx context.Context, rec *dns.RecordBody, zone string) error {
+	return o.client.UpdateRecord(ctx, dns.UpdateRecordRequest{
+		Record: rec,
+		Zone:   zone,
+	})
 }
 
 // RecordDelete is a function that deletes the given zone in the given RecordBody.
-func (o OpenDNSConfig) RecordDelete(rec *dns.RecordBody, zone string) error {
-
-	return rec.Delete(zone)
+func (o OpenDNSClient) RecordDelete(ctx context.Context, rec *dns.RecordBody, zone string) error {
+	return o.client.DeleteRecord(ctx, dns.DeleteRecordRequest{
+		RecordType: rec.RecordType,
+		Name:       rec.Name,
+		Zone:       zone,
+	})
 }

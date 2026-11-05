@@ -45,18 +45,37 @@ var supportedAlgorithms = map[string]string{
 type DNSProvider struct {
 	nameserver    string
 	tsigAlgorithm string
+	network       string
 	tsigKeyName   string
 	tsigSecret    string
+}
+
+// ProviderOption is some configuration that modifies rfc2136 DNS provider.
+// It is meant to replace optional parameters and move towards function parameters and higher order functions.
+// Currently only protocol is migrated and future work is to be done on this.
+type ProviderOption func(*DNSProvider)
+
+func WithNetwork(network string) ProviderOption {
+	return func(d *DNSProvider) {
+		if network == "" {
+			network = "udp"
+		}
+		d.network = strings.ToLower(network)
+	}
 }
 
 // NewDNSProviderCredentials uses the supplied credentials to return a
 // DNSProvider instance configured for rfc2136 dynamic update. To disable TSIG
 // authentication, leave the TSIG parameters as empty strings.
 // nameserver must be a network address in the form "IP" or "IP:port".
-func NewDNSProviderCredentials(nameserver, tsigAlgorithm, tsigKeyName, tsigSecret string) (*DNSProvider, error) {
+func NewDNSProviderCredentials(nameserver, tsigAlgorithm, tsigKeyName, tsigSecret string, opts ...ProviderOption) (*DNSProvider, error) {
 	logf.Log.V(logf.DebugLevel).Info("Creating RFC2136 Provider")
 
 	d := &DNSProvider{}
+
+	for _, opt := range opts {
+		opt(d)
+	}
 
 	if validNameserver, err := util.ValidNameserver(nameserver); err != nil {
 		return nil, err
@@ -76,21 +95,22 @@ func NewDNSProviderCredentials(nameserver, tsigAlgorithm, tsigKeyName, tsigSecre
 			tsigAlgorithm = value
 		} else {
 			return nil, fmt.Errorf("algorithm '%v' is not supported", tsigAlgorithm)
-
 		}
 	}
 	d.tsigAlgorithm = tsigAlgorithm
 
-	logf.V(logf.DebugLevel).Infof("DNSProvider nameserver:       %s\n", d.nameserver)
-	logf.V(logf.DebugLevel).Infof("            tsigAlgorithm:    %s\n", d.tsigAlgorithm)
-	logf.V(logf.DebugLevel).Infof("            tsigKeyName:      %s\n", d.tsigKeyName)
 	keyLen := len(d.tsigSecret)
 	mask := make([]rune, keyLen/2)
 	for i := range mask {
 		mask[i] = '*'
 	}
 	masked := d.tsigSecret[0:keyLen/4] + string(mask) + d.tsigSecret[keyLen/4*3:keyLen]
-	logf.V(logf.DebugLevel).Infof("            tsigSecret:       %s\n", masked)
+	logf.Log.V(logf.DebugLevel).Info("DNSProvider",
+		"nameserver", d.nameserver,
+		"tsigAlgorithm", d.tsigAlgorithm,
+		"tsigKeyName", d.tsigKeyName,
+		"tsigSecret", masked,
+	)
 
 	return d, nil
 }
@@ -105,10 +125,10 @@ func (r *DNSProvider) CleanUp(_, fqdn, zone, value string) error {
 	return r.changeRecord("REMOVE", fqdn, zone, value, 60)
 }
 
-func (r *DNSProvider) changeRecord(action, fqdn, zone, value string, ttl int) error {
+func (r *DNSProvider) changeRecord(action, fqdn, zone, value string, ttl uint32) error {
 	// Create RR
 	rr := new(dns.TXT)
-	rr.Hdr = dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: uint32(ttl)}
+	rr.Hdr = dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: ttl}
 	rr.Txt = []string{value}
 	rrs := []dns.RR{rr}
 
@@ -125,9 +145,8 @@ func (r *DNSProvider) changeRecord(action, fqdn, zone, value string, ttl int) er
 	}
 
 	// Setup client
-	c := new(dns.Client)
+	c := &dns.Client{Net: r.network}
 	c.TsigProvider = tsigHMACProvider(r.tsigSecret)
-	c.SingleInflight = true
 	// TSIG authentication / msg signing
 	if len(r.tsigKeyName) > 0 && len(r.tsigSecret) > 0 {
 		m.SetTsig(dns.Fqdn(r.tsigKeyName), r.tsigAlgorithm, 300, time.Now().Unix())

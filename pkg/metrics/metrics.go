@@ -19,8 +19,9 @@ limitations under the License.
 // certificate_expiration_timestamp_seconds{name, namespace, issuer_name, issuer_kind, issuer_group}
 // certificate_renewal_timestamp_seconds{name, namespace, issuer_name, issuer_kind, issuer_group}
 // certificate_ready_status{name, namespace, condition, issuer_name, issuer_kind, issuer_group}
-// acme_client_request_count{"scheme", "host", "path", "method", "status"}
-// acme_client_request_duration_seconds{"scheme", "host", "path", "method", "status"}
+// certificate_challenge_status{status, domain, reason, processing, id, type}
+// acme_client_request_count{"scheme", "host", "action", "method", "status"}
+// acme_client_request_duration_seconds{"scheme", "host", "action", "method", "status"}
 // venafi_client_request_duration_seconds{"scheme", "host", "path", "method", "status"}
 // controller_sync_call_count{"controller"}
 package metrics
@@ -32,10 +33,13 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/utils/clock"
 
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	cmcollectors "github.com/cert-manager/cert-manager/internal/collectors"
+	cmacmelisters "github.com/cert-manager/cert-manager/pkg/client/listers/acme/v1"
+	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 )
 
 const (
@@ -52,25 +56,27 @@ type Metrics struct {
 	log      logr.Logger
 	registry *prometheus.Registry
 
-	clockTimeSeconds                   prometheus.CounterFunc
-	clockTimeSecondsGauge              prometheus.GaugeFunc
-	certificateExpiryTimeSeconds       *prometheus.GaugeVec
-	certificateRenewalTimeSeconds      *prometheus.GaugeVec
-	certificateReadyStatus             *prometheus.GaugeVec
-	acmeClientRequestDurationSeconds   *prometheus.SummaryVec
-	acmeClientRequestCount             *prometheus.CounterVec
-	venafiClientRequestDurationSeconds *prometheus.SummaryVec
-	controllerSyncCallCount            *prometheus.CounterVec
-	controllerSyncErrorCount           *prometheus.CounterVec
+	clockTimeSeconds                    prometheus.CounterFunc
+	clockTimeSecondsGauge               prometheus.GaugeFunc
+	acmeClientRequestDurationSeconds    *prometheus.SummaryVec
+	acmeClientRequestCount              *prometheus.CounterVec
+	venafiClientRequestDurationSeconds  *prometheus.SummaryVec
+	venafiOAuthTokenRequestsTotal       *prometheus.CounterVec
+	venafiOAuthTokenRequestDurationSecs prometheus.Histogram
+	controllerSyncCallCount             *prometheus.CounterVec
+	controllerSyncErrorCount            *prometheus.CounterVec
+	challengeCollector                  prometheus.Collector
+	certificateCollector                prometheus.Collector
+	issuerCollector                     prometheus.Collector
+	clusterIssuerCollector              prometheus.Collector
 }
-
-var readyConditionStatuses = [...]cmmeta.ConditionStatus{cmmeta.ConditionTrue, cmmeta.ConditionFalse, cmmeta.ConditionUnknown}
 
 // New creates a Metrics struct and populates it with prometheus metric types.
 func New(log logr.Logger, c clock.Clock) *Metrics {
 	var (
 		// Deprecated in favour of clock_time_seconds_gauge.
 		clockTimeSeconds = prometheus.NewCounterFunc(
+			//nolint:promlinter // This metric is deprecated and should be removed
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Name:      "clock_time_seconds",
@@ -90,66 +96,47 @@ func New(log logr.Logger, c clock.Clock) *Metrics {
 		// a new `clock_time_seconds_gauge` metric of type gauge is added which
 		// implements the same thing.
 		clockTimeSecondsGauge = prometheus.NewGaugeFunc(
+			//nolint:promlinter
 			prometheus.GaugeOpts{
 				Namespace: namespace,
 				Name:      "clock_time_seconds_gauge",
-				Help:      "The clock time given in seconds (from 1970/01/01 UTC).",
+				Help:      "The clock time given in seconds (from 1970/01/01 UTC). Gauge form of the deprecated clock_time_seconds counter. No labels.",
 			},
 			func() float64 {
 				return float64(c.Now().Unix())
 			},
 		)
 
-		certificateExpiryTimeSeconds = prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Namespace: namespace,
-				Name:      "certificate_expiration_timestamp_seconds",
-				Help:      "The date after which the certificate expires. Expressed as a Unix Epoch Time.",
-			},
-			[]string{"name", "namespace", "issuer_name", "issuer_kind", "issuer_group"},
-		)
-
-		certificateRenewalTimeSeconds = prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Namespace: namespace,
-				Name:      "certificate_renewal_timestamp_seconds",
-				Help:      "The number of seconds before expiration time the certificate should renew.",
-			},
-			[]string{"name", "namespace", "issuer_name", "issuer_kind", "issuer_group"},
-		)
-
-		certificateReadyStatus = prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Namespace: namespace,
-				Name:      "certificate_ready_status",
-				Help:      "The ready status of the certificate.",
-			},
-			[]string{"name", "namespace", "condition", "issuer_name", "issuer_kind", "issuer_group"},
-		)
-
 		// acmeClientRequestCount is a Prometheus summary to collect the number of
 		// requests made to each endpoint with the ACME client.
 		acmeClientRequestCount = prometheus.NewCounterVec(
+			//nolint:promlinter
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Name:      "acme_client_request_count",
-				Help:      "The number of requests made by the ACME client.",
+				Help: "Total number of outbound ACME HTTP requests. " +
+					"Labels: scheme (http/https), host (ACME host), action (logical ACME operation), " +
+					"method (HTTP verb), status (HTTP status code).",
 				Subsystem: "http",
 			},
-			[]string{"scheme", "host", "path", "method", "status"},
+			[]string{"scheme", "host", "action", "method", "status"},
 		)
 
 		// acmeClientRequestDurationSeconds is a Prometheus summary to collect request
 		// times for the ACME client.
 		acmeClientRequestDurationSeconds = prometheus.NewSummaryVec(
 			prometheus.SummaryOpts{
-				Namespace:  namespace,
-				Name:       "acme_client_request_duration_seconds",
-				Help:       "The HTTP request latencies in seconds for the ACME client.",
+				Namespace: namespace,
+				Name:      "acme_client_request_duration_seconds",
+				Help: "Latency of outbound ACME HTTP requests in seconds. " +
+					"Summary quantiles approximate request distribution. " +
+					"Labels: scheme (http/https), host (ACME host), action (logical ACME operation), " +
+					"method (HTTP verb), status (HTTP status code). " +
+					"Use with acme_client_request_count for rate/error analysis.",
 				Subsystem:  "http",
 				Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 			},
-			[]string{"scheme", "host", "path", "method", "status"},
+			[]string{"scheme", "host", "action", "method", "status"},
 		)
 
 		// venafiClientRequestDurationSeconds is a Prometheus summary to
@@ -160,64 +147,126 @@ func New(log logr.Logger, c clock.Clock) *Metrics {
 			prometheus.SummaryOpts{
 				Namespace:  namespace,
 				Name:       "venafi_client_request_duration_seconds",
-				Help:       "ALPHA: The HTTP request latencies in seconds for the Venafi client. This metric is currently alpha as we would like to understand whether it helps to measure Venafi call latency. Please leave feedback if you have any.",
+				Help:       "ALPHA: The HTTP request latencies in seconds for the Certificate Manager client. This metric is currently alpha as we would like to understand whether it helps to measure Certificate Manager call latency. Please leave feedback if you have any.",
 				Subsystem:  "http",
 				Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 			},
 			[]string{"api_call"},
 		)
 
+		venafiOAuthTokenRequestsTotal = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "venafi_oauth_token_requests_total",
+				Help: "Total number of Venafi OAuth token requests made by cert-manager. " +
+					"Label: status (success/failure).",
+			},
+			[]string{"status"},
+		)
+
+		venafiOAuthTokenRequestDurationSecs = prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Namespace: namespace,
+				Name:      "venafi_oauth_token_request_duration_seconds",
+				Help: "Duration in seconds of Venafi OAuth token requests. " +
+					"Buckets cover typical token-exchange latencies from 10ms to 30s.",
+				Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+			},
+		)
+
 		controllerSyncCallCount = prometheus.NewCounterVec(
+			//nolint:promlinter
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Name:      "controller_sync_call_count",
-				Help:      "The number of sync() calls made by a controller.",
+				Help:      "The number of sync() calls made by a controller. Label: controller (fixed small set of controller names).",
 			},
 			[]string{"controller"},
 		)
 
 		controllerSyncErrorCount = prometheus.NewCounterVec(
+			//nolint:promlinter
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Name:      "controller_sync_error_count",
-				Help:      "The number of errors encountered during controller sync().",
+				Help:      "The number of errors encountered during controller sync(). Label: controller. Use with controller_sync_call_count to derive error rates.",
 			},
 			[]string{"controller"},
 		)
 	)
 
+	// Create Registry and register the recommended collectors
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
+	)
 	// Create server and register Prometheus metrics handler
 	m := &Metrics{
 		log:      log.WithName("metrics"),
-		registry: prometheus.NewRegistry(),
+		registry: registry,
 
-		clockTimeSeconds:                   clockTimeSeconds,
-		clockTimeSecondsGauge:              clockTimeSecondsGauge,
-		certificateExpiryTimeSeconds:       certificateExpiryTimeSeconds,
-		certificateRenewalTimeSeconds:      certificateRenewalTimeSeconds,
-		certificateReadyStatus:             certificateReadyStatus,
-		acmeClientRequestCount:             acmeClientRequestCount,
-		acmeClientRequestDurationSeconds:   acmeClientRequestDurationSeconds,
-		venafiClientRequestDurationSeconds: venafiClientRequestDurationSeconds,
-		controllerSyncCallCount:            controllerSyncCallCount,
-		controllerSyncErrorCount:           controllerSyncErrorCount,
+		clockTimeSeconds:                    clockTimeSeconds,
+		clockTimeSecondsGauge:               clockTimeSecondsGauge,
+		acmeClientRequestCount:              acmeClientRequestCount,
+		acmeClientRequestDurationSeconds:    acmeClientRequestDurationSeconds,
+		venafiClientRequestDurationSeconds:  venafiClientRequestDurationSeconds,
+		venafiOAuthTokenRequestsTotal:       venafiOAuthTokenRequestsTotal,
+		venafiOAuthTokenRequestDurationSecs: venafiOAuthTokenRequestDurationSecs,
+		controllerSyncCallCount:             controllerSyncCallCount,
+		controllerSyncErrorCount:            controllerSyncErrorCount,
 	}
 
 	return m
+}
+
+func (m *Metrics) SetupACMECollector(acmeInformers cmacmelisters.ChallengeLister) {
+	m.challengeCollector = cmcollectors.NewACMECollector(acmeInformers)
+}
+
+func (m *Metrics) SetupCertificateCollector(certLister cmlisters.CertificateLister) {
+	m.certificateCollector = cmcollectors.NewCertificateCollector(certLister)
+}
+
+func (m *Metrics) SetupIssuerCollector(issuerLister cmlisters.IssuerLister) {
+	m.issuerCollector = cmcollectors.NewIssuerCollector(issuerLister)
+}
+
+func (m *Metrics) SetupClusterIssuerCollector(clusterIssuerLister cmlisters.ClusterIssuerLister) {
+	m.clusterIssuerCollector = cmcollectors.NewClusterIssuerCollector(clusterIssuerLister)
+}
+
+func (m *Metrics) ACMERequestCounter() *prometheus.CounterVec {
+	return m.acmeClientRequestCount
 }
 
 // NewServer registers Prometheus metrics and returns a new Prometheus metrics HTTP server.
 func (m *Metrics) NewServer(ln net.Listener) *http.Server {
 	m.registry.MustRegister(m.clockTimeSeconds)
 	m.registry.MustRegister(m.clockTimeSecondsGauge)
-	m.registry.MustRegister(m.certificateExpiryTimeSeconds)
-	m.registry.MustRegister(m.certificateRenewalTimeSeconds)
-	m.registry.MustRegister(m.certificateReadyStatus)
 	m.registry.MustRegister(m.acmeClientRequestDurationSeconds)
 	m.registry.MustRegister(m.venafiClientRequestDurationSeconds)
+	m.registry.MustRegister(m.venafiOAuthTokenRequestsTotal)
+	m.registry.MustRegister(m.venafiOAuthTokenRequestDurationSecs)
 	m.registry.MustRegister(m.acmeClientRequestCount)
 	m.registry.MustRegister(m.controllerSyncCallCount)
 	m.registry.MustRegister(m.controllerSyncErrorCount)
+
+	if m.challengeCollector != nil {
+		m.registry.MustRegister(m.challengeCollector)
+	}
+
+	if m.certificateCollector != nil {
+		m.registry.MustRegister(m.certificateCollector)
+	}
+
+	if m.issuerCollector != nil {
+		m.registry.MustRegister(m.issuerCollector)
+	}
+
+	if m.clusterIssuerCollector != nil {
+		m.registry.MustRegister(m.clusterIssuerCollector)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{}))

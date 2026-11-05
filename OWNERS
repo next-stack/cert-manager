@@ -1,22 +1,6 @@
 approvers:
-- munnerz
-- joshvanl
-- meyskens
-- wallrj
-- jakexks
-- maelvls
-- irbekrm
-- sgtcodfish
-- jahrlin
-- inteon
+- cm-maintainers
 reviewers:
-- munnerz
-- joshvanl
-- meyskens
-- wallrj
-- jakexks
-- maelvls
-- irbekrm
-- sgtcodfish
-- jahrlin
-- inteon
+- cm-maintainers
+- ali-hamza-noor
+- lunarwhite

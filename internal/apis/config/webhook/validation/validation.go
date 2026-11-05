@@ -17,42 +17,57 @@ limitations under the License.
 package validation
 
 import (
-	"fmt"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	logsapi "k8s.io/component-base/logs/api/v1"
 
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-
+	sharedvalidation "github.com/cert-manager/cert-manager/internal/apis/config/shared/validation"
 	config "github.com/cert-manager/cert-manager/internal/apis/config/webhook"
 )
 
-func ValidateWebhookConfiguration(cfg *config.WebhookConfiguration) error {
-	var allErrors []error
-	if cfg.TLSConfig.FilesystemConfigProvided() && cfg.TLSConfig.DynamicConfigProvided() {
-		allErrors = append(allErrors, fmt.Errorf("invalid configuration: cannot specify both filesystem based and dynamic TLS configuration"))
-	} else {
-		if cfg.TLSConfig.FilesystemConfigProvided() {
-			if cfg.TLSConfig.Filesystem.KeyFile == "" {
-				allErrors = append(allErrors, fmt.Errorf("invalid configuration: tlsConfig.filesystem.keyFile (--tls-private-key-file) must be specified when using filesystem based TLS config"))
-			}
-			if cfg.TLSConfig.Filesystem.CertFile == "" {
-				allErrors = append(allErrors, fmt.Errorf("invalid configuration: tlsConfig.filesystem.certFile (--tls-cert-file) must be specified when using filesystem based TLS config"))
-			}
-		} else if cfg.TLSConfig.DynamicConfigProvided() {
-			if cfg.TLSConfig.Dynamic.SecretNamespace == "" {
-				allErrors = append(allErrors, fmt.Errorf("invalid configuration: tlsConfig.dynamic.secretNamespace (--dynamic-serving-ca-secret-namespace) must be specified when using dynamic TLS config"))
-			}
-			if cfg.TLSConfig.Dynamic.SecretName == "" {
-				allErrors = append(allErrors, fmt.Errorf("invalid configuration: tlsConfig.dynamic.secretName (--dynamic-serving-ca-secret-name) must be specified when using dynamic TLS config"))
-			}
-			if len(cfg.TLSConfig.Dynamic.DNSNames) == 0 {
-				allErrors = append(allErrors, fmt.Errorf("invalid configuration: tlsConfig.dynamic.dnsNames (--dynamic-serving-dns-names) must be specified when using dynamic TLS config"))
-			}
-		}
+func ValidateWebhookConfiguration(cfg *config.WebhookConfiguration, fldPath *field.Path) field.ErrorList {
+	var allErrors field.ErrorList
+
+	allErrors = append(allErrors, logsapi.Validate(&cfg.Logging, nil, fldPath.Child("logging"))...)
+	allErrors = append(allErrors, sharedvalidation.ValidateTLSConfig(&cfg.TLSConfig, fldPath.Child("tlsConfig"))...)
+
+	if cfg.HealthzPort < 0 || cfg.HealthzPort > 65535 {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("healthzPort"), cfg.HealthzPort, "must be a valid port number"))
 	}
-	if cfg.HealthzPort == nil {
-		allErrors = append(allErrors, fmt.Errorf("invalid configuration: healthzPort must be specified"))
+	if cfg.SecurePort < 0 || cfg.SecurePort > 65535 {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("securePort"), cfg.SecurePort, "must be a valid port number"))
 	}
-	if cfg.SecurePort == nil {
-		allErrors = append(allErrors, fmt.Errorf("invalid configuration: securePort must be specified"))
+
+	allErrors = append(allErrors, validatePEMSizeLimitsConfig(&cfg.PEMSizeLimitsConfig, fldPath.Child("pemSizeLimitsConfig"))...)
+
+	return allErrors
+}
+
+func validatePEMSizeLimitsConfig(cfg *config.PEMSizeLimitsConfig, fldPath *field.Path) field.ErrorList {
+	var allErrors field.ErrorList
+
+	if cfg.MaxCertificateSize <= 0 {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("maxCertificateSize"), cfg.MaxCertificateSize, "must be greater than 0"))
 	}
-	return utilerrors.NewAggregate(allErrors)
+
+	if cfg.MaxPrivateKeySize <= 0 {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("maxPrivateKeySize"), cfg.MaxPrivateKeySize, "must be greater than 0"))
+	}
+
+	if cfg.MaxChainLength <= 0 {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("maxChainLength"), cfg.MaxChainLength, "must be greater than 0"))
+	}
+
+	if cfg.MaxBundleSize <= 0 {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("maxBundleSize"), cfg.MaxBundleSize, "must be greater than 0"))
+	}
+
+	if cfg.MaxCertificateSize > cfg.MaxBundleSize {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("maxCertificateSize"), cfg.MaxCertificateSize, "must not be larger than maxBundleSize"))
+	}
+
+	if cfg.MaxChainLength > cfg.MaxBundleSize {
+		allErrors = append(allErrors, field.Invalid(fldPath.Child("maxChainLength"), cfg.MaxChainLength, "must not exceed maxBundleSize"))
+	}
+
+	return allErrors
 }

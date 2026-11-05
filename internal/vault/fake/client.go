@@ -18,18 +18,21 @@ package fake
 
 import (
 	"errors"
+	"testing"
 
 	vault "github.com/hashicorp/vault/api"
 )
 
-type Client struct {
+type FakeClient struct {
 	NewRequestS  *vault.Request
 	RawRequestFn func(r *vault.Request) (*vault.Response, error)
-	token        string
+	WriteFn      func(path string, data map[string]any) (*vault.Secret, error)
+	GotToken     string
+	T            *testing.T
 }
 
-func NewFakeClient() *Client {
-	return &Client{
+func NewFakeClient() *FakeClient {
+	return &FakeClient{
 		NewRequestS: new(vault.Request),
 		RawRequestFn: func(r *vault.Request) (*vault.Response, error) {
 			return nil, errors.New("unexpected RawRequest call")
@@ -37,34 +40,44 @@ func NewFakeClient() *Client {
 	}
 }
 
-func (c *Client) WithNewRequest(r *vault.Request) *Client {
+func (c *FakeClient) CloneConfig() *vault.Config {
+	return vault.DefaultConfig()
+}
+
+func (c *FakeClient) WithNewRequest(r *vault.Request) *FakeClient {
 	c.NewRequestS = r
 	return c
 }
 
-func (c *Client) WithRawRequest(resp *vault.Response, err error) *Client {
+func (c *FakeClient) WithRawRequest(resp *vault.Response, err error) *FakeClient {
 	c.RawRequestFn = func(r *vault.Request) (*vault.Response, error) {
 		return resp, err
 	}
 	return c
 }
 
-func (c *Client) NewRequest(method, requestPath string) *vault.Request {
+func (c *FakeClient) WithRawRequestFn(fn func(t *testing.T, r *vault.Request) (*vault.Response, error)) *FakeClient {
+	c.RawRequestFn = func(req *vault.Request) (*vault.Response, error) {
+		return fn(c.T, req)
+	}
+	return c
+}
+
+func (c *FakeClient) NewRequest(method, requestPath string) *vault.Request {
 	return c.NewRequestS
 }
 
-func (c *Client) SetToken(v string) {
-	c.token = v
+func (c *FakeClient) SetToken(v string) {
+	c.GotToken = v
 }
 
-func (c *Client) Token() string {
-	return c.token
-}
-
-func (c *Client) RawRequest(r *vault.Request) (*vault.Response, error) {
+func (c *FakeClient) RawRequest(r *vault.Request) (*vault.Response, error) {
 	return c.RawRequestFn(r)
 }
 
-func (c *Client) Sys() *vault.Sys {
-	return nil
+func (c *FakeClient) Write(path string, data map[string]any) (*vault.Secret, error) {
+	if c.WriteFn != nil {
+		return c.WriteFn(path, data)
+	}
+	return nil, errors.New("unexpected Write call")
 }

@@ -20,11 +20,13 @@ import (
 	"context"
 	"crypto"
 	"crypto/x509"
+	"errors"
 	"fmt"
 
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
-	corelisters "k8s.io/client-go/listers/core/v1"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
@@ -33,6 +35,7 @@ import (
 	issuerpkg "github.com/cert-manager/cert-manager/pkg/issuer"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	cmerrors "github.com/cert-manager/cert-manager/pkg/util/errors"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/kube"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 )
@@ -46,30 +49,25 @@ type signingFn func([]*x509.Certificate, crypto.Signer, *x509.Certificate) (pki.
 
 type CA struct {
 	issuerOptions controllerpkg.IssuerOptions
-	secretsLister corelisters.SecretLister
+	secretsLister internalinformers.SecretLister
 
 	reporter *crutil.Reporter
 
-	// Used for testing to get reproducible resulting certificates
+	// templateGenerator is used to generate templates to pass to the Go stdlib for signing.
+	// It's a member of the struct so it can be mocked for testing.
 	templateGenerator templateGenerator
-	signingFn         signingFn
-}
 
-func init() {
-	// create certificate request controller for ca issuer
-	controllerpkg.Register(CRControllerName, func(ctx *controllerpkg.ContextFactory) (controllerpkg.Interface, error) {
-		return controllerpkg.NewBuilder(ctx, CRControllerName).
-			For(certificaterequests.New(apiutil.IssuerCA, NewCA)).
-			Complete()
-	})
+	// signingFn is the function called to actually sign certificates.
+	// It's a member of the struct so it can be mocked for testing.
+	signingFn signingFn
 }
 
 func NewCA(ctx *controllerpkg.Context) certificaterequests.Issuer {
 	return &CA{
 		issuerOptions:     ctx.IssuerOptions,
-		secretsLister:     ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
+		secretsLister:     ctx.KubeSharedInformerFactory.Secrets().Lister(),
 		reporter:          crutil.NewReporter(ctx.Clock, ctx.Recorder),
-		templateGenerator: pki.GenerateTemplateFromCertificateRequest,
+		templateGenerator: pki.CertificateTemplateFromCertificateRequest,
 		signingFn:         pki.SignCSRTemplate,
 	}
 }
@@ -118,8 +116,18 @@ func (c *CA) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuerObj c
 		return nil, nil
 	}
 
+	if !utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) &&
+		(pki.IsMLDSAPublicKey(template.PublicKey) || pki.IsMLDSAPublicKey(caKey.Public())) {
+		err := errors.New("the MLDSAPrivateKeys feature gate is disabled")
+		message := "Refusing to sign a certificate involving an ML-DSA key"
+		c.reporter.Pending(cr, err, "MLDSAPrivateKeysDisabled", message)
+		log.Error(err, message)
+		return nil, nil
+	}
+
 	template.CRLDistributionPoints = issuerObj.GetSpec().CA.CRLDistributionPoints
 	template.OCSPServer = issuerObj.GetSpec().CA.OCSPServers
+	template.IssuingCertificateURL = issuerObj.GetSpec().CA.IssuingCertificateURLs
 
 	bundle, err := c.signingFn(caCerts, caKey, template)
 	if err != nil {
@@ -135,4 +143,13 @@ func (c *CA) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuerObj c
 		Certificate: bundle.ChainPEM,
 		CA:          bundle.CAPEM,
 	}, nil
+}
+
+func init() {
+	// create certificate request controller for ca issuer
+	controllerpkg.Register(CRControllerName, func(ctx *controllerpkg.ContextFactory) (controllerpkg.Interface, error) {
+		return controllerpkg.NewBuilder(ctx, CRControllerName).
+			For(certificaterequests.New(apiutil.IssuerCA, NewCA)).
+			Complete()
+	})
 }

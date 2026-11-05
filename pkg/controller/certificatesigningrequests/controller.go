@@ -22,7 +22,8 @@ import (
 
 	"github.com/go-logr/logr"
 	certificatesv1 "k8s.io/api/certificates/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	authzclient "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	certificatesclient "k8s.io/client-go/kubernetes/typed/certificates/v1"
 	certificateslisters "k8s.io/client-go/listers/certificates/v1"
@@ -36,8 +37,6 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/issuer"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
-
-var keyFunc = controllerpkg.KeyFunc
 
 // Signer is an implementation of a Kubernetes CertificateSigningRequest
 // signer, backed by a cert-manager Issuer.
@@ -54,7 +53,7 @@ type SignerConstructor func(*controllerpkg.Context) Signer
 // informers not covered in the main shared controller implementation.
 // The returned set of InformerSyncs will be waited on when the controller
 // starts.
-type RegisterExtraInformerFn func(*controllerpkg.Context, logr.Logger, workqueue.RateLimitingInterface) ([]cache.InformerSynced, error)
+type RegisterExtraInformerFn func(*controllerpkg.Context, logr.Logger, workqueue.TypedRateLimitingInterface[types.NamespacedName]) ([]cache.InformerSynced, error)
 
 // Controller is a base Kubernetes CertificateSigningRequest controller. It is
 // responsible for orchestrating and performing shared operations that all
@@ -72,7 +71,7 @@ type Controller struct {
 	// fieldManager is the manager name used for the Apply operations.
 	fieldManager string
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName]
 
 	// logger to be used by this controller
 	log logr.Logger
@@ -87,8 +86,8 @@ type Controller struct {
 	// the signer kind to react to when a certificate signing request is synced
 	signerType string
 
-	//registerExtraInformers is a list of functions that
-	//CertificateSigningRequest controllers can use to register custom informers.
+	// registerExtraInformers is a list of functions that
+	// CertificateSigningRequest controllers can use to register custom informers.
 	registerExtraInformers []RegisterExtraInformerFn
 
 	// used for testing
@@ -97,7 +96,7 @@ type Controller struct {
 
 // New will construct a new certificatesigningrequest controller using the
 // given Signer implementation.
-// Note: the registerExtraInfromers passed here will be 'waited' for when
+// Note: the registerExtraInformers passed here will be 'waited' for when
 // starting to ensure their corresponding listers have synced.
 // The caller is responsible for ensuring the informer work functions are setup
 // correctly on any informer.
@@ -113,14 +112,19 @@ func New(signerType string, signerConstructor SignerConstructor, registerExtraIn
 	}
 }
 
-func (c *Controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *Controller) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	componentName := "certificatesigningrequests-" + c.signerType
 
 	// construct a new named logger to be reused throughout the controller
 	c.log = logf.FromContext(ctx.RootContext, componentName)
 
 	// create a queue used to queue up items to be processed
-	c.queue = workqueue.NewNamedRateLimitingQueue(controllerpkg.DefaultItemBasedRateLimiter(), componentName)
+	c.queue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultItemBasedRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: componentName,
+		},
+	)
 
 	kubeClient := ctx.Client
 	c.sarClient = kubeClient.AuthorizationV1().SubjectAccessReviews()
@@ -128,7 +132,7 @@ func (c *Controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	issuerInformer := ctx.SharedInformerFactory.Certmanager().V1().Issuers()
 
 	// obtain references to all the informers used by this controller
-	csrInformer := ctx.KubeSharedInformerFactory.Certificates().V1().CertificateSigningRequests()
+	csrInformer := ctx.KubeSharedInformerFactory.CertificateSigningRequests()
 
 	// build a list of InformerSynced functions that will be returned by the
 	// Register method. The controller will only begin processing items once all
@@ -153,7 +157,9 @@ func (c *Controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	clusterIssuerInformer := ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers()
 	if ctx.Namespace == "" {
 		// register handler function for clusterissuer resources
-		clusterIssuerInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{WorkFunc: c.handleGenericIssuer})
+		if _, err := clusterIssuerInformer.Informer().AddEventHandler(controllerpkg.BlockingEventHandler(c.handleGenericIssuer)); err != nil {
+			return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+		}
 		mustSync = append(mustSync, clusterIssuerInformer.Informer().HasSynced)
 	}
 
@@ -161,8 +167,12 @@ func (c *Controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	c.csrLister = csrInformer.Lister()
 
 	// register handler functions
-	csrInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: c.queue})
-	issuerInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{WorkFunc: c.handleGenericIssuer})
+	if _, err := csrInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(c.queue)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := issuerInformer.Informer().AddEventHandler(controllerpkg.BlockingEventHandler(c.handleGenericIssuer)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// create an issuer helper for reading generic issuers
 	c.helper = issuer.NewHelper(issuerInformer.Lister(), clusterIssuerInformer.Lister())
@@ -182,24 +192,18 @@ func (c *Controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	return c.queue, mustSync, nil
 }
 
-func (c *Controller) ProcessItem(ctx context.Context, key string) error {
+func (c *Controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx)
-	dbg := log.V(logf.DebugLevel)
 
-	_, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key")
-		return nil
-	}
+	name := key.Name
 
 	csr, err := c.csrLister.Get(name)
-	if apierrors.IsNotFound(err) {
-		dbg.Info("certificate signing request in work queue no longer exists", "error", err.Error())
-		return nil
-	}
-
-	if err != nil {
+	if err != nil && !k8sErrors.IsNotFound(err) {
 		return err
+	}
+	if csr == nil || csr.DeletionTimestamp != nil {
+		// If the CertificateSigningRequest object was/ is being deleted, we don't want to start signing.
+		return nil
 	}
 
 	ctx = logf.NewContext(ctx, logf.WithResource(log, csr))

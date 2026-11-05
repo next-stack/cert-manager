@@ -19,6 +19,7 @@ package pki_test
 import (
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"math"
 	"testing"
 	"time"
@@ -30,10 +31,25 @@ import (
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
 
-func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
+func TestCertificateTemplateFromCertificateSigningRequest(t *testing.T) {
 	csr, pk, err := gen.CSR(x509.RSA, gen.SetCSRCommonName("example.com"), gen.SetCSRDNSNames("example.com", "foo.example.com"))
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	sansGenerator := func(t *testing.T, generalNames []asn1.RawValue, critical bool) pkix.Extension {
+		var oidExtensionSubjectAltName = []int{2, 5, 29, 17}
+
+		val, err := asn1.Marshal(generalNames)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return pkix.Extension{
+			Id:       oidExtensionSubjectAltName,
+			Critical: critical,
+			Value:    val,
+		}
 	}
 
 	tests := map[string]struct {
@@ -79,9 +95,7 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 				gen.SetCertificateSigningRequestRequest(csr),
 			),
 			expCertificate: &x509.Certificate{
-				Version:               2,
 				BasicConstraintsValid: true,
-				SerialNumber:          nil,
 				PublicKeyAlgorithm:    x509.RSA,
 				PublicKey:             pk.Public(),
 				IsCA:                  true,
@@ -96,6 +110,18 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 					x509.ExtKeyUsageCodeSigning,
 				},
 				DNSNames: []string{"example.com", "foo.example.com"},
+				Extensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
 			},
 		},
 		"a CSR with isCA=false that is valid should return a valid *x509.Certificate": {
@@ -112,9 +138,7 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 				gen.SetCertificateSigningRequestRequest(csr),
 			),
 			expCertificate: &x509.Certificate{
-				Version:               2,
 				BasicConstraintsValid: true,
-				SerialNumber:          nil,
 				PublicKeyAlgorithm:    x509.RSA,
 				PublicKey:             pk.Public(),
 				IsCA:                  false,
@@ -129,6 +153,18 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 					x509.ExtKeyUsageCodeSigning,
 				},
 				DNSNames: []string{"example.com", "foo.example.com"},
+				Extensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
 			},
 		},
 		"a CSR with expiration seconds that is valid should return a valid *x509.Certificate": {
@@ -145,9 +181,7 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 				gen.SetCertificateSigningRequestRequest(csr),
 			),
 			expCertificate: &x509.Certificate{
-				Version:               2,
 				BasicConstraintsValid: true,
-				SerialNumber:          nil,
 				PublicKeyAlgorithm:    x509.RSA,
 				PublicKey:             pk.Public(),
 				IsCA:                  false,
@@ -162,6 +196,18 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 					x509.ExtKeyUsageCodeSigning,
 				},
 				DNSNames: []string{"example.com", "foo.example.com"},
+				Extensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
 			},
 		},
 		"a CSR with expiration seconds and duration annotation should prefer the annotation duration": {
@@ -179,9 +225,7 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 				gen.SetCertificateSigningRequestRequest(csr),
 			),
 			expCertificate: &x509.Certificate{
-				Version:               2,
 				BasicConstraintsValid: true,
-				SerialNumber:          nil,
 				PublicKeyAlgorithm:    x509.RSA,
 				PublicKey:             pk.Public(),
 				IsCA:                  false,
@@ -196,13 +240,25 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 					x509.ExtKeyUsageCodeSigning,
 				},
 				DNSNames: []string{"example.com", "foo.example.com"},
+				Extensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(t, []asn1.RawValue{
+						{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+						{Tag: 2, Class: 2, Bytes: []byte("foo.example.com")},
+					}, false),
+				},
 			},
 		},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			templ, err := pki.GenerateTemplateFromCertificateSigningRequest(test.csr)
+			templ, err := pki.CertificateTemplateFromCertificateSigningRequest(test.csr)
 			assert.Equal(t, test.expErr, err != nil)
 
 			if err == nil {
@@ -218,7 +274,6 @@ func TestGenerateTemplateFromCertificateSigningRequest(t *testing.T) {
 				test.expCertificate.NotBefore = time.Time{}
 				templ.NotAfter = time.Time{}
 				templ.NotBefore = time.Time{}
-				templ.SerialNumber = nil
 				templ.Subject.Names = nil
 				templ.RawSubject = nil
 

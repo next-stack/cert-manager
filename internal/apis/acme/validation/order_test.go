@@ -17,13 +17,12 @@ limitations under the License.
 package validation
 
 import (
-	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/utils/pointer"
 
 	cmacme "github.com/cert-manager/cert-manager/internal/apis/acme"
 )
@@ -55,46 +54,24 @@ func testImmutableOrderField(t *testing.T, fldPath *field.Path, setter func(*cma
 			field.Forbidden(fldPath, "field is immutable once set"),
 		}
 		var expectedWarnings []string
-		old := &cmacme.Order{}
-		new := &cmacme.Order{}
-		setter(old, testValueOptionOne)
-		setter(new, testValueOptionTwo)
-		errs, warnings := ValidateOrderUpdate(someAdmissionRequest, old, new)
-		if len(errs) != len(expectedErrs) {
-			t.Errorf("Expected errors %v but got %v", expectedErrs, errs)
-			return
-		}
-		for i, e := range errs {
-			expectedErr := expectedErrs[i]
-			if !reflect.DeepEqual(e, expectedErr) {
-				t.Errorf("Expected error %v but got %v", expectedErr, e)
-			}
-		}
-		if !reflect.DeepEqual(warnings, expectedWarnings) {
-			t.Errorf("Expected warnings %+#v but got %+#v", expectedWarnings, warnings)
-		}
+		oldOrder := &cmacme.Order{}
+		newOrder := &cmacme.Order{}
+		setter(oldOrder, testValueOptionOne)
+		setter(newOrder, testValueOptionTwo)
+		errs, warnings := ValidateOrderUpdate(someAdmissionRequest, oldOrder, newOrder)
+		field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, expectedErrs, errs)
+		assert.Equal(t, expectedWarnings, warnings)
 	})
 	t.Run("should allow updates to "+fldPath.String()+" if not already set", func(t *testing.T) {
-		expectedErrs := []*field.Error{}
+		var expectedErrs []*field.Error
 		var expectedWarnings []string
-		old := &cmacme.Order{}
-		new := &cmacme.Order{}
-		setter(old, testValueNone)
-		setter(new, testValueOptionOne)
-		errs, warnings := ValidateOrderUpdate(someAdmissionRequest, old, new)
-		if len(errs) != len(expectedErrs) {
-			t.Errorf("Expected errors %v but got %v", expectedErrs, errs)
-			return
-		}
-		for i, e := range errs {
-			expectedErr := expectedErrs[i]
-			if !reflect.DeepEqual(e, expectedErr) {
-				t.Errorf("Expected error %v but got %v", expectedErr, e)
-			}
-		}
-		if !reflect.DeepEqual(warnings, expectedWarnings) {
-			t.Errorf("Expected warnings %+#v but got %+#v", expectedWarnings, warnings)
-		}
+		oldOrder := &cmacme.Order{}
+		newOrder := &cmacme.Order{}
+		setter(oldOrder, testValueNone)
+		setter(newOrder, testValueOptionOne)
+		errs, warnings := ValidateOrderUpdate(someAdmissionRequest, oldOrder, newOrder)
+		field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, expectedErrs, errs)
+		assert.Equal(t, expectedWarnings, warnings)
 	})
 }
 
@@ -153,11 +130,11 @@ func TestValidateOrderUpdate(t *testing.T) {
 			}
 		case testValueOptionOne:
 			o.Status.Authorizations = []cmacme.ACMEAuthorization{
-				{Wildcard: pointer.BoolPtr(false)},
+				{Wildcard: new(false)},
 			}
 		case testValueOptionTwo:
 			o.Status.Authorizations = []cmacme.ACMEAuthorization{
-				{Wildcard: pointer.BoolPtr(true)},
+				{Wildcard: new(true)},
 			}
 		}
 	})
@@ -234,19 +211,8 @@ func TestValidateOrderUpdate(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs, warnings := ValidateOrderUpdate(s.a, s.old, s.new)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected errors %v but got %v", expectedErr, e)
-				}
-			}
-			if !reflect.DeepEqual(warnings, s.warnings) {
-				t.Errorf("Expected warnings %+#v but got %+#v", s.warnings, warnings)
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
+			assert.Equal(t, s.warnings, warnings)
 		})
 	}
 }
@@ -261,19 +227,8 @@ func TestValidateOrder(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs, warnings := ValidateOrder(s.a, s.order)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected errors %v but got %v", expectedErr, e)
-				}
-			}
-			if !reflect.DeepEqual(warnings, s.warnings) {
-				t.Errorf("Expected warnings %+#v but got %+#v", s.warnings, warnings)
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
+			assert.Equal(t, s.warnings, warnings)
 		})
 	}
 }

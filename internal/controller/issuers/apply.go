@@ -23,7 +23,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
@@ -43,7 +42,7 @@ func ApplyIssuerStatus(ctx context.Context, cl cmclient.Interface, fieldManager 
 
 	_, err = cl.CertmanagerV1().Issuers(issuer.Namespace).Patch(
 		ctx, issuer.Name, apitypes.ApplyPatchType, issuerData,
-		metav1.PatchOptions{Force: pointer.Bool(true), FieldManager: fieldManager}, "status",
+		metav1.PatchOptions{Force: new(true), FieldManager: fieldManager}, "status",
 	)
 
 	return err
@@ -64,7 +63,7 @@ func ApplyClusterIssuerStatus(ctx context.Context, cl cmclient.Interface, fieldM
 
 	_, err = cl.CertmanagerV1().ClusterIssuers().Patch(
 		ctx, issuer.Name, apitypes.ApplyPatchType, issuerData,
-		metav1.PatchOptions{Force: pointer.Bool(true), FieldManager: fieldManager}, "status",
+		metav1.PatchOptions{Force: new(true), FieldManager: fieldManager}, "status",
 	)
 
 	return err
@@ -77,8 +76,10 @@ func ApplyClusterIssuerStatus(ctx context.Context, cl cmclient.Interface, fieldM
 // "cert-manager.io/v1" respectively.
 func serializeApplyIssuerStatus(issuer *cmapi.Issuer) ([]byte, error) {
 	issuer = &cmapi.Issuer{
-		TypeMeta:   metav1.TypeMeta{Kind: cmapi.IssuerKind, APIVersion: cmapi.SchemeGroupVersion.Identifier()},
-		ObjectMeta: metav1.ObjectMeta{Namespace: issuer.Namespace, Name: issuer.Name},
+		Kind:       cmapi.IssuerKind,
+		APIVersion: cmapi.SchemeGroupVersion.Identifier(),
+		Namespace:  issuer.Namespace,
+		Name:       issuer.Name,
 		Status:     *issuer.Status.DeepCopy(),
 	}
 	issuerData, err := json.Marshal(issuer)
@@ -95,8 +96,9 @@ func serializeApplyIssuerStatus(issuer *cmapi.Issuer) ([]byte, error) {
 // "cert-manager.io/v1" respectively.
 func serializeApplyClusterIssuerStatus(issuer *cmapi.ClusterIssuer) ([]byte, error) {
 	issuer = &cmapi.ClusterIssuer{
-		TypeMeta:   metav1.TypeMeta{Kind: cmapi.ClusterIssuerKind, APIVersion: cmapi.SchemeGroupVersion.Identifier()},
-		ObjectMeta: metav1.ObjectMeta{Name: issuer.Name},
+		Kind:       cmapi.ClusterIssuerKind,
+		APIVersion: cmapi.SchemeGroupVersion.Identifier(),
+		Name:       issuer.Name,
 		Status:     *issuer.Status.DeepCopy(),
 	}
 	issuerData, err := json.Marshal(issuer)

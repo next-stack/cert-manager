@@ -20,20 +20,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
+	"time"
 
-	acmeapi "golang.org/x/crypto/acme"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/digitalocean/godo"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	"github.com/cert-manager/cert-manager/pkg/acme"
 	acmecl "github.com/cert-manager/cert-manager/pkg/acme/client"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
-	dnsutil "github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
-	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
+	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
 )
 
 const (
@@ -42,6 +48,10 @@ const (
 	reasonPresentError   = "PresentError"
 	reasonPresented      = "Presented"
 	reasonFailed         = "Failed"
+
+	// How long to wait for an authorization response from the ACME server in acceptChallenge()
+	// before giving up
+	authorizationTimeout = 2 * time.Minute
 )
 
 // solver solves ACME challenges by presenting the given token and key in an
@@ -53,8 +63,8 @@ type solver interface {
 	Check(ctx context.Context, issuer cmapi.GenericIssuer, ch *cmacme.Challenge) error
 	// CleanUp will remove challenge records for a given solver.
 	// This may involve deleting resources in the Kubernetes API Server, or
-	// communicating with other external components (e.g. DNS providers).
-	CleanUp(ctx context.Context, issuer cmapi.GenericIssuer, ch *cmacme.Challenge) error
+	// communicating with other external components (e.g., DNS providers).
+	CleanUp(ctx context.Context, ch *cmacme.Challenge) error
 }
 
 // Sync will process this ACME Challenge.
@@ -64,9 +74,19 @@ func (c *controller) Sync(ctx context.Context, chOriginal *cmacme.Challenge) (er
 	ctx = logf.NewContext(ctx, log)
 	ch := chOriginal.DeepCopy()
 
+	// Upgrade from CSA to SSA if needed. This might result in a resource conflict if another
+	// controller has updated the Challenge since it was read, but that's ok - we'll just retry
+	// and upgrade again on the next sync.
+	if upgraded, err := c.upgradeManagedFields(ctx, ch); err != nil {
+		return fmt.Errorf("error upgrading managed fields: %w", err)
+	} else if upgraded {
+		log.V(logf.DebugLevel).Info("upgraded managed fields from CSA to SSA, will reconcile again with updated managed fields")
+		return nil
+	}
+
 	defer func() {
-		if updateError := c.updateObject(ctx, chOriginal, ch); updateError != nil {
-			if errors.Is(updateError, argumentError) {
+		if updateError := c.updateStatus(ctx, chOriginal, ch); updateError != nil {
+			if errors.Is(updateError, errArgument) {
 				log.Error(updateError, "If this error occurs there is a bug in cert-manager. Please report it. Not retrying.")
 				return
 			}
@@ -74,53 +94,57 @@ func (c *controller) Sync(ctx context.Context, chOriginal *cmacme.Challenge) (er
 		}
 	}()
 
-	if !ch.DeletionTimestamp.IsZero() {
-		return c.handleFinalizer(ctx, ch)
+	// If the challenge has been deleted or is in a finished state then attempt
+	// to cleanup any presented resources, remove the finalizer and reset the
+	// processing and presented status fields.
+	// Once the challenge reaches this final state, we always return here.
+	challengeFinished := !ch.DeletionTimestamp.IsZero() || acme.IsFinalState(ch.Status.State)
+	if challengeFinished {
+		if finalizers := sets.New(ch.Finalizers...); finalizers.Has(cmacme.ACMELegacyFinalizer) ||
+			finalizers.Has(cmacme.ACMEDomainQualifiedFinalizer) {
+			// The resource still has ACME finalizers, we attempt to finalize the resource
+			// by calling CleanUp and then remove the finalizers if successful
+			if err := c.finalize(ctx, ch); err != nil {
+				return err
+			}
+
+			// Remove the ACME finalizers since cleanup has been completed successfully.
+			return c.applyFinalizers(ctx, ch, nil)
+		}
+
+		ch.Status.Presented = false
+		ch.Status.Processing = false
+		// PresentedAt is intentionally left untouched. It records when the
+		// solver resources were first presented, which remains accurate for a
+		// finished challenge, and clearing it here would diverge between the
+		// legacy UpdateStatus path (which would set it to nil) and the SSA path
+		// (which omits nil fields and so would leave it set on the server).
+
+		return nil
 	}
 
 	// bail out early on if processing=false, as this challenge has not been
-	// scheduled yet.
+	// scheduled yet or has finished.
 	if !ch.Status.Processing {
 		return nil
 	}
 
-	// This finalizer ensures that the challenge is not garbage collected before
-	// cert-manager has a chance to clean up resources created for the
-	// challenge.
-	if finalizerRequired(ch) {
-		ch.Finalizers = append(ch.Finalizers, cmacme.ACMEFinalizer)
-		return nil
+	// Add finalizer or replace legacy finalizer if needed. This ensures that the
+	// challenge is not garbage collected before cert-manager has a chance to clean
+	// up resources created for the challenge.
+	if finalizers := sets.New(ch.Finalizers...); !finalizers.Has(cmacme.ACMEDomainQualifiedFinalizer) ||
+		finalizers.Has(cmacme.ACMELegacyFinalizer) {
+		// Apply the ACME finalizer, replacing the legacy finalizer if it is present.
+		// We return early and wait for the next sync to make sure we have the latest
+		// resourceVersion for follow-up updates. Once we move to SSA for status updates,
+		// we will no longer have to worry about conflicts in following code and don't have
+		// to return early here.
+		return c.applyFinalizers(ctx, ch, []string{cmacme.ACMEDomainQualifiedFinalizer})
 	}
 
 	genericIssuer, err := c.helper.GetGenericIssuer(ch.Spec.IssuerRef, ch.Namespace)
 	if err != nil {
 		return fmt.Errorf("error reading (cluster)issuer %q: %v", ch.Spec.IssuerRef.Name, err)
-	}
-
-	// if a challenge is in a final state, we bail out early as there is nothing
-	// left for us to do here.
-	if acme.IsFinalState(ch.Status.State) {
-		if ch.Status.Presented {
-			solver, err := c.solverFor(ch.Spec.Type)
-			if err != nil {
-				log.Error(err, "error getting solver for challenge")
-				return err
-			}
-
-			err = solver.CleanUp(ctx, genericIssuer, ch)
-			if err != nil {
-				c.recorder.Eventf(ch, corev1.EventTypeWarning, reasonCleanUpError, "Error cleaning up challenge: %v", err)
-				ch.Status.Reason = err.Error()
-				log.Error(err, "error cleaning up challenge")
-				return err
-			}
-
-			ch.Status.Presented = false
-		}
-
-		ch.Status.Processing = false
-
-		return nil
 	}
 
 	cl, err := c.accountRegistry.GetClient(string(genericIssuer.GetUID()))
@@ -131,7 +155,7 @@ func (c *controller) Sync(ctx context.Context, chOriginal *cmacme.Challenge) (er
 	if ch.Status.State == "" {
 		err := c.syncChallengeStatus(ctx, cl, ch)
 		if err != nil {
-			return handleError(ch, err)
+			return handleError(ctx, ch, err)
 		}
 
 		// if the state has not changed, return an error
@@ -146,28 +170,6 @@ func (c *controller) Sync(ctx context.Context, chOriginal *cmacme.Challenge) (er
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(feature.ValidateCAA) {
-		// check for CAA records.
-		// CAA records are static, so we don't have to present anything
-		// before we check for them.
-
-		// Find out which identity the ACME server says it will use.
-		dir, err := cl.Discover(ctx)
-		if err != nil {
-			return handleError(ch, err)
-		}
-		// TODO(dmo): figure out if missing CAA identity in directory
-		// means no CAA check is performed by ACME server or if any valid
-		// CAA would stop issuance (strongly suspect the former)
-		if len(dir.CAA) != 0 {
-			err := dnsutil.ValidateCAA(ch.Spec.DNSName, dir.CAA, ch.Spec.Wildcard, c.dns01Nameservers)
-			if err != nil {
-				ch.Status.Reason = fmt.Sprintf("CAA self-check failed: %s", err)
-				return err
-			}
-		}
-	}
-
 	solver, err := c.solverFor(ch.Spec.Type)
 	if err != nil {
 		return err
@@ -177,27 +179,39 @@ func (c *controller) Sync(ctx context.Context, chOriginal *cmacme.Challenge) (er
 		err := solver.Present(ctx, genericIssuer, ch)
 		if err != nil {
 			c.recorder.Eventf(ch, corev1.EventTypeWarning, reasonPresentError, "Error presenting challenge: %v", err)
-			ch.Status.Reason = err.Error()
+			// stabilize the error message to avoid spurious updates which would
+			// cause repeated reconciles
+			ch.Status.Reason = stabilizeSolverErrorMessage(err)
 			return err
 		}
 
 		ch.Status.Presented = true
+		now := metav1.NewTime(c.clock.Now())
+		ch.Status.PresentedAt = &now
 		c.recorder.Eventf(ch, corev1.EventTypeNormal, reasonPresented, "Presented challenge using %s challenge mechanism", ch.Spec.Type)
 	}
 
-	err = solver.Check(ctx, genericIssuer, ch)
+	// Backfill PresentedAt for already-presented challenges when
+	// WaitInsteadOfSelfCheck is configured. This covers upgrade or
+	// pre-existing-object cases where Presented was recorded before the
+	// controller started writing PresentedAt.
+	if ch.Status.Presented && ch.Status.PresentedAt == nil && ch.Spec.Solver.WaitInsteadOfSelfCheck != nil {
+		now := metav1.NewTime(c.clock.Now())
+		ch.Status.PresentedAt = &now
+	}
+
+	readiness := buildChallengeReadinessEvaluator(ch, c.DNS01CheckRetryPeriod, c.clock.Now())
+	result, err := readiness.evaluate(ctx, solver, genericIssuer, ch)
 	if err != nil {
-		log.Error(err, "propagation check failed")
-		ch.Status.Reason = fmt.Sprintf("Waiting for %s challenge propagation: %s", ch.Spec.Type, err)
-
-		key, err := controllerpkg.KeyFunc(ch)
-		// This is an unexpected edge case and should never occur
-		if err != nil {
-			return err
-		}
-
-		c.queue.AddAfter(key, c.DNS01CheckRetryPeriod)
-
+		return err
+	}
+	if !result.ready {
+		log.V(logf.DebugLevel).Info("challenge not ready to accept yet", "retry_after", result.retryAfter)
+		ch.Status.Reason = result.reason
+		c.queue.AddAfter(types.NamespacedName{
+			Namespace: ch.Namespace,
+			Name:      ch.Name,
+		}, result.retryAfter)
 		return nil
 	}
 
@@ -209,10 +223,72 @@ func (c *controller) Sync(ctx context.Context, chOriginal *cmacme.Challenge) (er
 	return nil
 }
 
+// stabilizeSolverErrorMessage will attempt to remove any unique IDs from the given
+// error message so that it can be assigned to the Challenge.Status.Reason
+// field without causing spurious updates.
+//
+// For example,
+// - Azure SDK returns the contents of the HTTP requests in its error messages.
+// - AWS SDK adds request UIDs to its error messages.
+// - DigitalOcean SDK adds request UIDs to its error messages.
+//
+// TODO(wallrj): Ideally this would not be necessary. It should be possible to
+// add the unique error message to the status without triggering another
+// reconcile.
+//
+// TODO(wallrj): This won't work if one of the unstable errors is wrapped inside
+// another unstable error, because we only unwrap the first instance and the
+// strings.ReplaceAll calls won't find it. At time of wriging none of the DNS
+// SDKs returns nested unstable errors, so we do not expect this to be a problem
+// in practice.
+func stabilizeSolverErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	fullMessage := err.Error()
+	{
+		if target, ok := errors.AsType[*awshttp.ResponseError](err); ok {
+			fullMessage = strings.ReplaceAll(
+				fullMessage,
+				target.Error(),
+				"<redacted AWS SDK error: http.ResponseError: see events and logs for details>",
+			)
+		}
+	}
+	{
+		if target, ok := errors.AsType[*azidentity.AuthenticationFailedError](err); ok {
+			fullMessage = strings.ReplaceAll(
+				fullMessage,
+				target.Error(),
+				"<redacted Azure SDK error: azidentity.AuthenticationFailedError: see events and logs for details>",
+			)
+		}
+	}
+	{
+		if target, ok := errors.AsType[*azcore.ResponseError](err); ok {
+			fullMessage = strings.ReplaceAll(
+				fullMessage,
+				target.Error(),
+				"<redacted Azure SDK error: azcore.ResponseError: see events and logs for details>",
+			)
+		}
+	}
+	{
+		if target, ok := errors.AsType[*godo.ErrorResponse](err); ok {
+			fullMessage = strings.ReplaceAll(
+				fullMessage,
+				target.Error(),
+				"<redacted DigitalOcean SDK error: godo.ErrorResponse: see events and logs for details>",
+			)
+		}
+	}
+	return fullMessage
+}
+
 // handleError will handle ACME error types, updating the challenge resource
 // with any new information found whilst inspecting the error response.
 // This may include marking the challenge as expired.
-func handleError(ch *cmacme.Challenge, err error) error {
+func handleError(ctx context.Context, ch *cmacme.Challenge, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -220,20 +296,36 @@ func handleError(ch *cmacme.Challenge, err error) error {
 	var acmeErr *acmeapi.Error
 	var ok bool
 	if acmeErr, ok = err.(*acmeapi.Error); !ok {
+		// Transient network errors (TLS handshake timeouts, DNS failures,
+		// connection resets) and context cancellation/deadline errors are
+		// not protocol-level rejections from the ACME server. Returning them
+		// without setting Status.State leaves the challenge in its current
+		// state and lets the workqueue retry with backoff. Without this, a
+		// single transient network blip marks the challenge terminally
+		// Errored, after which IsFinalState() makes the controller stop
+		// reconciling it (see issues #8696 and #8747).
+		if isTransientACMEError(err) {
+			logf.FromContext(ctx).Error(err, "transient non-ACME API error, will retry")
+			return err
+		}
+		ch.Status.State = cmacme.Errored
+		ch.Status.Reason = fmt.Sprintf("unexpected non-ACME API error: %v", err)
+		logf.FromContext(ctx).Error(err, "unexpected non-ACME API error")
 		return err
 	}
-	switch acmeErr.ProblemType {
+
 	// This response type is returned when an authorization has expired or the
 	// request is in some way malformed.
 	// In this case, we should mark the challenge as expired so that the order
 	// can be retried.
 	// TODO: don't mark *all* malformed errors as expired, we may be able to be
 	// more informative to the user by further inspecting the Error response.
-	case "urn:ietf:params:acme:error:malformed":
+	if acmeErr.ProblemType == "urn:ietf:params:acme:error:malformed" {
 		ch.Status.State = cmacme.Expired
 		// absorb the error as updating the challenge's status will trigger a sync
 		return nil
 	}
+
 	if acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
 		ch.Status.State = cmacme.Errored
 		ch.Status.Reason = fmt.Sprintf("Failed to retrieve Order resource: %v", err)
@@ -243,44 +335,38 @@ func handleError(ch *cmacme.Challenge, err error) error {
 	return err
 }
 
-// handleFinalizer will attempt to 'finalize' the Challenge resource by calling
-// CleanUp if the resource is in a 'processing' state.
-func (c *controller) handleFinalizer(ctx context.Context, ch *cmacme.Challenge) (err error) {
+// isTransientACMEError reports whether err is a transient network-layer
+// failure (timeout, DNS resolution failure, connection reset, TLS handshake
+// failure, etc.) or a context cancellation / deadline error. Such errors are
+// not ACME-protocol rejections and should be retried via the workqueue rather
+// than terminally failing the challenge.
+func isTransientACMEError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// finalize will attempt to 'finalize' the Challenge resource by calling CleanUp
+func (c *controller) finalize(ctx context.Context, ch *cmacme.Challenge) (err error) {
 	log := logf.FromContext(ctx, "finalizer")
-	if len(ch.Finalizers) == 0 {
-		return nil
-	}
-	if ch.Finalizers[0] != cmacme.ACMEFinalizer {
-		log.V(logf.DebugLevel).Info("waiting to run challenge finalization...")
-		return nil
-	}
-
-	defer func() {
-		// call Update to remove the metadata.finalizers entry
-		ch.Finalizers = ch.Finalizers[1:]
-	}()
-
-	if !ch.Status.Processing {
-		return nil
-	}
-
-	genericIssuer, err := c.helper.GetGenericIssuer(ch.Spec.IssuerRef, ch.Namespace)
-	if err != nil {
-		return fmt.Errorf("error reading (cluster)issuer %q: %v", ch.Spec.IssuerRef.Name, err)
-	}
 
 	solver, err := c.solverFor(ch.Spec.Type)
 	if err != nil {
 		log.Error(err, "error getting solver for challenge")
-		return nil
+		return err
 	}
 
-	err = solver.CleanUp(ctx, genericIssuer, ch)
+	err = solver.CleanUp(ctx, ch)
 	if err != nil {
-		c.recorder.Eventf(ch, corev1.EventTypeWarning, reasonCleanUpError, "Error cleaning up challenge: %v", err)
-		ch.Status.Reason = err.Error()
+		err := fmt.Errorf("Error cleaning up challenge: %v", err)
+		c.recorder.Eventf(ch, corev1.EventTypeWarning, reasonCleanUpError, "%s", err.Error())
+		// stabilize the error message to avoid spurious updates which would
+		// cause repeated reconciles
+		ch.Status.Reason = stabilizeSolverErrorMessage(err)
 		log.Error(err, "error cleaning up challenge")
-		return nil
+		return err
 	}
 
 	return nil
@@ -370,14 +456,22 @@ func (c *controller) acceptChallenge(ctx context.Context, cl acmecl.Interface, c
 	if err != nil {
 		log.Error(err, "error accepting challenge")
 		ch.Status.Reason = fmt.Sprintf("Error accepting challenge: %v", err)
-		return handleError(ch, err)
+		return handleError(ctx, ch, err)
 	}
 
 	log.V(logf.DebugLevel).Info("waiting for authorization for domain")
-	authorization, err := cl.WaitAuthorization(ctx, ch.Spec.AuthorizationURL)
+	// The underlying ACME implementation from golang.org/x/crypto of WaitAuthorization retries on
+	// response parsing errors.  In the event that an ACME server is not returning expected JSON
+	// responses, the call to WaitAuthorization can and has been seen to not return and loop forever,
+	// blocking the challenge's processing. Here, we defensively add a timeout for this exchange
+	// with the ACME server and a "context deadline reached" error will be returned by WaitAuthorization
+	// in the err variable.
+	ctxTimeout, cancelAuthorization := context.WithTimeout(ctx, authorizationTimeout)
+	defer cancelAuthorization()
+	authorization, err := cl.WaitAuthorization(ctxTimeout, ch.Spec.AuthorizationURL)
 	if err != nil {
 		log.Error(err, "error waiting for authorization")
-		return c.handleAuthorizationError(ch, err)
+		return c.handleAuthorizationError(ctxTimeout, ch, err)
 	}
 
 	ch.Status.State = cmacme.State(authorization.Status)
@@ -387,10 +481,10 @@ func (c *controller) acceptChallenge(ctx context.Context, cl acmecl.Interface, c
 	return nil
 }
 
-func (c *controller) handleAuthorizationError(ch *cmacme.Challenge, err error) error {
+func (c *controller) handleAuthorizationError(ctx context.Context, ch *cmacme.Challenge, err error) error {
 	authErr, ok := err.(*acmeapi.AuthorizationError)
 	if !ok {
-		return handleError(ch, err)
+		return handleError(ctx, ch, err)
 	}
 
 	// TODO: the AuthorizationError above could technically contain the final

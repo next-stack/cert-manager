@@ -16,8 +16,22 @@ limitations under the License.
 
 package v1
 
-// Common annotation keys added to resources.
 const (
+
+	// Common label keys added to resources
+	// Label key that indicates that a resource is of interest to
+	// cert-manager controller By default this is set on
+	// certificate.spec.secretName secret as well as on the temporary
+	// private key Secret. If using SecretsFilteredCaching feature, you
+	// might want to set this (with a value of 'true') to any other Secrets
+	// that cert-manager controller needs to read, such as issuer
+	// credentials Secrets.
+	// fao = 'for attention of'
+	// See https://github.com/cert-manager/cert-manager/blob/master/design/20221205-memory-management.md#risks-and-mitigations
+	PartOfCertManagerControllerLabelKey = "controller.cert-manager.io/fao"
+
+	// Common annotation keys added to resources
+
 	// Annotation key for DNS subjectAltNames.
 	AltNamesAnnotationKey = "cert-manager.io/alt-names"
 
@@ -35,6 +49,36 @@ const (
 
 	// Annotation key for certificate renewBefore.
 	RenewBeforeAnnotationKey = "cert-manager.io/renew-before"
+
+	// Annotation key for certificate renewBeforePercentage.
+	RenewBeforePercentageAnnotationKey = "cert-manager.io/renew-before-percentage"
+
+	// Annotation key for emails subjectAltNames.
+	EmailsAnnotationKey = "cert-manager.io/email-sans"
+
+	// Annotation key for subject organization.
+	SubjectOrganizationsAnnotationKey = "cert-manager.io/subject-organizations"
+
+	// Annotation key for subject organizational units.
+	SubjectOrganizationalUnitsAnnotationKey = "cert-manager.io/subject-organizationalunits"
+
+	// Annotation key for subject organizational units.
+	SubjectCountriesAnnotationKey = "cert-manager.io/subject-countries"
+
+	// Annotation key for subject provinces.
+	SubjectProvincesAnnotationKey = "cert-manager.io/subject-provinces"
+
+	// Annotation key for subject localities.
+	SubjectLocalitiesAnnotationKey = "cert-manager.io/subject-localities"
+
+	// Annotation key for subject provinces.
+	SubjectStreetAddressesAnnotationKey = "cert-manager.io/subject-streetaddresses"
+
+	// Annotation key for subject postal codes.
+	SubjectPostalCodesAnnotationKey = "cert-manager.io/subject-postalcodes"
+
+	// Annotation key for subject serial number.
+	SubjectSerialNumberAnnotationKey = "cert-manager.io/subject-serialnumber"
 
 	// Annotation key for certificate key usages.
 	UsagesAnnotationKey = "cert-manager.io/usages"
@@ -65,6 +109,8 @@ const (
 	// key size of 256 will be used for `ECDSA` key algorithm and
 	// key size of 2048 will be used for `RSA` key algorithm.
 	// key size is ignored when using the `Ed25519` key algorithm.
+	// The `MLDSA` key algorithm requires the MLDSAPrivateKeys feature gate, and
+	// defaults to the ML-DSA-44 parameter set and `digital signature` usage.
 	// If unset an algorithm `RSA` will be used.
 	PrivateKeyAlgorithmAnnotationKey = "cert-manager.io/private-key-algorithm"
 
@@ -80,12 +126,23 @@ const (
 	// If PrivateKeyAlgorithm is set to `ECDSA`, valid values are `256`, `384` or `521`,
 	// and will default to `256` if not specified.
 	// If PrivateKeyAlgorithm is set to `Ed25519`, Size is ignored.
+	// If PrivateKeyAlgorithm is set to `MLDSA`, valid values are `44`, `65` or `87`,
+	// and will default to `44` if not specified.
 	// No other values are allowed.
 	PrivateKeySizeAnnotationKey = "cert-manager.io/private-key-size"
 
 	// Annotation key used to set the PrivateKeyRotationPolicy for a Certificate.
 	// If unset a policy `Never` will be used.
 	PrivateKeyRotationPolicyAnnotationKey = "cert-manager.io/private-key-rotation-policy"
+
+	// CertificateIgnoreTLSListeners is an annotation that specifies which
+	// Gateway API listeners in a ListenerSet or Gateway cert-manager should
+	// ignore while creating Certificate objects through the certificate-shim
+	// controller.
+	// The value of this annotation should be a comma-separated list of listener names.
+	// This is useful for users who want to use cert-manager to manage
+	// certificates for some, but not all, of the listeners for a given parent.
+	CertificateIgnoreTLSListeners = "cert-manager.io/ignore-tls-listeners"
 )
 
 const (
@@ -99,11 +156,18 @@ const (
 	// IngressACMEIssuerHTTP01IngressClassAnnotationKey holds the acmeIssuerHTTP01IngressClassAnnotation value
 	// which can be used to override the http01 ingressClass if the challenge type is set to http01
 	IngressACMEIssuerHTTP01IngressClassAnnotationKey = "acme.cert-manager.io/http01-ingress-class"
+	// IngressACMEIssuerHTTP01IngressClassNameAnnotationKey holds the annotation value
+	// which can be used to override the http01 ingressClassName if the challenge type is set to http01
+	IngressACMEIssuerHTTP01IngressClassNameAnnotationKey = "acme.cert-manager.io/http01-ingress-ingressclassname"
 
 	// IngressClassAnnotationKey picks a specific "class" for the Ingress. The
 	// controller only processes Ingresses with this annotation either unset, or
 	// set to either the configured value or the empty string.
 	IngressClassAnnotationKey = "kubernetes.io/ingress.class"
+
+	// IngressSecretTemplate can be used to set the secretTemplate field in the generated Certificate.
+	// The value is a JSON representation of secretTemplate and must not have any unknown fields.
+	IngressSecretTemplate = "cert-manager.io/secret-template"
 )
 
 // Annotation names for CertificateRequests
@@ -163,15 +227,15 @@ const (
 
 // Issuer specific Annotations
 const (
-	// VenafiCustomFieldsAnnotationKey is the annotation that passes on JSON encoded custom fields to the Venafi issuer
-	// This will only work with Venafi TPP v19.3 and higher
+	// VenafiCustomFieldsAnnotationKey is the annotation that passes on JSON encoded custom fields to the Certificate Manager issuer
+	// This will only work with CyberArk Certificate Manager Self-Hosted v19.3 and higher
 	// The value is an array with objects containing the name and value keys
 	// for example: `[{"name": "custom-field", "value": "custom-value"}]`
 	VenafiCustomFieldsAnnotationKey = "venafi.cert-manager.io/custom-fields"
 
 	// VenafiPickupIDAnnotationKey is the annotation key used to record the
-	// Venafi Pickup ID of a certificate signing request that has been submitted
-	// to the Venafi API for collection later.
+	// Certificate Manager Pickup ID of a certificate signing request that has been submitted
+	// to the Certificate Manager for collection later.
 	VenafiPickupIDAnnotationKey = "venafi.cert-manager.io/pickup-id"
 )
 
@@ -231,6 +295,24 @@ const (
 	UsageOCSPSigning       KeyUsage = "ocsp signing"
 	UsageMicrosoftSGC      KeyUsage = "microsoft sgc"
 	UsageNetscapeSGC       KeyUsage = "netscape sgc"
+)
+
+// Keystore specific secret keys
+const (
+	// PKCS12SecretKey is the name of the data entry in the Secret resource
+	// used to store the p12 file.
+	PKCS12SecretKey = "keystore.p12"
+	// Data Entry Name in the Secret resource for PKCS12 containing Certificate Authority
+	PKCS12TruststoreKey = "truststore.p12"
+
+	// JKSSecretKey is the name of the data entry in the Secret resource
+	// used to store the jks file.
+	JKSSecretKey = "keystore.jks"
+	// Data Entry Name in the Secret resource for JKS containing Certificate Authority
+	JKSTruststoreKey = "truststore.jks"
+
+	// The password used to encrypt the keystore and truststore
+	KeystorePassword = "keystorePassword"
 )
 
 // DefaultKeyUsages contains the default list of key usages

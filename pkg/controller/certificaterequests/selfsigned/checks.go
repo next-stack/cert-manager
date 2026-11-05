@@ -22,10 +22,13 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
+	cmdoc "github.com/cert-manager/cert-manager/pkg/apis/certmanager"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	clientv1 "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
@@ -40,13 +43,13 @@ import (
 func handleSecretReferenceWorkFunc(log logr.Logger,
 	lister clientv1.CertificateRequestLister,
 	helper issuer.Helper,
-	queue workqueue.RateLimitingInterface,
-) func(obj any) {
-	return func(obj any) {
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName],
+) func(metav1.Object) {
+	return func(obj metav1.Object) {
 		log := log.WithName("handleSecretReference")
-		secret, ok := obj.(*corev1.Secret)
+		secret, ok := controllerpkg.ToSecret(obj)
 		if !ok {
-			log.Error(nil, "object is not a secret")
+			log.Error(nil, "object is not a secret", "object", obj)
 			return
 		}
 		log = logf.WithResource(log, secret)
@@ -56,13 +59,10 @@ func handleSecretReferenceWorkFunc(log logr.Logger,
 			return
 		}
 		for _, request := range requests {
-			log := logf.WithRelatedResource(log, request)
-			key, err := controllerpkg.KeyFunc(request)
-			if err != nil {
-				log.Error(err, "error computing key for resource")
-				continue
-			}
-			queue.Add(key)
+			queue.Add(types.NamespacedName{
+				Name:      request.Name,
+				Namespace: request.Namespace,
+			})
 		}
 	}
 }
@@ -82,9 +82,14 @@ func certificateRequestsForSecret(log logr.Logger,
 		return nil, fmt.Errorf("failed to list certificate requests: %w", err)
 	}
 
-	dbg.Info("checking if self signed certificate requests reference secret")
+	dbg.Info("checking if self-signed certificate requests reference secret")
 	var affected []*cmapi.CertificateRequest
 	for _, request := range requests {
+		if request.Spec.IssuerRef.Group != cmdoc.GroupName {
+			dbg.Info("skipping SelfSigned secret reference checks since issuer has external group", "group", request.Spec.IssuerRef.Group)
+			continue
+		}
+
 		issuerObj, err := helper.GetGenericIssuer(request.Spec.IssuerRef, request.Namespace)
 		if k8sErrors.IsNotFound(err) {
 			dbg.Info("issuer not found, skipping")

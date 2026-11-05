@@ -20,16 +20,18 @@ import (
 	"context"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	cmutil "github.com/cert-manager/cert-manager/pkg/util"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
-	vaddon "github.com/cert-manager/cert-manager/test/e2e/framework/addon/venafi"
-	"github.com/cert-manager/cert-manager/test/e2e/util"
+	"github.com/cert-manager/cert-manager/test/unit/gen"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/rand"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+	vaddon "github.com/cert-manager/cert-manager/e2e-tests/framework/addon/venafi"
+	"github.com/cert-manager/cert-manager/e2e-tests/util"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = TPPDescribe("Certificate with a properly configured Issuer", func() {
@@ -42,23 +44,23 @@ var _ = TPPDescribe("Certificate with a properly configured Issuer", func() {
 		certificateSecretName = "test-venafi-cert-tls"
 	)
 
-	BeforeEach(func() {
+	BeforeEach(func(testingCtx context.Context) {
 		tppAddon.Namespace = f.Namespace.Name
 	})
 
 	f.RequireAddon(tppAddon)
 
 	// Create the Issuer resource
-	BeforeEach(func() {
+	BeforeEach(func(testingCtx context.Context) {
 		var err error
 
 		By("Creating a Venafi Issuer resource")
 		issuer = tppAddon.Details().BuildIssuer()
-		issuer, err = f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+		issuer, err = f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for Issuer to become Ready")
-		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+		err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuer.Name,
 			cmapi.IssuerCondition{
 				Type:   cmapi.IssuerConditionReady,
@@ -67,23 +69,33 @@ var _ = TPPDescribe("Certificate with a properly configured Issuer", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	AfterEach(func() {
+	AfterEach(func(testingCtx context.Context) {
 		By("Cleaning up")
-		f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(context.TODO(), issuer.Name, metav1.DeleteOptions{})
+		if issuer != nil {
+			err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(testingCtx, issuer.Name, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		}
 	})
 
-	It("should obtain a signed certificate for a single domain", func() {
+	It("should obtain a signed certificate for a single domain", func(testingCtx context.Context) {
 		certClient := f.CertManagerClientSet.CertmanagerV1().Certificates(f.Namespace.Name)
 
-		cert := util.NewCertManagerBasicCertificate(certificateName, certificateSecretName, issuer.Name, cmapi.IssuerKind, nil, nil)
-		cert.Spec.CommonName = cmutil.RandStringRunes(10) + ".venafi-e2e.example"
-
 		By("Creating a Certificate")
-		cert, err := certClient.Create(context.TODO(), cert, metav1.CreateOptions{})
+		cert := gen.Certificate(certificateName,
+			gen.SetCertificateNamespace(f.Namespace.Name),
+			gen.SetCertificateSecretName(certificateSecretName),
+			gen.SetCertificateIssuer(cmmeta.IssuerReference{
+				Name: issuer.Name,
+				Kind: cmapi.IssuerKind,
+			}),
+			gen.SetCertificateCommonName(rand.String(10)+".venafi-e2e.example"),
+			gen.SetCertificateOrganization("test-org"),
+		)
+		cert, err := certClient.Create(testingCtx, cert, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for the Certificate to be issued...")
-		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(cert, time.Minute*5)
+		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(testingCtx, cert, time.Minute*5)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Validating the issued Certificate...")

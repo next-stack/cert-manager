@@ -18,16 +18,15 @@ package issuing
 
 import (
 	"context"
-	"encoding/pem"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
 
 	"github.com/cert-manager/cert-manager/internal/controller/certificates/policies"
+	"github.com/cert-manager/cert-manager/internal/pem"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates/issuing/internal"
@@ -40,7 +39,9 @@ func Test_ensureSecretData(t *testing.T) {
 
 	pk := testcrypto.MustCreatePEMPrivateKey(t)
 	cert := testcrypto.MustCreateCert(t, pk, &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "test"}})
-	block, _ := pem.Decode(pk)
+
+	block, _, _ := pem.SafeDecodePrivateKey(pk)
+
 	pkDER := block.Bytes
 	combinedPEM := append(append(pk, '\n'), cert...)
 
@@ -48,7 +49,7 @@ func Test_ensureSecretData(t *testing.T) {
 		// key that should be passed to ProcessItem.
 		// if not set, the 'namespace/name' of the 'Certificate' field will be used.
 		// if neither is set, the key will be "".
-		key string
+		key types.NamespacedName
 
 		// cert is the optional cert to be loaded to fake clientset.
 		cert *cmapi.Certificate
@@ -67,39 +68,47 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if 'key' is an invalid value, should do nothing and not error": {
-			key:            "abc/def/ghi",
+			key: types.NamespacedName{
+				Namespace: "abc",
+				Name:      "def/ghi",
+			},
 			expectedAction: false,
 		},
 		"if 'key' references a Certificate that doesn't exist, should do nothing and not error": {
-			key:            "random-namespace/random-certificate",
+			key: types.NamespacedName{
+				Namespace: "random-namespace",
+				Name:      "random-certificate",
+			},
 			expectedAction: false,
 		},
 		"if Certificate and Secret exists, but the Secret contains no certificate or private key data, do nothing": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
-				Data:       map[string][]byte{},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Data:      map[string][]byte{},
 			},
 			expectedAction: false,
 		},
 		"if Certificate and Secret exists, but the Secret contains no certificate data, do nothing": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
 				Data: map[string][]byte{
 					"tls.key": pk,
 				},
@@ -107,16 +116,17 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if Certificate and Secret exists, but the Secret contains no private key data, do nothing": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
 				Data: map[string][]byte{
 					"tls.cert": cert,
 				},
@@ -124,9 +134,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if Certificate and Secret exists, but the Certificate has a True Issuing condition, do nothing": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
@@ -136,7 +146,8 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -145,9 +156,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if Certificate exists without a Issuing condition, but Secret does not exist, do nothing": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
@@ -158,9 +169,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if Certificate exists in a false Issuing condition, Secret exists and matches the SecretTemplate but no managed fields, should reconcile Secret": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
@@ -170,10 +181,8 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "test-namespace", Name: "test-secret",
-					Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
-				},
+				Namespace: "test-namespace", Name: "test-secret",
+				Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -182,9 +191,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: true,
 		},
 		"if Certificate exists in a false Issuing condition, Secret exists and matches the SecretTemplate but the managed fields contains more than what is in the SecretTemplate, should reconcile Secret": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
@@ -194,25 +203,26 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "test-namespace", Name: "test-secret",
-					Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
-					ManagedFields: []metav1.ManagedFieldsEntry{{
-						Manager: fieldManager,
-						FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`{"f:metadata": {
+				Namespace: "test-namespace", Name: "test-secret",
+				Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
+				ManagedFields: []metav1.ManagedFieldsEntry{{
+					Manager: fieldManager,
+					FieldsV1: metav1.NewFieldsV1(`{"f:metadata": {
 							"f:annotations": {
+								"f:cert-manager.io/common-name": {},
+								"f:cert-manager.io/alt-names": {},
+								"f:cert-manager.io/ip-sans": {},
+								"f:cert-manager.io/uri-sans": {},
 								"f:foo": {},
 								"f:another-annotation": {}
 							},
 							"f:labels": {
+								"f:controller.cert-manager.io/fao": {},
 								"f:abc": {},
 								"f:another-label": {}
 							}
 						}}`),
-						},
-					}},
-				},
+				}},
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -221,9 +231,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: true,
 		},
 		"if Certificate exists in a false Issuing condition, Secret exists and matches the SecretTemplate but the managed fields are managed by another manager, should reconcile Secret": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
@@ -233,22 +243,23 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "test-namespace", Name: "test-secret",
-					Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
-					ManagedFields: []metav1.ManagedFieldsEntry{{
-						Manager: "not-cert-manager",
-						FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`{"f:metadata": {
+				Namespace: "test-namespace", Name: "test-secret",
+				Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
+				ManagedFields: []metav1.ManagedFieldsEntry{{
+					Manager: "not-cert-manager",
+					FieldsV1: metav1.NewFieldsV1(`{"f:metadata": {
 							"f:annotations": {
+								"f:cert-manager.io/common-name": {},
+								"f:cert-manager.io/alt-names": {},
+								"f:cert-manager.io/ip-sans": {},
+								"f:cert-manager.io/uri-sans": {},
 								"f:foo": {}
 							},
 							"f:labels": {
+								"f:controller.cert-manager.io/fao": {},
 								"f:abc": {}
 							}
-						}}`),
-						}},
-					},
+						}}`)},
 				},
 				Data: map[string][]byte{
 					"tls.crt": cert,
@@ -257,35 +268,38 @@ func Test_ensureSecretData(t *testing.T) {
 			},
 			expectedAction: true,
 		},
-		"if Certificate exists in a false Issuing condition, Secret exists and matches the SecretTemplate with the correct managed fields, should do nothing": {
-			key: "test-namespace/test-name",
+		"if Certificate exists in a false Issuing condition, Secret exists and matches the SecretTemplate with the correct managed fields and base labels, should do nothing": {
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
-					SecretName:     "test-secret",
-					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
+					SecretName: "test-secret",
+					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"},
+						Labels: map[string]string{"abc": "123"}},
 				},
 				Status: cmapi.CertificateStatus{
 					Conditions: []cmapi.CertificateCondition{{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse}},
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "test-namespace", Name: "test-secret",
-					Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"},
-					ManagedFields: []metav1.ManagedFieldsEntry{{
-						Manager: fieldManager,
-						FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`{"f:metadata": {
+				Namespace: "test-namespace", Name: "test-secret",
+				Annotations: map[string]string{"foo": "bar"},
+				Labels:      map[string]string{"abc": "123", cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				ManagedFields: []metav1.ManagedFieldsEntry{{
+					Manager: fieldManager,
+					FieldsV1: metav1.NewFieldsV1(`{"f:metadata": {
 							"f:annotations": {
+								"f:cert-manager.io/common-name": {},
+								"f:cert-manager.io/alt-names": {},
+								"f:cert-manager.io/ip-sans": {},
+								"f:cert-manager.io/uri-sans": {},
 								"f:foo": {}
 							},
 							"f:labels": {
+								"f:controller.cert-manager.io/fao": {},
 								"f:abc": {}
 							}
-						}}`),
-						}},
-					},
+						}}`)},
 				},
 				Data: map[string][]byte{
 					"tls.crt": cert,
@@ -295,9 +309,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if Certificate exists in a false Issuing condition, Secret exists but does not match SecretTemplate, should apply the Labels and Annotations": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:     "test-secret",
 					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
@@ -310,7 +324,60 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				Data: map[string][]byte{
+					"tls.crt": cert,
+					"tls.key": pk,
+				},
+			},
+			expectedAction: true,
+		},
+		"if Certificate exists in a false Issuing condition, Secret exists but is missing the required label, apply the label": {
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				Spec: cmapi.CertificateSpec{
+					SecretName:     "test-secret",
+					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
+				},
+				Status: cmapi.CertificateStatus{
+					Conditions: []cmapi.CertificateCondition{
+						{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse},
+						{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{"foo": "bar"},
+				Data: map[string][]byte{
+					"tls.crt": cert,
+					"tls.key": pk,
+				},
+			},
+			expectedAction: true,
+		},
+		"if Certificate exists in a false Issuing condition, Secret exists with some labels, but is missing the required label, apply the label": {
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				Spec: cmapi.CertificateSpec{
+					SecretName:     "test-secret",
+					SecretTemplate: &cmapi.CertificateSecretTemplate{Annotations: map[string]string{"foo": "bar"}, Labels: map[string]string{"abc": "123"}},
+				},
+				Status: cmapi.CertificateStatus{
+					Conditions: []cmapi.CertificateCondition{
+						{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse},
+						{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Namespace: "test-namespace",
+				Name:      "test-secret",
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -319,9 +386,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: true,
 		},
 		"if Certificate with combined pem and Secret exists, but the Secret doesn't have combined pem, should apply the combined pem": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName: "test-secret",
 					AdditionalOutputFormats: []cmapi.CertificateAdditionalOutputFormat{
@@ -330,7 +397,9 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -339,9 +408,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: true,
 		},
 		"if Certificate with der and Secret exists, but the Secret doesn't have der, should apply the der": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName: "test-secret",
 					AdditionalOutputFormats: []cmapi.CertificateAdditionalOutputFormat{
@@ -350,7 +419,9 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -359,9 +430,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: true,
 		},
 		"if Certificate with combined pem and der, and Secret exists, but the Secret doesn't have combined pem or der, should apply the combined pem and der": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName: "test-secret",
 					AdditionalOutputFormats: []cmapi.CertificateAdditionalOutputFormat{
@@ -371,7 +442,9 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
 				Data: map[string][]byte{
 					"tls.crt": cert,
 					"tls.key": pk,
@@ -380,9 +453,9 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: true,
 		},
 		"if Certificate with combined pem and der, and Secret exists with combined pem and der with managed fields, should do nothing": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName: "test-secret",
 					AdditionalOutputFormats: []cmapi.CertificateAdditionalOutputFormat{
@@ -392,17 +465,33 @@ func Test_ensureSecretData(t *testing.T) {
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret",
-					ManagedFields: []metav1.ManagedFieldsEntry{{
-						Manager: fieldManager,
-						FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`{"f:data": {
-							"f:tls-combined.pem": {},
-							"f:key.der": {}
-						}}`),
-						},
-					}},
-				},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				ManagedFields: []metav1.ManagedFieldsEntry{{
+					Manager: fieldManager,
+					FieldsV1: metav1.NewFieldsV1(`
+							{
+								"f:metadata": {
+									"f:labels": {
+										"f:controller.cert-manager.io/fao": {}
+									},
+									"f:annotations": {
+										"f:cert-manager.io/common-name": {},
+										"f:cert-manager.io/alt-names": {},
+										"f:cert-manager.io/ip-sans": {},
+										"f:cert-manager.io/uri-sans": {}
+									},
+									"f:ownerReferences": {
+										"k:{\"uid\":\"uid-123\"}": {}
+									}
+								},
+								"f:data": {
+									"f:tls-combined.pem": {},
+									"f:key.der": {}
+								}
+							}`),
+				}},
 				Data: map[string][]byte{
 					"tls.crt":          cert,
 					"tls.key":          pk,
@@ -413,26 +502,42 @@ func Test_ensureSecretData(t *testing.T) {
 			expectedAction: false,
 		},
 		"if Certificate with no combined pem or der, and Secret exists with combined pem and der managed by field manager, should apply to remove them": {
-			key: "test-namespace/test-name",
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
 				Spec: cmapi.CertificateSpec{
 					SecretName:              "test-secret",
 					AdditionalOutputFormats: []cmapi.CertificateAdditionalOutputFormat{},
 				},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret",
-					ManagedFields: []metav1.ManagedFieldsEntry{{
-						Manager: fieldManager,
-						FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`{"f:data": {
-							"f:tls-combined.pem": {},
-							"f:key.der": {}
-						}}`),
-						},
-					}},
-				},
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				ManagedFields: []metav1.ManagedFieldsEntry{{
+					Manager: fieldManager,
+					FieldsV1: metav1.NewFieldsV1(`
+							{
+								"f:metadata": {
+									"f:labels": {
+										"f:controller.cert-manager.io/fao": {}
+									},
+									"f:annotations": {
+										"f:cert-manager.io/common-name": {},
+										"f:cert-manager.io/alt-names": {},
+										"f:cert-manager.io/ip-sans": {},
+										"f:cert-manager.io/uri-sans": {}
+									},
+									"f:ownerReferences": {
+										"k:{\"uid\":\"uid-123\"}": {}
+									}
+								},
+								"f:data": {
+									"f:tls-combined.pem": {},
+									"f:key.der": {}
+								}
+							}`),
+				}},
 				Data: map[string][]byte{
 					"tls.crt":          cert,
 					"tls.key":          pk,
@@ -444,51 +549,598 @@ func Test_ensureSecretData(t *testing.T) {
 		},
 
 		"enabledOwnerRef=false if Secret has owner reference to Certificate owned by field manager, expect action": {
-			key:            "test-namespace/test-name",
 			enableOwnerRef: false,
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name", UID: types.UID("uid-123")},
-				Spec:       cmapi.CertificateSpec{SecretName: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec:      cmapi.CertificateSpec{SecretName: "test-secret"},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret",
-					ManagedFields: []metav1.ManagedFieldsEntry{
-						{Manager: fieldManager, FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`
-                {"f:metadata": {
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
 								"f:ownerReferences": {
-                "k:{\"uid\":\"uid-123\"}": {}
-							}}}`),
-						}},
-					},
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
 				},
 				Data: map[string][]byte{"tls.crt": cert, "tls.key": pk, "key.der": pkDER},
 			},
 			expectedAction: true,
 		},
 		"enabledOwnerRef=true if Secret has owner reference to Certificate owned by field manager, expect no action": {
-			key:            "test-namespace/test-name",
 			enableOwnerRef: true,
 			cert: &cmapi.Certificate{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-name", UID: types.UID("uid-123")},
-				Spec:       cmapi.CertificateSpec{SecretName: "test-secret"},
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec:      cmapi.CertificateSpec{SecretName: "test-secret"},
 			},
 			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-secret",
-					OwnerReferences: []metav1.OwnerReference{
-						{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: pointer.Bool(true), BlockOwnerDeletion: pointer.Bool(true)},
-					},
-					ManagedFields: []metav1.ManagedFieldsEntry{
-						{Manager: fieldManager, FieldsV1: &metav1.FieldsV1{
-							Raw: []byte(`
-                {"f:metadata": {
+				Namespace: "test-namespace",
+				Name:      "test-secret",
+				Labels:    map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
 								"f:ownerReferences": {
-                "k:{\"uid\":\"uid-123\"}": {}
-							}}}`),
-						}},
-					},
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
 				},
 				Data: map[string][]byte{"tls.crt": cert, "tls.key": pk, "key.der": pkDER},
+			},
+			expectedAction: false,
+		},
+		"refresh secrets when keystore is not defined and the secret has keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-234"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "test-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "test-secret",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-234"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+					cmapi.PKCS12TruststoreKey: []byte("SomeData"),
+				},
+			},
+			expectedAction: true,
+		},
+		"refresh secrets when JKS keystore is defined and the secret does not have keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						JKS: &cmapi.JKSKeystore{
+							Create: true,
+						},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+				},
+			},
+			expectedAction: true,
+		},
+		"refresh secrets when JKS keystore is defined, create is disabled and the secret has keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						JKS: &cmapi.JKSKeystore{
+							Create: false,
+						},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+					cmapi.JKSTruststoreKey: []byte("SomeData"),
+				},
+			},
+			expectedAction: true,
+		},
+		"refresh secrets when JKS keystore is null and the secret has keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						JKS: nil,
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+					cmapi.JKSTruststoreKey: []byte("SomeData"),
+				},
+			},
+			expectedAction: true,
+		},
+		"do nothing when JKS keystore is defined and create field is set to false": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						JKS: &cmapi.JKSKeystore{
+							Create: false,
+						},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+				},
+			},
+			expectedAction: false,
+		},
+		"refresh secret when PKCS12 keystore is defined and the secret does not have keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						PKCS12: &cmapi.PKCS12Keystore{
+							Create: true,
+						},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+				},
+			},
+			expectedAction: true,
+		},
+		"refresh secret when PKCS12 keystore is defined, create is disabled and the secret has keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						PKCS12: &cmapi.PKCS12Keystore{
+							Create: false,
+						},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+					cmapi.PKCS12TruststoreKey: []byte("SomeData"),
+				},
+			},
+			expectedAction: true,
+		},
+		"refresh secret when PKCS12 keystore is null and the secret has keystore/truststore fields": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						PKCS12: nil,
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+					cmapi.PKCS12TruststoreKey: []byte("SomeData"),
+				},
+			},
+			expectedAction: true,
+		},
+		"do nothing when PKCS12 keystore is defined and the create is set to false": {
+			enableOwnerRef: true,
+			cert: &cmapi.Certificate{
+				Namespace: "test-namespace",
+				Name:      "test-name",
+				UID:       types.UID("uid-123"),
+				Spec: cmapi.CertificateSpec{
+					CommonName: "example.com",
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "testissuer",
+						Kind:  "IssuerKind",
+						Group: "group.example.com",
+					},
+					SecretName: "something",
+					Keystores: &cmapi.CertificateKeystores{
+						PKCS12: &cmapi.PKCS12Keystore{
+							Create: false,
+						},
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				Name:      "something",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					cmapi.IssuerNameAnnotationKey:  "testissuer",
+					cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+					cmapi.IssuerGroupAnnotationKey: "group.example.com",
+				},
+				Labels: map[string]string{cmapi.PartOfCertManagerControllerLabelKey: "true"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "test-name", UID: types.UID("uid-123"), Controller: new(true), BlockOwnerDeletion: new(true)},
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{Manager: fieldManager, FieldsV1: metav1.NewFieldsV1(`
+							{"f:metadata": {
+								"f:labels": {
+									"f:controller.cert-manager.io/fao": {}
+								},
+								"f:annotations": {
+									"f:cert-manager.io/common-name": {},
+									"f:cert-manager.io/alt-names": {},
+									"f:cert-manager.io/ip-sans": {},
+									"f:cert-manager.io/uri-sans": {}
+								},
+								"f:ownerReferences": {
+									"k:{\"uid\":\"uid-123\"}": {}
+								}
+							}}`)},
+				},
+				Data: map[string][]byte{
+					corev1.TLSPrivateKeyKey: pk,
+					corev1.TLSCertKey: testcrypto.MustCreateCert(t, pk,
+						&cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.com"}},
+					),
+				},
 			},
 			expectedAction: false,
 		},
@@ -530,15 +1182,18 @@ func Test_ensureSecretData(t *testing.T) {
 			defer builder.Stop()
 
 			key := test.key
+			if key == (types.NamespacedName{}) && test.cert != nil {
+				key = types.NamespacedName{
+					Name:      test.cert.Name,
+					Namespace: test.cert.Namespace,
+				}
+			}
 
 			// Call ProcessItem
-			err = w.controller.ProcessItem(context.Background(), key)
+			err = w.controller.ProcessItem(t.Context(), key)
 			assert.NoError(t, err)
 
 			if err := builder.AllActionsExecuted(); err != nil {
-				builder.T.Error(err)
-			}
-			if err := builder.AllReactorsCalled(); err != nil {
 				builder.T.Error(err)
 			}
 

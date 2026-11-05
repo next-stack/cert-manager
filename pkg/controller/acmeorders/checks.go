@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/util/workqueue"
 
@@ -29,28 +30,20 @@ import (
 )
 
 func handleGenericIssuerFunc(
-	queue workqueue.RateLimitingInterface,
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName],
 	orderLister cmacmelisters.OrderLister,
-) func(interface{}) {
-	return func(obj interface{}) {
-		iss, ok := obj.(cmapi.GenericIssuer)
-		if !ok {
-			runtime.HandleError(fmt.Errorf("object does not implement GenericIssuer %#v", obj))
-			return
-		}
-
-		certs, err := ordersForGenericIssuer(iss, orderLister)
+) func(cmapi.GenericIssuer) {
+	return func(iss cmapi.GenericIssuer) {
+		orders, err := ordersForGenericIssuer(iss, orderLister)
 		if err != nil {
-			runtime.HandleError(fmt.Errorf("error looking up Orders observing Issuer/ClusterIssuer: %s/%s", iss.GetObjectMeta().Namespace, iss.GetObjectMeta().Name))
+			runtime.HandleError(fmt.Errorf("error looking up Orders observing Issuer/ClusterIssuer: %s/%s: %w", iss.GetNamespace(), iss.GetName(), err))
 			return
 		}
-		for _, crt := range certs {
-			key, err := keyFunc(crt)
-			if err != nil {
-				runtime.HandleError(err)
-				continue
-			}
-			queue.Add(key)
+		for _, order := range orders {
+			queue.Add(types.NamespacedName{
+				Namespace: order.Namespace,
+				Name:      order.Name,
+			})
 		}
 	}
 }
@@ -59,7 +52,7 @@ func ordersForGenericIssuer(iss cmapi.GenericIssuer, orderLister cmacmelisters.O
 	orders, err := orderLister.List(labels.NewSelector())
 
 	if err != nil {
-		return nil, fmt.Errorf("error listing certificates: %s", err.Error())
+		return nil, fmt.Errorf("error listing orders: %w", err)
 	}
 
 	_, isClusterIssuer := iss.(*cmapi.ClusterIssuer)
@@ -70,11 +63,11 @@ func ordersForGenericIssuer(iss cmapi.GenericIssuer, orderLister cmacmelisters.O
 			continue
 		}
 		if !isClusterIssuer {
-			if o.Namespace != iss.GetObjectMeta().Namespace {
+			if o.Namespace != iss.GetNamespace() {
 				continue
 			}
 		}
-		if o.Spec.IssuerRef.Name != iss.GetObjectMeta().Name {
+		if o.Spec.IssuerRef.Name != iss.GetName() {
 			continue
 		}
 		affected = append(affected, o)

@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/go-logr/logr"
 	certificatesv1 "k8s.io/api/certificates/v1"
@@ -28,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	certificatesclient "k8s.io/client-go/kubernetes/typed/certificates/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -44,7 +46,6 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests"
 	ctrlutil "github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests/util"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
-	"github.com/cert-manager/cert-manager/pkg/util"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 )
 
@@ -80,19 +81,21 @@ func init() {
 
 func controllerBuilder() *certificatesigningrequests.Controller {
 	return certificatesigningrequests.New(apiutil.IssuerACME, NewACME,
-		func(ctx *controllerpkg.Context, log logr.Logger, queue workqueue.RateLimitingInterface) ([]cache.InformerSynced, error) {
+		func(ctx *controllerpkg.Context, log logr.Logger, queue workqueue.TypedRateLimitingInterface[types.NamespacedName]) ([]cache.InformerSynced, error) {
 			orderInformer := ctx.SharedInformerFactory.Acme().V1().Orders().Informer()
-			csrLister := ctx.KubeSharedInformerFactory.Certificates().V1().CertificateSigningRequests().Lister()
+			csrLister := ctx.KubeSharedInformerFactory.CertificateSigningRequests().Lister()
 
-			orderInformer.AddEventHandler(&controllerpkg.BlockingEventHandler{
-				WorkFunc: controllerpkg.HandleOwnedResourceNamespacedFunc(
+			if _, err := orderInformer.AddEventHandler(controllerpkg.BlockingEventHandler(
+				controllerpkg.HandleOwnedResourceNamespacedFunc(
 					log, queue,
 					certificatesv1.SchemeGroupVersion.WithKind("CertificateSigningRequest"),
-					func(_, name string) (interface{}, error) {
+					func(_, name string) (*certificatesv1.CertificateSigningRequest, error) {
 						return csrLister.Get(name)
 					},
 				),
-			})
+			)); err != nil {
+				return nil, fmt.Errorf("error setting up event handler: %v", err)
+			}
 			return []cache.InformerSynced{orderInformer.HasSynced}, nil
 		},
 	)
@@ -133,7 +136,7 @@ func (a *ACME) Sign(ctx context.Context, csr *certificatesv1.CertificateSigningR
 
 	// If the CommonName is also not present in the DNS names or IP Addresses of
 	// the Request then hard fail.
-	if len(req.Subject.CommonName) > 0 && !util.Contains(req.DNSNames, req.Subject.CommonName) && !util.Contains(pki.IPAddressesToString(req.IPAddresses), req.Subject.CommonName) {
+	if len(req.Subject.CommonName) > 0 && !slices.Contains(req.DNSNames, req.Subject.CommonName) && !slices.Contains(pki.IPAddressesToString(req.IPAddresses), req.Subject.CommonName) {
 		err = fmt.Errorf("%q does not exist in %s or %s", req.Subject.CommonName, req.DNSNames, pki.IPAddressesToString(req.IPAddresses))
 		message := fmt.Sprintf("The CSR PEM requests a commonName that is not present in the list of dnsNames or ipAddresses. If a commonName is set, ACME requires that the value is also present in the list of dnsNames or ipAddresses: %s", err)
 
@@ -275,7 +278,7 @@ func (a *ACME) buildOrder(csr *certificatesv1.CertificateSigningRequest, req *x5
 
 	spec := cmacme.OrderSpec{
 		Request: csr.Spec.Request,
-		IssuerRef: cmmeta.ObjectReference{
+		IssuerRef: cmmeta.IssuerReference{
 			Name:  ref.Name,
 			Kind:  kind,
 			Group: ref.Group,
@@ -301,7 +304,7 @@ func (a *ACME) buildOrder(csr *certificatesv1.CertificateSigningRequest, req *x5
 	// NotAfter field.
 	computeNameSpec.Request = nil
 
-	var hashObj interface{}
+	var hashObj any
 	hashObj = computeNameSpec
 	if len(csr.Name) >= 52 {
 		// Pass a unique struct for hashing so that names at or longer than 52
@@ -326,14 +329,12 @@ func (a *ACME) buildOrder(csr *certificatesv1.CertificateSigningRequest, req *x5
 	// Truncate certificate name so final name will be <= 63 characters. Hash
 	// (uint32) will be at most 10 digits long, and we account for the hyphen.
 	return &cmacme.Order{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   a.issuerOptions.ResourceNamespace(iss),
-			Labels:      csr.Labels,
-			Annotations: annotations,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(csr, schema.GroupVersionKind{Group: "certificates.k8s.io", Version: "v1", Kind: "CertificateSigningRequest"}),
-			},
+		Name:        name,
+		Namespace:   a.issuerOptions.ResourceNamespace(iss),
+		Labels:      csr.Labels,
+		Annotations: annotations,
+		OwnerReferences: []metav1.OwnerReference{
+			*metav1.NewControllerRef(csr, schema.GroupVersionKind{Group: "certificates.k8s.io", Version: "v1", Kind: "CertificateSigningRequest"}),
 		},
 		Spec: spec,
 	}, nil

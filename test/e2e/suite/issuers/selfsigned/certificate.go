@@ -21,15 +21,17 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
-	"github.com/cert-manager/cert-manager/test/e2e/util"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/validation/certificates"
+	"github.com/cert-manager/cert-manager/e2e-tests/util"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
@@ -39,7 +41,7 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 	certificateName := "test-selfsigned-certificate"
 	certificateSecretName := "test-selfsigned-certificate"
 
-	It("should generate a signed keypair", func() {
+	It("should generate a signed keypair", func(testingCtx context.Context) {
 		By("Creating an Issuer")
 
 		certClient := f.CertManagerClientSet.CertmanagerV1().Certificates(f.Namespace.Name)
@@ -47,10 +49,10 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 		issuer := gen.Issuer(issuerName,
 			gen.SetIssuerNamespace(f.Namespace.Name),
 			gen.SetIssuerSelfSigned(v1.SelfSignedIssuer{}))
-		_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+		_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		By("Waiting for Issuer to become Ready")
-		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+		err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuerName,
 			v1.IssuerCondition{
 				Type:   v1.IssuerConditionReady,
@@ -58,10 +60,20 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 			})
 		Expect(err).NotTo(HaveOccurred())
 		By("Creating a Certificate")
-		cert, err := certClient.Create(context.TODO(), util.NewCertManagerBasicCertificate(certificateName, certificateSecretName, issuerName, v1.IssuerKind, nil, nil), metav1.CreateOptions{})
+		cert := gen.Certificate(certificateName,
+			gen.SetCertificateNamespace(f.Namespace.Name),
+			gen.SetCertificateSecretName(certificateSecretName),
+			gen.SetCertificateIssuer(cmmeta.IssuerReference{
+				Name: issuerName,
+				Kind: v1.IssuerKind,
+			}),
+			gen.SetCertificateCommonName("test.domain.com"),
+			gen.SetCertificateOrganization("test-org"),
+		)
+		cert, err = certClient.Create(testingCtx, cert, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		By("Waiting for the Certificate to be issued...")
-		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(cert, time.Minute*5)
+		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(testingCtx, cert, time.Minute*5)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Validating the issued Certificate...")
@@ -89,8 +101,7 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 		},
 	}
 	for _, v := range cases {
-		v := v
-		It("should generate a signed keypair valid for "+v.label, func() {
+		It("should generate a signed keypair valid for "+v.label, func(testingCtx context.Context) {
 			certClient := f.CertManagerClientSet.CertmanagerV1().Certificates(f.Namespace.Name)
 
 			By("Creating an Issuer")
@@ -98,10 +109,10 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 			issuer := gen.Issuer(issuerDurationName,
 				gen.SetIssuerNamespace(f.Namespace.Name),
 				gen.SetIssuerSelfSigned(v1.SelfSignedIssuer{}))
-			_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+			_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			By("Waiting for Issuer to become Ready")
-			err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+			err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 				issuerDurationName,
 				v1.IssuerCondition{
 					Type:   v1.IssuerConditionReady,
@@ -110,21 +121,34 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Creating a Certificate")
-			cert, err := certClient.Create(context.TODO(), util.NewCertManagerBasicCertificate(certificateName, certificateSecretName, issuerDurationName, v1.IssuerKind, v.inputDuration, v.inputRenewBefore), metav1.CreateOptions{})
+			cert := gen.Certificate(certificateName,
+				gen.SetCertificateNamespace(f.Namespace.Name),
+				gen.SetCertificateSecretName(certificateSecretName),
+				gen.SetCertificateIssuer(cmmeta.IssuerReference{
+					Name: issuerDurationName,
+					Kind: v1.IssuerKind,
+				}),
+				gen.SetCertificateDuration(v.inputDuration),
+				gen.SetCertificateRenewBefore(v.inputRenewBefore),
+				gen.SetCertificateCommonName("test.domain.com"),
+				gen.SetCertificateOrganization("test-org"),
+			)
+			cert, err = certClient.Create(testingCtx, cert, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			By("Waiting for the Certificate to be issued...")
-			cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(cert, time.Minute*5)
+			cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(testingCtx, cert, time.Minute*5)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Validating the issued Certificate...")
 			err = f.Helper().ValidateCertificate(cert)
 			Expect(err).NotTo(HaveOccurred())
 
-			f.CertificateDurationValid(cert, v.expectedDuration, 0)
+			err = f.Helper().ValidateCertificate(cert, certificates.ExpectDuration(v.expectedDuration, 0))
+			Expect(err).NotTo(HaveOccurred())
 		})
 	}
 
-	It("should correctly encode a certificate's private key based on the key encoding", func() {
+	It("should correctly encode a certificate's private key based on the key encoding", func(testingCtx context.Context) {
 		By("Creating an Issuer")
 
 		certClient := f.CertManagerClientSet.CertmanagerV1().Certificates(f.Namespace.Name)
@@ -132,18 +156,26 @@ var _ = framework.CertManagerDescribe("Self Signed Certificate", func() {
 		issuer := gen.Issuer(issuerName,
 			gen.SetIssuerNamespace(f.Namespace.Name),
 			gen.SetIssuerSelfSigned(v1.SelfSignedIssuer{}))
-		_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+		_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		cert := util.NewCertManagerBasicCertificate(certificateName, certificateSecretName, issuerName, v1.IssuerKind, nil, nil)
-		cert.Spec.PrivateKey.Encoding = v1.PKCS8
-
 		By("Creating a Certificate")
-		cert, err = certClient.Create(context.TODO(), cert, metav1.CreateOptions{})
+		cert := gen.Certificate(certificateName,
+			gen.SetCertificateNamespace(f.Namespace.Name),
+			gen.SetCertificateSecretName(certificateSecretName),
+			gen.SetCertificateIssuer(cmmeta.IssuerReference{
+				Name: issuerName,
+				Kind: v1.IssuerKind,
+			}),
+			gen.SetCertificateCommonName("test.domain.com"),
+			gen.SetCertificateOrganization("test-org"),
+			gen.SetCertificateKeyEncoding(v1.PKCS8),
+		)
+		cert, err = certClient.Create(testingCtx, cert, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for the Certificate to be issued...")
-		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(cert, time.Minute*5)
+		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(testingCtx, cert, time.Minute*5)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Validating the issued Certificate...")

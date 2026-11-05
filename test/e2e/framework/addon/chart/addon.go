@@ -17,6 +17,7 @@ limitations under the License.
 package chart
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -27,8 +28,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/cert-manager/cert-manager/test/e2e/framework/addon/base"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/config"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/addon/base"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/addon/internal"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/config"
 )
 
 // Chart is a generic Helm chart addon for the test environment
@@ -68,6 +70,19 @@ type Chart struct {
 	// before installing.
 	// This should only be set to true when the ChartName is a local path on disk.
 	UpdateDeps bool
+
+	// repository source of this Chart
+	Repo Repo
+}
+
+var _ internal.Addon = &Chart{}
+
+type Repo struct {
+	// name of the repository
+	Name string
+
+	// source URL of the repository
+	Url string
 }
 
 // StringTuple is a tuple of strings, used to create ordered maps
@@ -85,56 +100,60 @@ type Details struct {
 	Namespace string
 }
 
-func (c *Chart) Setup(cfg *config.Config) error {
+func (c *Chart) Setup(_ context.Context, cfg *config.Config, _ ...internal.AddonTransferableData) (internal.AddonTransferableData, error) {
 	var err error
 
 	c.config = cfg
 	if c.config.Addons.Helm.Path == "" {
-		return fmt.Errorf("--helm-binary-path must be set")
+		return nil, fmt.Errorf("--helm-binary-path must be set")
 	}
 
 	c.home, err = os.MkdirTemp("", "helm-chart-install")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return nil, nil
 }
 
 // Provision an instance of tiller-deploy
-func (c *Chart) Provision() error {
+func (c *Chart) Provision(ctx context.Context) error {
+	if len(c.Repo.Name) > 0 && len(c.Repo.Url) > 0 {
+		err := c.addRepo(ctx)
+		if err != nil {
+			return fmt.Errorf("error adding helm repo: %v", err)
+		}
+	}
+
 	if c.UpdateDeps {
-		err := c.runDepUpdate()
+		err := c.runDepUpdate(ctx)
 		if err != nil {
 			return fmt.Errorf("error updating helm chart dependencies: %v", err)
 		}
 	}
 
-	err := c.runInstall()
+	err := c.runInstall(ctx)
 	if err != nil {
 		return fmt.Errorf("error install helm chart: %v", err)
 	}
 
-	err = c.Base.Details().Helper().WaitForAllPodsRunningInNamespace(c.Namespace)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func (c *Chart) runDepUpdate() error {
-	err := c.buildHelmCmd("dep", "update", c.ChartName).Run()
+func (c *Chart) runDepUpdate(ctx context.Context) error {
+	err := c.buildHelmCmd(ctx, "dep", "update", c.ChartName).Run()
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *Chart) runInstall() error {
-	args := []string{"install", c.ReleaseName, c.ChartName,
+func (c *Chart) runInstall(ctx context.Context) error {
+	args := []string{"upgrade", c.ReleaseName, c.ChartName,
+		"--install",
 		"--wait",
 		"--namespace", c.Namespace,
+		"--create-namespace",
 		"--version", c.ChartVersion}
 
 	for _, v := range c.Values {
@@ -145,73 +164,31 @@ func (c *Chart) runInstall() error {
 		args = append(args, "--set", fmt.Sprintf("%s=%s", s.Key, s.Value))
 	}
 
-	cmd := c.buildHelmCmd(args...)
-	cmd.Stdout = nil
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	defer out.Close()
+	cmd := c.buildHelmCmd(ctx, args...)
 
-	err = cmd.Run()
-	if err != nil {
-		_, err2 := io.Copy(os.Stdout, out)
-		if err2 != nil {
-			return fmt.Errorf("cmd.Run: %v: io.Copy: %v", err, err2)
-		}
-
-		return fmt.Errorf("cmd.Run: %v", err)
-	}
-
-	return nil
+	return cmd.Run()
 }
 
-func (c *Chart) buildHelmCmd(args ...string) *exec.Cmd {
+func (c *Chart) buildHelmCmd(ctx context.Context, args ...string) *exec.Cmd {
 	args = append([]string{
 		"--kubeconfig", c.config.KubeConfig,
 		"--kube-context", c.config.KubeContext,
 	}, args...)
-	cmd := exec.Command(c.config.Addons.Helm.Path, args...)
+	cmd := exec.CommandContext(ctx, c.config.Addons.Helm.Path, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd
 }
 
-func (c *Chart) getHelmVersion() (string, error) {
-	cmd := c.buildHelmCmd("version", "--template", "{{.Client.Version}}")
-	cmd.Stdout = nil
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	defer out.Close()
+// Deprovision the deployed chart
+func (c *Chart) Deprovision(ctx context.Context) error {
+	cmd := c.buildHelmCmd(ctx, "delete", "--namespace", c.Namespace, c.ReleaseName)
+	stdoutBuf := &bytes.Buffer{}
+	cmd.Stdout = stdoutBuf
 
-	err = cmd.Run()
+	err := cmd.Run()
 	if err != nil {
-		return "", err
-	}
-
-	outBytes, err := io.ReadAll(out)
-	if err != nil {
-		return "", err
-	}
-
-	return string(outBytes), nil
-}
-
-// Deprovision the deployed instance of tiller-deploy
-func (c *Chart) Deprovision() error {
-	cmd := c.buildHelmCmd("delete", "--namespace", c.Namespace, c.ReleaseName)
-	cmd.Stdout = nil
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	err = cmd.Run()
-	if err != nil {
-		_, err2 := io.Copy(os.Stdout, out)
+		_, err2 := io.Copy(os.Stdout, stdoutBuf)
 		if err2 != nil {
 			return fmt.Errorf("cmd.Run: %v: io.Copy: %v", err, err2)
 		}
@@ -243,26 +220,23 @@ func (c *Chart) SupportsGlobal() bool {
 	// We can't run in global mode if the release name is not set, as there's
 	// no way for us to communicate the generated release name to other test
 	// runners when running in parallel mode.
-	if c.ReleaseName == "" {
-		return false
-	}
-
-	return true
+	return c.ReleaseName != ""
 }
 
-func (c *Chart) Logs() (map[string]string, error) {
+func (c *Chart) Logs(ctx context.Context) (map[string]string, error) {
 	kc := c.Base.Details().KubeClient
-	oldLabelPods, err := kc.CoreV1().Pods(c.Namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: "release=" + c.ReleaseName})
+	oldLabelPods, err := kc.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "release=" + c.ReleaseName})
 	if err != nil {
 		return nil, err
 	}
 
 	// also check pods with the new style labels used in the cert-manager chart
-	newLabelPods, err := kc.CoreV1().Pods(c.Namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=" + c.ReleaseName})
+	newLabelPods, err := kc.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=" + c.ReleaseName})
 	if err != nil {
 		return nil, err
 	}
-	podList := append(oldLabelPods.Items, newLabelPods.Items...)
+	podList := append([]corev1.Pod(nil), oldLabelPods.Items...)
+	podList = append(podList, newLabelPods.Items...)
 
 	out := make(map[string]string)
 	for _, pod := range podList {
@@ -271,7 +245,7 @@ func (c *Chart) Logs() (map[string]string, error) {
 				resp := kc.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
 					Container: con.Name,
 					Previous:  b,
-				}).Do(context.TODO())
+				}).Do(ctx)
 
 				err := resp.Error()
 				if err != nil {
@@ -296,4 +270,12 @@ func (c *Chart) Logs() (map[string]string, error) {
 	}
 
 	return out, nil
+}
+
+func (c *Chart) addRepo(ctx context.Context) error {
+	err := c.buildHelmCmd(ctx, "repo", "add", c.Repo.Name, c.Repo.Url).Run()
+	if err != nil {
+		return err
+	}
+	return nil
 }

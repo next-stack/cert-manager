@@ -19,8 +19,8 @@ package client
 import (
 	"time"
 
-	"github.com/Venafi/vcert/v4/pkg/certificate"
-	"github.com/Venafi/vcert/v4/pkg/endpoint"
+	"github.com/Venafi/vcert/v5/pkg/certificate"
+	"github.com/Venafi/vcert/v5/pkg/endpoint"
 	"github.com/go-logr/logr"
 
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
@@ -35,7 +35,7 @@ type instrumentedConnector struct {
 
 var _ connector = instrumentedConnector{}
 
-func newInstumentedConnector(conn connector, metrics *metrics.Metrics, log logr.Logger) connector {
+func newInstrumentedConnector(conn connector, metrics *metrics.Metrics, log logr.Logger) connector {
 	return instrumentedConnector{
 		conn:    conn,
 		metrics: metrics,
@@ -77,13 +77,4 @@ func (ic instrumentedConnector) Ping() error {
 	labels := []string{"ping"}
 	ic.metrics.ObserveVenafiRequestDuration(time.Since(start), labels...)
 	return err
-}
-
-func (ic instrumentedConnector) RenewCertificate(req *certificate.RenewalRequest) (string, error) {
-	start := time.Now()
-	ic.logger.V(logf.TraceLevel).Info("calling RenewCertificate")
-	reqID, err := ic.conn.RenewCertificate(req)
-	labels := []string{"renew_certificate"}
-	ic.metrics.ObserveVenafiRequestDuration(time.Since(start), labels...)
-	return reqID, err
 }

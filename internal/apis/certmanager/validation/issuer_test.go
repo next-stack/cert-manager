@@ -17,15 +17,17 @@ limitations under the License.
 package validation
 
 import (
-	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/clock"
-	gwapi "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	"k8s.io/utils/ptr"
+	gwapi "sigs.k8s.io/gateway-api/apis/v1"
 
 	cmacme "github.com/cert-manager/cert-manager/internal/apis/acme"
 	cmapi "github.com/cert-manager/cert-manager/internal/apis/certmanager"
@@ -40,12 +42,11 @@ var (
 		Project:        "valid",
 	}
 	validSecretKeyRef = cmmeta.SecretKeySelector{
-		LocalObjectReference: cmmeta.LocalObjectReference{
-			Name: "valid",
-		},
-		Key: "validkey",
+		Name: "valid",
+		Key:  "validkey",
 	}
 	// TODO (JS): Missing test for validCloudflareProvider
+	//nolint: unused
 	validCloudflareProvider = cmacme.ACMEIssuerDNS01ProviderCloudflare{
 		APIKey: &validSecretKeyRef,
 		Email:  "valid",
@@ -70,7 +71,7 @@ func TestValidateVaultIssuerConfig(t *testing.T) {
 		clock.RealClock{},
 	).CertBytes
 
-	fldPath := field.NewPath("")
+	fldPath := field.NewPath("spec")
 	scenarios := map[string]struct {
 		spec *cmapi.VaultIssuer
 		errs []*field.Error
@@ -81,14 +82,15 @@ func TestValidateVaultIssuerConfig(t *testing.T) {
 				Path:     "secret/path",
 				CABundle: caBundle,
 				CABundleSecretRef: &cmmeta.SecretKeySelector{
-					Key: "ca.crt",
-					LocalObjectReference: cmmeta.LocalObjectReference{
-						Name: "test-secret",
-					},
+					Key:  "ca.crt",
+					Name: "test-secret",
+				},
+				Auth: cmapi.VaultAuth{
+					TokenSecretRef: &validSecretKeyRef,
 				},
 			},
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("caBundle"), caBundle, "specified caBundle and caBundleSecretRef cannot be used together"),
+				field.Invalid(fldPath.Child("caBundle"), "<snip>", "specified caBundle and caBundleSecretRef cannot be used together"),
 				field.Invalid(fldPath.Child("caBundleSecretRef"), "test-secret", "specified caBundleSecretRef and caBundle cannot be used together"),
 			},
 		},
@@ -100,38 +102,368 @@ func TestValidateVaultIssuerConfig(t *testing.T) {
 			errs: []*field.Error{
 				field.Required(fldPath.Child("server"), ""),
 				field.Required(fldPath.Child("path"), ""),
+				field.Required(fldPath.Child("auth"), "please supply one of: appRole, kubernetes, tokenSecretRef, clientCertificate, aws"),
 			},
 		},
-		"vault issuer with invalid fields": {
+		"vault issuer with a CA bundle containing no valid certificates": {
 			spec: &cmapi.VaultIssuer{
 				Server:   "something",
 				Path:     "a/b/c",
 				CABundle: []byte("invalid"),
+				Auth: cmapi.VaultAuth{
+					TokenSecretRef: &validSecretKeyRef,
+				},
 			},
 			errs: []*field.Error{
-				field.Invalid(fldPath.Child("caBundle"), "", "Specified CA bundle is invalid"),
+				field.Invalid(fldPath.Child("caBundle"), "<snip>", "cert bundle didn't contain any valid certificates"),
+			},
+		},
+		"vault issuer define clientCertSecretRef but not clientKeySecretRef": {
+			spec: &cmapi.VaultIssuer{
+				Server: "https://vault.example.com",
+				Path:   "secret/path",
+				CABundleSecretRef: &cmmeta.SecretKeySelector{
+					Key:  "ca.crt",
+					Name: "test-secret",
+				},
+				ClientCertSecretRef: &cmmeta.SecretKeySelector{
+					Key:  "tls.crt",
+					Name: "test-secret",
+				},
+				Auth: cmapi.VaultAuth{
+					TokenSecretRef: &validSecretKeyRef,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("clientKeySecretRef"), "<snip>", "clientKeySecretRef must be provided when defining the clientCertSecretRef"),
+			},
+		},
+		"vault issuer define clientKeySecretRef but not clientCertSecretRef": {
+			spec: &cmapi.VaultIssuer{
+				Server: "https://vault.example.com",
+				Path:   "secret/path",
+				CABundleSecretRef: &cmmeta.SecretKeySelector{
+					Key:  "ca.crt",
+					Name: "test-secret",
+				},
+				ClientKeySecretRef: &cmmeta.SecretKeySelector{
+					Key:  "tls.key",
+					Name: "test-secret",
+				},
+				Auth: cmapi.VaultAuth{
+					TokenSecretRef: &validSecretKeyRef,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("clientCertSecretRef"), "<snip>", "clientCertSecretRef must be provided when defining the clientKeySecretRef"),
+			},
+		},
+		"invalid vault issuer: path contains '..' segments": {
+			spec: &cmapi.VaultIssuer{
+				Server: "https://vault.example.com",
+				Path:   "pki/../sys/seal",
+				Auth: cmapi.VaultAuth{
+					TokenSecretRef: &validSecretKeyRef,
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("path"), "pki/../sys/seal", "must not contain '..' path segments"),
 			},
 		},
 	}
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs := ValidateVaultIssuerConfig(s.spec, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
+		})
+	}
+}
+
+func TestValidateVaultIssuerAuth(t *testing.T) {
+	fldPath := field.NewPath("spec.auth")
+	scenarios := map[string]struct {
+		auth *cmapi.VaultAuth
+		errs []*field.Error
+	}{
+		// For backwards compatibility, we allow the user to set all auth types.
+		// We have documented in the API the order of precedence.
+		"valid auth: all three auth types can be set simultaneously": {
+			auth: &cmapi.VaultAuth{
+				AppRole: &cmapi.VaultAppRole{
+					RoleId: "role-id",
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+						Key:                  "key",
+					},
+					Path: "path",
+				},
+				TokenSecretRef: &validSecretKeyRef,
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					Path: "path",
+					Role: "role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+				},
+			},
+		},
+		"valid auth.tokenSecretRef": {
+			auth: &cmapi.VaultAuth{
+				TokenSecretRef: &cmmeta.SecretKeySelector{
+					Name: "secret",
+					Key:  "key",
+				},
+			},
+		},
+		// The default value for auth.tokenSecretRef.key is 'token'. This
+		// behavior is not documented in the API reference, but we keep it for
+		// backward compatibility.
+		"invalid auth.tokenSecretRef: key can be omitted": {
+			auth: &cmapi.VaultAuth{
+				TokenSecretRef: &cmmeta.SecretKeySelector{
+					Name: "secret",
+				},
+			},
+		},
+		"valid auth.appRole": {
+			auth: &cmapi.VaultAuth{
+				AppRole: &cmapi.VaultAppRole{
+					RoleId: "role-id",
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+						Key:                  "key",
+					},
+					Path: "path",
+				},
+			},
+		},
+		// TODO(mael): The reason we allow the user to omit the key but we say
+		// in the documentation that "key must be specified" is because the
+		// controller-side validation doesn't check that the key is empty. We
+		// should add a check for that.
+		"valid auth.appRole: key can be omitted": {
+			auth: &cmapi.VaultAuth{
+				AppRole: &cmapi.VaultAppRole{
+					RoleId: "role-id",
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+					},
+					Path: "path",
+				},
+			},
+		},
+		"invalid auth.appRole: roleId is required": {
+			auth: &cmapi.VaultAuth{
+				AppRole: &cmapi.VaultAppRole{
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+						Key:                  "key",
+					},
+					Path: "path",
+				},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("appRole").Child("roleId"), ""),
+			},
+		},
+		"valid auth.clientCertificate: all fields can be empty": {
+			auth: &cmapi.VaultAuth{
+				ClientCertificate: &cmapi.VaultClientCertificateAuth{},
+			},
+		},
+		// The field auth.kubernetes.secretRef.key defaults to 'token' if
+		// not specified.
+		"valid auth.kubernetes.secretRef: key can be left empty": {
+			auth: &cmapi.VaultAuth{
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+					},
+					Role: "role",
+				},
+			},
+		},
+		"valid auth.kubernetes.serviceAccountRef": {
+			auth: &cmapi.VaultAuth{
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					Path: "path",
+					Role: "role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+				},
+			},
+		},
+		"invalid auth.kubernetes: role is required": {
+			auth: &cmapi.VaultAuth{
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					Path: "path",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("kubernetes").Child("role"), ""),
+			},
+		},
+		"invalid auth.kubernetes: secretRef and serviceAccountRef mutually exclusive": {
+			auth: &cmapi.VaultAuth{
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+					},
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+					Role: "role",
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("kubernetes"), "please supply one of: secretRef, serviceAccountRef"),
+			},
+		},
+		"valid auth.aws": {
+			auth: &cmapi.VaultAuth{
+				AWS: &cmapi.VaultAWSAuth{
+					Role: "my-role",
+				},
+			},
+		},
+		"valid auth.aws with serviceAccountRef": {
+			auth: &cmapi.VaultAuth{
+				AWS: &cmapi.VaultAWSAuth{
+					Role: "my-role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+					IAMRoleARN: "arn:aws:iam::123456789012:role/my-role",
+				},
+			},
+		},
+		"invalid auth.aws: role is required": {
+			auth: &cmapi.VaultAuth{
+				AWS: &cmapi.VaultAWSAuth{},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("aws", "role"), ""),
+			},
+		},
+		"invalid auth.aws: serviceAccountRef.name is required": {
+			auth: &cmapi.VaultAuth{
+				AWS: &cmapi.VaultAWSAuth{
+					Role:              "my-role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{},
+					IAMRoleARN:        "arn:aws:iam::123456789012:role/my-role",
+				},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("aws", "serviceAccountRef", "name"), ""),
+			},
+		},
+		"invalid auth.aws: iamRoleArn is required when serviceAccountRef is set": {
+			auth: &cmapi.VaultAuth{
+				AWS: &cmapi.VaultAWSAuth{
+					Role: "my-role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("aws", "iamRoleArn"), "iamRoleArn is required when using serviceAccountRef for IRSA"),
+			},
+		},
+		"invalid auth.appRole: path contains '..' segments": {
+			auth: &cmapi.VaultAuth{
+				AppRole: &cmapi.VaultAppRole{
+					RoleId: "role-id",
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+						Key:                  "key",
+					},
+					Path: "../../sys/seal",
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("appRole", "path"), "../../sys/seal", "must not contain '..' path segments"),
+			},
+		},
+		"invalid auth.clientCertificate: path contains '..' segments": {
+			auth: &cmapi.VaultAuth{
+				ClientCertificate: &cmapi.VaultClientCertificateAuth{
+					Path: "../other",
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("clientCertificate", "path"), "../other", "must not contain '..' path segments"),
+			},
+		},
+		"invalid auth.kubernetes: path contains '..' segments": {
+			auth: &cmapi.VaultAuth{
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					Path: "../other",
+					Role: "role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("kubernetes", "path"), "../other", "must not contain '..' path segments"),
+			},
+		},
+		"invalid auth.aws: mountPath contains '..' segments": {
+			auth: &cmapi.VaultAuth{
+				AWS: &cmapi.VaultAWSAuth{
+					Role:      "my-role",
+					MountPath: "../other",
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("aws", "mountPath"), "../other", "must not contain '..' path segments"),
+			},
+		},
+		"valid auth: all five auth types can be set simultaneously": {
+			auth: &cmapi.VaultAuth{
+				AppRole: &cmapi.VaultAppRole{
+					RoleId: "role-id",
+					SecretRef: cmmeta.SecretKeySelector{
+						LocalObjectReference: cmmeta.LocalObjectReference{Name: "secret"},
+						Key:                  "key",
+					},
+					Path: "path",
+				},
+				TokenSecretRef: &validSecretKeyRef,
+				Kubernetes: &cmapi.VaultKubernetesAuth{
+					Path: "path",
+					Role: "role",
+					ServiceAccountRef: &cmapi.ServiceAccountRef{
+						Name: "service-account",
+					},
+				},
+				AWS: &cmapi.VaultAWSAuth{
+					Role: "aws-role",
+				},
+			},
+		},
+	}
+	for n, s := range scenarios {
+		t.Run(n, func(t *testing.T) {
+			errs := ValidateVaultIssuerAuth(s.auth, fldPath)
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 		})
 	}
 }
 
 func TestValidateACMEIssuerConfig(t *testing.T) {
-	fldPath := field.NewPath("")
+	fldPath := (*field.Path)(nil)
+
+	caBundle := unitcrypto.MustCreateCryptoBundle(t,
+		&pubcmapi.Certificate{Spec: pubcmapi.CertificateSpec{CommonName: "test"}},
+		clock.RealClock{},
+	).CertBytes
+
 	scenarios := map[string]struct {
 		spec     *cmacme.ACMEIssuer
 		errs     []*field.Error
@@ -145,6 +477,44 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 			errs: []*field.Error{
 				field.Required(fldPath.Child("privateKeySecretRef", "name"), "private key secret name is a required field"),
 				field.Required(fldPath.Child("server"), "acme server URL is a required field"),
+			},
+		},
+		"acme issuer with an invalid CA bundle": {
+			spec: &cmacme.ACMEIssuer{
+				Email:      "valid-email",
+				Server:     "valid-server",
+				CABundle:   []byte("abc123"),
+				PrivateKey: validSecretKeyRef,
+				Solvers: []cmacme.ACMEChallengeSolver{
+					{
+						DNS01: &cmacme.ACMEChallengeSolverDNS01{
+							CloudDNS: &validCloudDNSProvider,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("caBundle"), "", "cert bundle didn't contain any valid certificates"),
+			},
+		},
+		"acme issuer with both a CA bundle and SkipTLSVerify": {
+			spec: &cmacme.ACMEIssuer{
+				Email:         "valid-email",
+				Server:        "valid-server",
+				CABundle:      caBundle,
+				SkipTLSVerify: true,
+				PrivateKey:    validSecretKeyRef,
+				Solvers: []cmacme.ACMEChallengeSolver{
+					{
+						DNS01: &cmacme.ACMEChallengeSolverDNS01{
+							CloudDNS: &validCloudDNSProvider,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("caBundle"), "", "caBundle and skipTLSVerify are mutually exclusive and cannot both be set"),
+				field.Invalid(fldPath.Child("skipTLSVerify"), true, "caBundle and skipTLSVerify are mutually exclusive and cannot both be set"),
 			},
 		},
 		"acme solver without any config": {
@@ -172,6 +542,57 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 						},
 					},
 				},
+			},
+		},
+		"acme solver with a valid waitInsteadOfSelfCheck duration": {
+			spec: &cmacme.ACMEIssuer{
+				Email:      "valid-email",
+				Server:     "valid-server",
+				PrivateKey: validSecretKeyRef,
+				Solvers: []cmacme.ACMEChallengeSolver{
+					{
+						WaitInsteadOfSelfCheck: &metav1.Duration{Duration: 30 * time.Second},
+						DNS01: &cmacme.ACMEChallengeSolverDNS01{
+							CloudDNS: &validCloudDNSProvider,
+						},
+					},
+				},
+			},
+		},
+		"acme solver with a zero waitInsteadOfSelfCheck duration": {
+			// A zero duration is a valid "skip the self-check and accept
+			// immediately" configuration that relies on the ACME server's own
+			// validation retries; only negative durations are rejected.
+			spec: &cmacme.ACMEIssuer{
+				Email:      "valid-email",
+				Server:     "valid-server",
+				PrivateKey: validSecretKeyRef,
+				Solvers: []cmacme.ACMEChallengeSolver{
+					{
+						WaitInsteadOfSelfCheck: &metav1.Duration{Duration: 0},
+						DNS01: &cmacme.ACMEChallengeSolverDNS01{
+							CloudDNS: &validCloudDNSProvider,
+						},
+					},
+				},
+			},
+		},
+		"acme solver with a negative waitInsteadOfSelfCheck duration": {
+			spec: &cmacme.ACMEIssuer{
+				Email:      "valid-email",
+				Server:     "valid-server",
+				PrivateKey: validSecretKeyRef,
+				Solvers: []cmacme.ACMEChallengeSolver{
+					{
+						WaitInsteadOfSelfCheck: &metav1.Duration{Duration: -5 * time.Second},
+						DNS01: &cmacme.ACMEChallengeSolverDNS01{
+							CloudDNS: &validCloudDNSProvider,
+						},
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("solvers").Index(0).Child("waitInsteadOfSelfCheck"), -5*time.Second, "waitInsteadOfSelfCheck must not be negative"),
 			},
 		},
 		"acme solver with external account binding missing required fields": {
@@ -218,8 +639,9 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 				Server:     "valid-server",
 				PrivateKey: validSecretKeyRef,
 				ExternalAccountBinding: &cmacme.ACMEExternalAccountBinding{
-					KeyID:        "test",
-					Key:          validSecretKeyRef,
+					KeyID: "test",
+					Key:   validSecretKeyRef,
+					//nolint:staticcheck // SA1019 setting the deprecated eab.KeyAlgorithm field is intentional: this test asserts the deprecation warning.
 					KeyAlgorithm: cmacme.HS384,
 				},
 				Solvers: []cmacme.ACMEChallengeSolver{
@@ -273,6 +695,7 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 								ParentRefs: []gwapi.ParentReference{
 									{
 										Name: "blah",
+										Kind: (*gwapi.Kind)(new("Gateway")),
 									},
 								},
 							},
@@ -289,15 +712,21 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 				Solvers: []cmacme.ACMEChallengeSolver{
 					{
 						HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
-							GatewayHTTPRoute: &cmacme.ACMEChallengeSolverHTTP01GatewayHTTPRoute{},
+							GatewayHTTPRoute: &cmacme.ACMEChallengeSolverHTTP01GatewayHTTPRoute{
+								ParentRefs: []gwapi.ParentReference{
+									{
+										Kind: (*gwapi.Kind)(new("Gateway")),
+									},
+								},
+							},
 						},
 					},
 				},
 			},
 			errs: []*field.Error{
 				field.Required(
-					fldPath.Child("solvers").Index(0).Child("http01", "gateway").Child("parentRefs"),
-					"at least 1 parentRef is required",
+					fldPath.Child("solvers").Index(0).Child("http01", "gateway").Child("parentRefs").Index(0).Child("name"),
+					"name is required when kind is specified",
 				),
 			},
 		},
@@ -317,6 +746,7 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 								ParentRefs: []gwapi.ParentReference{
 									{
 										Name: "blah",
+										Kind: (*gwapi.Kind)(new("Gateway")),
 									},
 								},
 							},
@@ -341,13 +771,11 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 						HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
 							Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
 								PodTemplate: &cmacme.ACMEChallengeSolverHTTP01IngressPodTemplate{
-									ACMEChallengeSolverHTTP01IngressPodObjectMeta: cmacme.ACMEChallengeSolverHTTP01IngressPodObjectMeta{
-										Labels: map[string]string{
-											"valid_to_contain": "labels",
-										},
-										Annotations: map[string]string{
-											"valid_to_contain": "annotations",
-										},
+									Labels: map[string]string{
+										"valid_to_contain": "labels",
+									},
+									Annotations: map[string]string{
+										"valid_to_contain": "annotations",
 									},
 								},
 							},
@@ -395,10 +823,8 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 						HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
 							Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
 								PodTemplate: &cmacme.ACMEChallengeSolverHTTP01IngressPodTemplate{
-									ACMEChallengeSolverHTTP01IngressPodObjectMeta: cmacme.ACMEChallengeSolverHTTP01IngressPodObjectMeta{
-										Labels: map[string]string{
-											"valid_to_contain": "labels",
-										},
+									Labels: map[string]string{
+										"valid_to_contain": "labels",
 									},
 									Spec: cmacme.ACMEChallengeSolverHTTP01IngressPodSpec{
 										NodeSelector: map[string]string{
@@ -416,23 +842,104 @@ func TestValidateACMEIssuerConfig(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs, warnings := ValidateACMEIssuerConfig(s.spec, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 			assert.Equal(t, s.warnings, warnings)
 		})
 	}
 }
 
+func TestValidateACMEIssuerGatewayParentRefs(t *testing.T) {
+	fldPath := (*field.Path)(nil)
+
+	tests := []struct {
+		name            string
+		parentRefs      []gwapi.ParentReference
+		wantErrContains string // Empty string means no error expected
+	}{
+		{
+			name: "kind without name",
+			parentRefs: []gwapi.ParentReference{
+				{
+					Kind: ptr.To(gwapi.Kind("Gateway")),
+				},
+			},
+			wantErrContains: "name is required",
+		},
+		{
+			name: "name without kind",
+			parentRefs: []gwapi.ParentReference{
+				{Name: gwapi.ObjectName("test-gateway")},
+			},
+			wantErrContains: "kind is required",
+		},
+		{
+			name:       "empty parentRefs array",
+			parentRefs: []gwapi.ParentReference{},
+		},
+		{
+			name: "both name and kind present",
+			parentRefs: []gwapi.ParentReference{
+				{
+					Name: gwapi.ObjectName("test-gateway"),
+					Kind: ptr.To(gwapi.Kind("Gateway")),
+				},
+			},
+		},
+		{
+			name: "multiple valid parentRefs",
+			parentRefs: []gwapi.ParentReference{
+				{
+					Name: gwapi.ObjectName("gateway-1"),
+					Kind: ptr.To(gwapi.Kind("Gateway")),
+				},
+				{
+					Name: gwapi.ObjectName("gateway-2"),
+					Kind: ptr.To(gwapi.Kind("Gateway")),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &cmacme.ACMEIssuer{
+				Email:      "valid-email",
+				Server:     "valid-server",
+				PrivateKey: validSecretKeyRef,
+				Solvers: []cmacme.ACMEChallengeSolver{
+					{
+						HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
+							GatewayHTTPRoute: &cmacme.ACMEChallengeSolverHTTP01GatewayHTTPRoute{
+								ParentRefs: tt.parentRefs,
+							},
+						},
+					},
+				},
+			}
+
+			errs, _ := ValidateACMEIssuerConfig(spec, fldPath)
+
+			if tt.wantErrContains != "" {
+				assert.NotEmpty(t, errs, "expected validation errors")
+
+				found := false
+				for _, err := range errs {
+					if assert.Contains(t, err.Error(), tt.wantErrContains) {
+						found = true
+						break
+					}
+				}
+				assert.True(t, found, "expected error containing %q", tt.wantErrContains)
+			} else {
+				assert.Empty(t, errs, "expected no validation errors")
+			}
+		})
+	}
+}
+
 func TestValidateIssuerSpec(t *testing.T) {
-	fldPath := field.NewPath("")
+	fldPath := (*field.Path)(nil)
+
 	scenarios := map[string]struct {
 		spec     *cmapi.IssuerSpec
 		errs     field.ErrorList
@@ -440,43 +947,33 @@ func TestValidateIssuerSpec(t *testing.T) {
 	}{
 		"valid ca issuer": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					CA: &cmapi.CAIssuer{
-						SecretName: "valid",
-					},
+				CA: &cmapi.CAIssuer{
+					SecretName: "valid",
 				},
 			},
 			errs: []*field.Error{},
 		},
 		"ca issuer without secret name specified": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					CA: &cmapi.CAIssuer{},
-				},
+				CA: &cmapi.CAIssuer{},
 			},
 			errs: []*field.Error{field.Required(fldPath.Child("ca", "secretName"), "")},
 		},
-		"valid self signed issuer": {
+		"valid self-signed issuer": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					SelfSigned: &cmapi.SelfSignedIssuer{},
-				},
+				SelfSigned: &cmapi.SelfSignedIssuer{},
 			},
 			errs: []*field.Error{},
 		},
 		"valid acme issuer": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					ACME: &validACMEIssuer,
-				},
+				ACME: &validACMEIssuer,
 			},
 			errs: []*field.Error{},
 		},
 		"valid vault issuer": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					Vault: &validVaultIssuer,
-				},
+				Vault: &validVaultIssuer,
 			},
 			errs: []*field.Error{},
 		},
@@ -490,11 +987,9 @@ func TestValidateIssuerSpec(t *testing.T) {
 		},
 		"multiple issuers configured": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					SelfSigned: &cmapi.SelfSignedIssuer{},
-					CA: &cmapi.CAIssuer{
-						SecretName: "valid",
-					},
+				SelfSigned: &cmapi.SelfSignedIssuer{},
+				CA: &cmapi.CAIssuer{
+					SecretName: "valid",
 				},
 			},
 			errs: []*field.Error{
@@ -503,26 +998,42 @@ func TestValidateIssuerSpec(t *testing.T) {
 		},
 		"valid ocsp url": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					CA: &cmapi.CAIssuer{
-						SecretName:  "valid",
-						OCSPServers: []string{"http://ocsp.int-x3.letsencrypt.org"},
-					},
+				CA: &cmapi.CAIssuer{
+					SecretName:  "valid",
+					OCSPServers: []string{"http://ocsp.int-x3.letsencrypt.org"},
 				},
 			},
 			errs: []*field.Error{},
 		},
 		"invalid ocsp url": {
 			spec: &cmapi.IssuerSpec{
-				IssuerConfig: cmapi.IssuerConfig{
-					CA: &cmapi.CAIssuer{
-						SecretName:  "valid",
-						OCSPServers: []string{""},
-					},
+				CA: &cmapi.CAIssuer{
+					SecretName:  "valid",
+					OCSPServers: []string{""},
 				},
 			},
 			errs: []*field.Error{
 				field.Invalid(fldPath.Child("ca", "ocspServer").Index(0), "", `must be a valid URL, e.g., http://ocsp.int-x3.letsencrypt.org`),
+			},
+		},
+		"valid IssuingCertificateURLs": {
+			spec: &cmapi.IssuerSpec{
+				CA: &cmapi.CAIssuer{
+					SecretName:             "valid",
+					IssuingCertificateURLs: []string{"http://ca.example.com/ca.crt"},
+				},
+			},
+			errs: []*field.Error{},
+		},
+		"invalid IssuingCertificateURLs": {
+			spec: &cmapi.IssuerSpec{
+				CA: &cmapi.CAIssuer{
+					SecretName:             "valid",
+					IssuingCertificateURLs: []string{""},
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("ca", "issuingCertificateURLs").Index(0), "", `must be a valid URL`),
 			},
 		},
 	}
@@ -536,20 +1047,26 @@ func TestValidateIssuerSpec(t *testing.T) {
 }
 
 func TestValidateACMEIssuerHTTP01Config(t *testing.T) {
-	fldPath := field.NewPath("")
+	fldPath := (*field.Path)(nil)
+
 	scenarios := map[string]struct {
 		isExpectedFailure bool
 		cfg               *cmacme.ACMEChallengeSolverHTTP01
 		errs              []*field.Error
 	}{
-		"ingress field specified": {
+		"ingress name field specified": {
 			cfg: &cmacme.ACMEChallengeSolverHTTP01{
 				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{Name: "abc"},
 			},
 		},
 		"ingress class field specified": {
 			cfg: &cmacme.ACMEChallengeSolverHTTP01{
-				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{Class: strPtr("abc")},
+				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{Class: new("abc")},
+			},
+		},
+		"ingressClassName field specified": {
+			cfg: &cmacme.ACMEChallengeSolverHTTP01{
+				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{IngressClassName: new("abc")},
 			},
 		},
 		"neither field specified": {
@@ -563,15 +1080,59 @@ func TestValidateACMEIssuerHTTP01Config(t *testing.T) {
 				field.Required(fldPath, "no HTTP01 solver type configured"),
 			},
 		},
-		"both fields specified": {
+		"both ingress class and ingressClassName specified": {
 			cfg: &cmacme.ACMEChallengeSolverHTTP01{
 				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
-					Name:  "abc",
-					Class: strPtr("abc"),
+					Class:            new("abc"),
+					IngressClassName: new("abc"),
 				},
 			},
 			errs: []*field.Error{
-				field.Forbidden(fldPath.Child("ingress"), "only one of 'name' or 'class' should be specified"),
+				field.Forbidden(fldPath.Child("ingress"), "only one of 'ingressClassName', 'name' or 'class' should be specified"),
+			},
+		},
+		"both ingress class and ingress name specified": {
+			cfg: &cmacme.ACMEChallengeSolverHTTP01{
+				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
+					Class: new("abc"),
+					Name:  "abc",
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("ingress"), "only one of 'ingressClassName', 'name' or 'class' should be specified"),
+			},
+		},
+		"both ingressClassName and ingress name specified": {
+			cfg: &cmacme.ACMEChallengeSolverHTTP01{
+				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
+					IngressClassName: new("abc"),
+					Name:             "abc",
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("ingress"), "only one of 'ingressClassName', 'name' or 'class' should be specified"),
+			},
+		},
+		"all three fields specified": {
+			cfg: &cmacme.ACMEChallengeSolverHTTP01{
+				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
+					Name:             "abc",
+					Class:            new("abc"),
+					IngressClassName: new("abc"),
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("ingress"), "only one of 'ingressClassName', 'name' or 'class' should be specified"),
+			},
+		},
+		"ingressClassName is invalid": {
+			cfg: &cmacme.ACMEChallengeSolverHTTP01{
+				Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{
+					IngressClassName: new("azure/application-gateway"),
+				},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("ingress", "ingressClassName"), "azure/application-gateway", `must be a valid IngressClass name: a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')`),
 			},
 		},
 		"acme issuer with valid http01 service config serviceType ClusterIP": {
@@ -609,16 +1170,7 @@ func TestValidateACMEIssuerHTTP01Config(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs := ValidateACMEIssuerChallengeSolverHTTP01Config(s.cfg, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 		})
 	}
 }
@@ -644,8 +1196,8 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				CloudDNS: &cmacme.ACMEIssuerDNS01ProviderCloudDNS{
 					Project: "valid",
 					ServiceAccount: &cmmeta.SecretKeySelector{
-						LocalObjectReference: cmmeta.LocalObjectReference{Name: "something"},
-						Key:                  "",
+						Name: "something",
+						Key:  "",
 					},
 				},
 			},
@@ -658,8 +1210,8 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				CloudDNS: &cmacme.ACMEIssuerDNS01ProviderCloudDNS{
 					Project: "valid",
 					ServiceAccount: &cmmeta.SecretKeySelector{
-						LocalObjectReference: cmmeta.LocalObjectReference{Name: ""},
-						Key:                  "something",
+						Name: "",
+						Key:  "something",
 					},
 				},
 			},
@@ -730,19 +1282,9 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				field.Required(fldPath.Child("cloudflare", "email"), ""),
 			},
 		},
-		"missing route53 region": {
+		"empty route53 field should be valid because ambient credentials and region may be used instead": {
 			cfg: &cmacme.ACMEChallengeSolverDNS01{
 				Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{},
-			},
-			errs: []*field.Error{
-				field.Required(fldPath.Child("route53", "region"), ""),
-			},
-		},
-		"missing route53 accessKeyID and accessKeyIDSecretRef should be valid because ambient credentials may be used instead": {
-			cfg: &cmacme.ACMEChallengeSolverDNS01{
-				Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
-					Region: "valid",
-				},
 			},
 			errs: []*field.Error{},
 		},
@@ -777,8 +1319,8 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
 					Region: "valid",
 					SecretAccessKeyID: &cmmeta.SecretKeySelector{
-						LocalObjectReference: cmmeta.LocalObjectReference{Name: "name"},
-						Key:                  "",
+						Name: "name",
+						Key:  "",
 					},
 				},
 			},
@@ -811,7 +1353,7 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				field.Required(fldPath.Child("azureDNS", "subscriptionID"), ""),
 				field.Required(fldPath.Child("azureDNS", "resourceGroupName"), ""),
 				field.Invalid(fldPath.Child("azureDNS", "environment"), cmacme.AzureDNSEnvironment("an env"),
-					"must be either empty or one of AzurePublicCloud, AzureChinaCloud, AzureGermanCloud or AzureUSGovernmentCloud"),
+					"must be either empty or one of AzurePublicCloud, AzureChinaCloud, AzureGermanCloud, or AzureUSGovernmentCloud"),
 			},
 		},
 		"invalid azuredns missing clientSecret and tenantID": {
@@ -831,10 +1373,8 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 			cfg: &cmacme.ACMEChallengeSolverDNS01{
 				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
 					ClientSecret: &cmmeta.SecretKeySelector{
-						Key: "some-key",
-						LocalObjectReference: cmmeta.LocalObjectReference{
-							Name: "some-secret-name",
-						},
+						Key:  "some-key",
+						Name: "some-secret-name",
 					},
 				},
 			},
@@ -862,10 +1402,8 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 			cfg: &cmacme.ACMEChallengeSolverDNS01{
 				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
 					ClientSecret: &cmmeta.SecretKeySelector{
-						Key: "some-key",
-						LocalObjectReference: cmmeta.LocalObjectReference{
-							Name: "some-secret-name",
-						},
+						Key:  "some-key",
+						Name: "some-secret-name",
 					},
 					TenantID: "some-tenant-id",
 				},
@@ -895,9 +1433,7 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 					TenantID: "some-tenant-id",
 					ClientID: "some-client-id",
 					ClientSecret: &cmmeta.SecretKeySelector{
-						LocalObjectReference: cmmeta.LocalObjectReference{
-							Name: "some-secret-name",
-						},
+						Name: "some-secret-name",
 					},
 				},
 			},
@@ -928,10 +1464,8 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
 					ClientID: "some-client-id",
 					ClientSecret: &cmmeta.SecretKeySelector{
-						Key: "some-key",
-						LocalObjectReference: cmmeta.LocalObjectReference{
-							Name: "some-secret-name",
-						},
+						Key:  "some-key",
+						Name: "some-secret-name",
 					},
 				},
 			},
@@ -953,7 +1487,7 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 			errs: []*field.Error{
 				field.Required(fldPath.Child("azureDNS", "clientSecretSecretRef"), ""),
 				field.Required(fldPath.Child("azureDNS", "tenantID"), ""),
-				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity can not be used at the same time as clientID, clientSecretSecretRef or tenantID"),
+				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity cannot be used at the same time as clientID, clientSecretSecretRef or tenantID"),
 				field.Required(fldPath.Child("azureDNS", "subscriptionID"), ""),
 				field.Required(fldPath.Child("azureDNS", "resourceGroupName"), ""),
 			},
@@ -970,19 +1504,48 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 			errs: []*field.Error{
 				field.Required(fldPath.Child("azureDNS", "clientID"), ""),
 				field.Required(fldPath.Child("azureDNS", "clientSecretSecretRef"), ""),
-				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity can not be used at the same time as clientID, clientSecretSecretRef or tenantID"),
+				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity cannot be used at the same time as clientID, clientSecretSecretRef or tenantID"),
 				field.Required(fldPath.Child("azureDNS", "subscriptionID"), ""),
 				field.Required(fldPath.Child("azureDNS", "resourceGroupName"), ""),
+			},
+		},
+
+		"invalid azuredns managedIdentity tenantID used without managedIdentity clientID ": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
+					ManagedIdentity: &cmacme.AzureManagedIdentity{
+						TenantID: "some-tenant-id",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("azureDNS", "managedIdentity"), "managedIdentityClientID is required when using managedIdentityTenantID"),
+				field.Required(fldPath.Child("azureDNS", "subscriptionID"), ""),
+				field.Required(fldPath.Child("azureDNS", "resourceGroupName"), ""),
+			},
+		},
+		"invalid azuredns managedIdentity tenantID used with resourceID": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
+					SubscriptionID:    "test",
+					ResourceGroupName: "test",
+					ManagedIdentity: &cmacme.AzureManagedIdentity{
+						ResourceID: "test",
+						TenantID:   "some-tenant-id",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managedIdentityTenantID and managedIdentityResourceID cannot both be specified"),
+				field.Required(fldPath.Child("azureDNS", "managedIdentity"), "managedIdentityClientID is required when using managedIdentityTenantID"),
 			},
 		},
 		"invalid azuredns clientSecret used with managedIdentity": {
 			cfg: &cmacme.ACMEChallengeSolverDNS01{
 				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
 					ClientSecret: &cmmeta.SecretKeySelector{
-						Key: "some-key",
-						LocalObjectReference: cmmeta.LocalObjectReference{
-							Name: "some-secret-name",
-						},
+						Key:  "some-key",
+						Name: "some-secret-name",
 					},
 					ManagedIdentity: &cmacme.AzureManagedIdentity{
 						ClientID: "test",
@@ -992,7 +1555,7 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 			errs: []*field.Error{
 				field.Required(fldPath.Child("azureDNS", "clientID"), ""),
 				field.Required(fldPath.Child("azureDNS", "tenantID"), ""),
-				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity can not be used at the same time as clientID, clientSecretSecretRef or tenantID"),
+				field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity cannot be used at the same time as clientID, clientSecretSecretRef or tenantID"),
 				field.Required(fldPath.Child("azureDNS", "subscriptionID"), ""),
 				field.Required(fldPath.Child("azureDNS", "resourceGroupName"), ""),
 			},
@@ -1030,7 +1593,7 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 			},
 			errs: []*field.Error{},
 		},
-		"invalid azuredns managedIdentity with both cliendID and resourceID": {
+		"invalid azuredns managedIdentity with both clientID and resourceID": {
 			cfg: &cmacme.ACMEChallengeSolverDNS01{
 				AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
 					SubscriptionID:    "test",
@@ -1194,20 +1757,50 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				field.Forbidden(fldPath.Child("cloudflare"), "may not specify more than one provider type"),
 			},
 		},
+		"valid nameservers with ip:port": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				Nameservers: []string{"8.8.8.8:53", "1.1.1.1:53"},
+				CloudDNS:    &cmacme.ACMEIssuerDNS01ProviderCloudDNS{Project: "valid"},
+			},
+			errs: []*field.Error{},
+		},
+		"valid nameservers with hostname:port": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				Nameservers: []string{"ns.example.com:53"},
+				CloudDNS:    &cmacme.ACMEIssuerDNS01ProviderCloudDNS{Project: "valid"},
+			},
+			errs: []*field.Error{},
+		},
+		"valid nameservers with doh url": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				Nameservers: []string{"https://cloudflare-dns.com/dns-query"},
+				CloudDNS:    &cmacme.ACMEIssuerDNS01ProviderCloudDNS{Project: "valid"},
+			},
+			errs: []*field.Error{},
+		},
+		"invalid nameserver missing port": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				Nameservers: []string{"8.8.8.8"},
+				CloudDNS:    &cmacme.ACMEIssuerDNS01ProviderCloudDNS{Project: "valid"},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("nameservers").Index(0), "8.8.8.8", "must be in the format <ip address>:<port>"),
+			},
+		},
+		"invalid nameserver doh url missing host": {
+			cfg: &cmacme.ACMEChallengeSolverDNS01{
+				Nameservers: []string{"https://"},
+				CloudDNS:    &cmacme.ACMEIssuerDNS01ProviderCloudDNS{Project: "valid"},
+			},
+			errs: []*field.Error{
+				field.Invalid(fldPath.Child("nameservers").Index(0), "https://", "must be in the format https://<DoH RFC 8484 server address>"),
+			},
+		},
 	}
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
-			errs := ValidateACMEChallengeSolverDNS01(s.cfg, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			errs, _ := ValidateACMEChallengeSolverDNS01(s.cfg, fldPath)
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 		})
 	}
 }
@@ -1217,7 +1810,8 @@ func TestValidateSecretKeySelector(t *testing.T) {
 	validKey := "key"
 	// invalidName := cmmeta.LocalObjectReference{"-name-"}
 	// invalidKey := "-key-"
-	fldPath := field.NewPath("")
+	fldPath := (*field.Path)(nil)
+
 	scenarios := map[string]struct {
 		isExpectedFailure bool
 		selector          *cmmeta.SecretKeySelector
@@ -1263,16 +1857,7 @@ func TestValidateSecretKeySelector(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs := ValidateSecretKeySelector(s.selector, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Errorf("Expected %v but got %v", s.errs, errs)
-				return
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 		})
 	}
 }
@@ -1307,7 +1892,7 @@ func TestValidateVenafiIssuerConfig(t *testing.T) {
 				Zone: "a\\b\\c",
 			},
 			errs: []*field.Error{
-				field.Required(fldPath, "please supply one of: tpp, cloud"),
+				field.Required(fldPath, "please supply one of: tpp, cloud, ngts"),
 			},
 		},
 		"multiple configuration": {
@@ -1319,7 +1904,56 @@ func TestValidateVenafiIssuerConfig(t *testing.T) {
 				Cloud: &cmapi.VenafiCloud{},
 			},
 			errs: []*field.Error{
-				field.Forbidden(fldPath, "please supply one of: tpp, cloud"),
+				field.Forbidden(fldPath, "please supply one of: tpp, cloud, ngts"),
+			},
+		},
+		"valid NGTS configuration": {
+			cfg: &cmapi.VenafiIssuer{
+				Zone: "TestApp\\Default",
+				NGTS: &cmapi.VenafiNGTS{
+					URL:           "https://api.example.paloaltonetworks.com/ngts",
+					TokenEndpoint: "https://auth.example.com/oauth2/token",
+					TSGID:         "123456789",
+					CredentialsRef: cmmeta.LocalObjectReference{
+						Name: "ngts-secret",
+					},
+				},
+			},
+		},
+		"NGTS and TPP both set": {
+			cfg: &cmapi.VenafiIssuer{
+				Zone: "TestApp\\Default",
+				TPP: &cmapi.VenafiTPP{
+					URL: "https://tpp.example.com/vedsdk",
+				},
+				NGTS: &cmapi.VenafiNGTS{
+					URL:           "https://api.example.paloaltonetworks.com/ngts",
+					TokenEndpoint: "https://auth.example.com/oauth2/token",
+					TSGID:         "123456789",
+					CredentialsRef: cmmeta.LocalObjectReference{
+						Name: "ngts-secret",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath, "please supply one of: tpp, cloud, ngts"),
+			},
+		},
+		"NGTS and Cloud both set": {
+			cfg: &cmapi.VenafiIssuer{
+				Zone:  "TestApp\\Default",
+				Cloud: &cmapi.VenafiCloud{},
+				NGTS: &cmapi.VenafiNGTS{
+					URL:           "https://api.example.paloaltonetworks.com/ngts",
+					TokenEndpoint: "https://auth.example.com/oauth2/token",
+					TSGID:         "123456789",
+					CredentialsRef: cmmeta.LocalObjectReference{
+						Name: "ngts-secret",
+					},
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath, "please supply one of: tpp, cloud, ngts"),
 			},
 		},
 	}
@@ -1327,20 +1961,16 @@ func TestValidateVenafiIssuerConfig(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs := ValidateVenafiIssuerConfig(s.cfg, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Fatalf("Expected %v but got %v", s.errs, errs)
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 		})
 	}
 }
 
 func TestValidateVenafiTPP(t *testing.T) {
+	caBundle := unitcrypto.MustCreateCryptoBundle(t,
+		&pubcmapi.Certificate{Spec: pubcmapi.CertificateSpec{CommonName: "test"}},
+		clock.RealClock{},
+	).CertBytes
 	fldPath := field.NewPath("test")
 	scenarios := map[string]struct {
 		cfg  *cmapi.VenafiTPP
@@ -1357,20 +1987,89 @@ func TestValidateVenafiTPP(t *testing.T) {
 				field.Required(fldPath.Child("url"), ""),
 			},
 		},
+		"venafi TPP issuer defines both caBundle and caBundleSecretRef": {
+			cfg: &cmapi.VenafiTPP{
+				URL:      "https://tpp.example.com/vedsdk",
+				CABundle: caBundle,
+				CABundleSecretRef: &cmmeta.SecretKeySelector{
+					Key:  "ca.crt",
+					Name: "test-secret",
+				},
+			},
+			errs: []*field.Error{
+				field.Forbidden(fldPath, "may not specify more than one of caBundle/caBundleSecretRef as TPP CA Bundle"),
+			},
+		},
 	}
 
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			errs := ValidateVenafiTPP(s.cfg, fldPath)
-			if len(errs) != len(s.errs) {
-				t.Fatalf("Expected %v but got %v", s.errs, errs)
-			}
-			for i, e := range errs {
-				expectedErr := s.errs[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected %v but got %v", expectedErr, e)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
+		})
+	}
+}
+
+func TestValidateVenafiNGTS(t *testing.T) {
+	fldPath := field.NewPath("test")
+	scenarios := map[string]struct {
+		cfg  *cmapi.VenafiNGTS
+		errs []*field.Error
+	}{
+		"valid NGTS config": {
+			cfg: &cmapi.VenafiNGTS{
+				URL:           "https://api.example.paloaltonetworks.com/ngts",
+				TokenEndpoint: "https://auth.example.com/oauth2/token",
+				TSGID:         "123456789",
+				CredentialsRef: cmmeta.LocalObjectReference{
+					Name: "ngts-secret",
+				},
+			},
+		},
+		"valid NGTS config without optional fields": {
+			cfg: &cmapi.VenafiNGTS{
+				TSGID: "123456789",
+				CredentialsRef: cmmeta.LocalObjectReference{
+					Name: "ngts-secret",
+				},
+			},
+		},
+		"missing tsgID": {
+			cfg: &cmapi.VenafiNGTS{
+				URL:           "https://api.example.paloaltonetworks.com/ngts",
+				TokenEndpoint: "https://auth.example.com/oauth2/token",
+				CredentialsRef: cmmeta.LocalObjectReference{
+					Name: "ngts-secret",
+				},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("tsgID"), ""),
+			},
+		},
+		"missing credentialsRef name": {
+			cfg: &cmapi.VenafiNGTS{
+				URL:            "https://api.example.paloaltonetworks.com/ngts",
+				TokenEndpoint:  "https://auth.example.com/oauth2/token",
+				TSGID:          "123456789",
+				CredentialsRef: cmmeta.LocalObjectReference{},
+			},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("credentialsRef", "name"), ""),
+			},
+		},
+		"missing all required fields": {
+			cfg: &cmapi.VenafiNGTS{},
+			errs: []*field.Error{
+				field.Required(fldPath.Child("tsgID"), ""),
+				field.Required(fldPath.Child("credentialsRef", "name"), ""),
+			},
+		},
+	}
+
+	for n, s := range scenarios {
+		t.Run(n, func(t *testing.T) {
+			errs := ValidateVenafiNGTS(s.cfg, fldPath)
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.errs, errs)
 		})
 	}
 }
@@ -1386,33 +2085,16 @@ func TestValidateIssuer(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			gotE, gotW := ValidateIssuer(s.a, s.cfg)
-			if len(gotE) != len(s.expectedE) {
-				t.Fatalf("Expected errors %v but got %v", s.expectedE, gotE)
-			}
-			if len(gotW) != len(s.expectedW) {
-				t.Fatalf("Expected warnings %v but got %v", s.expectedE, gotE)
-			}
-			for i, e := range gotE {
-				expectedErr := s.expectedE[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected warnings %v but got %v", expectedErr, e)
-				}
-			}
-			for i, w := range gotW {
-				expectedWarning := s.expectedW[i]
-				if w != expectedWarning {
-					t.Errorf("Expected warning %q but got %q", expectedWarning, w)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.expectedE, gotE)
+			assert.Equal(t, s.expectedW, gotW)
 		})
 	}
 }
 
 func TestUpdateValidateIssuer(t *testing.T) {
 	baseIssuerConfig := cmapi.IssuerSpec{
-		IssuerConfig: cmapi.IssuerConfig{
-			SelfSigned: &cmapi.SelfSignedIssuer{},
-		}}
+		SelfSigned: &cmapi.SelfSignedIssuer{},
+	}
 	baseIssuer := cmapi.Issuer{
 		Spec: baseIssuerConfig,
 	}
@@ -1426,24 +2108,8 @@ func TestUpdateValidateIssuer(t *testing.T) {
 	for n, s := range scenarios {
 		t.Run(n, func(t *testing.T) {
 			gotE, gotW := ValidateUpdateIssuer(s.a, &baseIssuer, s.iss)
-			if len(gotE) != len(s.expectedE) {
-				t.Fatalf("Expected errors %v but got %v", s.expectedE, gotE)
-			}
-			if len(gotW) != len(s.expectedW) {
-				t.Fatalf("Expected warnings %v but got %v", s.expectedE, gotE)
-			}
-			for i, e := range gotE {
-				expectedErr := s.expectedE[i]
-				if !reflect.DeepEqual(e, expectedErr) {
-					t.Errorf("Expected warnings %v but got %v", expectedErr, e)
-				}
-			}
-			for i, w := range gotW {
-				expectedWarning := s.expectedW[i]
-				if w != expectedWarning {
-					t.Errorf("Expected warning %q but got %q", expectedWarning, w)
-				}
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, s.expectedE, gotE)
+			assert.Equal(t, s.expectedW, gotW)
 		})
 	}
 }

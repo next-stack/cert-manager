@@ -18,27 +18,26 @@ package cainjector
 
 import (
 	"context"
-
-	logf "github.com/cert-manager/cert-manager/pkg/logs"
+	"errors"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
 
 // caDataSource knows how to extract CA data given a provided InjectTarget.
 // This allows adaptable implementations of fetching CA data based on
-// configuration given on the injection target (e.g. annotations).
+// configuration given on the injection target (e.g., annotations).
 
 type caDataSource interface {
 	// Configured returns true if this data source should be used for the given
@@ -52,10 +51,7 @@ type caDataSource interface {
 	// In this case, the caller should not retry the operation.
 	// It is up to the ReadCA implementation to inform the user why the CA
 	// failed to read.
-	ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object) (ca []byte, err error)
-
-	// ApplyTo applies any required watchers to the given controller.
-	ApplyTo(ctx context.Context, mgr ctrl.Manager, setup injectorSetup, controller controller.Controller, ca cache.Cache) error
+	ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object, namespace string, ignoreNamespaces sets.Set[string]) (ca []byte, err error)
 }
 
 // kubeconfigDataSource reads the ca bundle provided as part of the struct
@@ -69,18 +65,8 @@ func (c *kubeconfigDataSource) Configured(log logr.Logger, metaObj metav1.Object
 	return metaObj.GetAnnotations()[cmapi.WantInjectAPIServerCAAnnotation] == "true"
 }
 
-func (c *kubeconfigDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object) (ca []byte, err error) {
+func (c *kubeconfigDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object, namespace string, ignoreNamespaces sets.Set[string]) (ca []byte, err error) {
 	return c.apiserverCABundle, nil
-}
-
-func (c *kubeconfigDataSource) ApplyTo(ctx context.Context, mgr ctrl.Manager, setup injectorSetup, _ controller.Controller, _ cache.Cache) error {
-	cfg := mgr.GetConfig()
-	caBundle, err := dataFromSliceOrFile(cfg.CAData, cfg.CAFile)
-	if err != nil {
-		return err
-	}
-	c.apiserverCABundle = caBundle
-	return nil
 }
 
 // certificateDataSource reads a CA bundle by fetching the Certificate named in
@@ -99,14 +85,30 @@ func (c *certificateDataSource) Configured(log logr.Logger, metaObj metav1.Objec
 	return true
 }
 
-func (c *certificateDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object) (ca []byte, err error) {
+func (c *certificateDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object, namespace string, ignoreNamespaces sets.Set[string]) (ca []byte, err error) {
 	certNameRaw := metaObj.GetAnnotations()[cmapi.WantInjectAnnotation]
 	certName := splitNamespacedName(certNameRaw)
 	log = log.WithValues("certificate", certName)
 	if certName.Namespace == "" {
-		log.Error(nil, "invalid certificate name; needs a namespace/ prefix")
+		err := errors.New("invalid annotation")
+		log.Error(err, "invalid certificate name: needs a namespace/ prefix")
+		// TODO: should an error be returned here to prevent the caller from proceeding?
 		// don't return an error, requeuing won't help till this is changed
 		return nil, nil
+	}
+
+	if ignoreNamespaces.Has(certName.Namespace) {
+		err := fmt.Errorf("cannot read CA data from Certificate in namespace %s, namespace is ignored", certName.Namespace)
+		forbiddenErr := apierrors.NewForbidden(cmapi.Resource("certificates"), certName.Name, err)
+		log.Error(forbiddenErr, "cannot read data source")
+		return nil, forbiddenErr
+	}
+
+	if namespace != "" && certName.Namespace != namespace {
+		err := fmt.Errorf("cannot read CA data from Certificate in namespace %s, cainjector is scoped to namespace %s", certName.Namespace, namespace)
+		forbiddenErr := apierrors.NewForbidden(cmapi.Resource("certificates"), certName.Name, err)
+		log.Error(forbiddenErr, "cannot read data source")
+		return nil, forbiddenErr
 	}
 
 	var cert cmapi.Certificate
@@ -116,57 +118,44 @@ func (c *certificateDataSource) ReadCA(ctx context.Context, log logr.Logger, met
 		return nil, dropNotFound(err)
 	}
 
-	secretName := &types.NamespacedName{Namespace: cert.Namespace, Name: cert.Spec.SecretName}
+	secretName := types.NamespacedName{Namespace: cert.Namespace, Name: cert.Spec.SecretName}
 	// grab the associated secret, and ensure it's owned by the cert
 	log = log.WithValues("secret", secretName)
 	var secret corev1.Secret
-	if err := c.client.Get(ctx, *secretName, &secret); err != nil {
+	if err := c.client.Get(ctx, secretName, &secret); err != nil {
 		log.Error(err, "unable to fetch associated secret")
 		// don't requeue if we're just not found, we'll get called when the secret gets created
 		return nil, dropNotFound(err)
 	}
-	owner := OwningCertForSecret(&secret)
+	// Only use Secrets that have been created by this Certificate.
+	// The Secret must have a `cert-manager.io/certificate-name` annotation
+	// value matching the name of this Certificate..
+	// NOTE: "owner" is not the `ownerReference`, because cert-manager does not
+	// usually set the ownerReference of the Secret.
+	owner := owningCertForSecret(&secret)
 	if owner == nil || *owner != certName {
-		log.V(logf.WarnLevel).Info("refusing to target secret not owned by certificate", "owner", metav1.GetControllerOf(&secret))
+		// klog.SafePtr prevents the nil owner (annotation missing) from
+		// reaching the logger's Stringer call, which would panic in the
+		// promoted value-receiver String method and render the field as
+		// "<panic: ...>".
+		log.V(logf.WarnLevel).Info(
+			"refusing to target secret: cert-manager.io/certificate-name annotation does not match",
+			"annotationValue", klog.SafePtr(owner),
+			"expected", certName,
+		)
 		return nil, nil
 	}
 
 	// inject the CA data
 	caData, hasCAData := secret.Data[cmmeta.TLSCAKey]
 	if !hasCAData {
-		log.Error(nil, "certificate has no CA data")
+		err := errors.New("invalid CA source")
+		log.Error(err, "certificate has no CA data")
 		// don't requeue, we'll get called when the secret gets updated
 		return nil, nil
 	}
 
 	return caData, nil
-}
-
-func (c *certificateDataSource) ApplyTo(ctx context.Context, mgr ctrl.Manager, setup injectorSetup, controller controller.Controller, ca cache.Cache) error {
-	typ := setup.injector.NewTarget().AsObject()
-	if err := ca.IndexField(ctx, typ, injectFromPath, injectableCAFromIndexer); err != nil {
-		return err
-	}
-
-	if err := controller.Watch(source.NewKindWithCache(&cmapi.Certificate{}, ca),
-		handler.EnqueueRequestsFromMapFunc((&certMapper{
-			Client:       ca,
-			log:          ctrl.Log.WithName("cert-mapper"),
-			toInjectable: buildCertToInjectableFunc(setup.listType, setup.resourceName),
-		}).Map),
-	); err != nil {
-		return err
-	}
-	if err := controller.Watch(source.NewKindWithCache(&corev1.Secret{}, ca),
-		handler.EnqueueRequestsFromMapFunc((&secretForCertificateMapper{
-			Client:                  ca,
-			log:                     ctrl.Log.WithName("secret-for-certificate-mapper"),
-			certificateToInjectable: buildCertToInjectableFunc(setup.listType, setup.resourceName),
-		}).Map),
-	); err != nil {
-		return err
-	}
-	return nil
 }
 
 // secretDataSource reads a CA bundle from a Secret resource named using the
@@ -185,14 +174,30 @@ func (c *secretDataSource) Configured(log logr.Logger, metaObj metav1.Object) bo
 	return true
 }
 
-func (c *secretDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object) ([]byte, error) {
+func (c *secretDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj metav1.Object, namespace string, ignoreNamespaces sets.Set[string]) ([]byte, error) {
 	secretNameRaw := metaObj.GetAnnotations()[cmapi.WantInjectFromSecretAnnotation]
 	secretName := splitNamespacedName(secretNameRaw)
 	log = log.WithValues("secret", secretName)
 	if secretName.Namespace == "" {
-		log.Error(nil, "invalid certificate name")
+		err := errors.New("invalid annotation")
+		log.Error(err, "invalid secret source: missing namespace/ prefix")
+		// TODO: should we return error here to prevent the caller from proceeding?
 		// don't return an error, requeuing won't help till this is changed
 		return nil, nil
+	}
+
+	if ignoreNamespaces.Has(secretName.Namespace) {
+		err := fmt.Errorf("cannot read CA data from Secret in namespace %s, namespace is ignored", secretName.Namespace)
+		forbiddenErr := apierrors.NewForbidden(cmapi.Resource("certificates"), secretName.Name, err)
+		log.Error(forbiddenErr, "cannot read data source")
+		return nil, forbiddenErr
+	}
+
+	if namespace != "" && secretName.Namespace != namespace {
+		err := fmt.Errorf("cannot read CA data from Secret in namespace %s, cainjector is scoped to namespace %s", secretName.Namespace, namespace)
+		forbiddenErr := apierrors.NewForbidden(cmapi.Resource("certificates"), secretName.Name, err)
+		log.Error(forbiddenErr, "cannot read data source")
+		return nil, forbiddenErr
 	}
 
 	// grab the associated secret
@@ -211,27 +216,11 @@ func (c *secretDataSource) ReadCA(ctx context.Context, log logr.Logger, metaObj 
 	// inject the CA data
 	caData, hasCAData := secret.Data[cmmeta.TLSCAKey]
 	if !hasCAData {
-		log.Error(nil, "certificate has no CA data")
+		err := errors.New("invalid CA source")
+		log.Error(err, "secret contains no CA data")
 		// don't requeue, we'll get called when the secret gets updated
 		return nil, nil
 	}
 
 	return caData, nil
-}
-
-func (c *secretDataSource) ApplyTo(ctx context.Context, mgr ctrl.Manager, setup injectorSetup, controller controller.Controller, ca cache.Cache) error {
-	typ := setup.injector.NewTarget().AsObject()
-	if err := ca.IndexField(ctx, typ, injectFromSecretPath, injectableCAFromSecretIndexer); err != nil {
-		return err
-	}
-	if err := controller.Watch(source.NewKindWithCache(&corev1.Secret{}, ca),
-		handler.EnqueueRequestsFromMapFunc((&secretForInjectableMapper{
-			Client:             ca,
-			log:                ctrl.Log.WithName("secret-mapper"),
-			secretToInjectable: buildSecretToInjectableFunc(setup.listType, setup.resourceName),
-		}).Map),
-	); err != nil {
-		return err
-	}
-	return nil
 }

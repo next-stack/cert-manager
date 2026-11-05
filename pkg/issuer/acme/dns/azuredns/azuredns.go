@@ -12,17 +12,24 @@ package azuredns
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	dns "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/dns/armdns"
+	privatedns "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns/v2"
 	"github.com/go-logr/logr"
+	"k8s.io/utils/ptr"
 
-	"github.com/Azure/azure-sdk-for-go/services/dns/mgmt/2017-10-01/dns"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/adal"
-	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/to"
-
+	utiloptions "github.com/cert-manager/cert-manager/internal/options"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
@@ -31,152 +38,242 @@ import (
 // DNSProvider implements the util.ChallengeProvider interface
 type DNSProvider struct {
 	dns01Nameservers  []string
-	recordClient      dns.RecordSetsClient
-	zoneClient        dns.ZonesClient
+	recordClient      RecordsClient
+	zoneClient        ZonesClient
 	resourceGroupName string
 	zoneName          string
 	log               logr.Logger
+	zoneType          cmacme.AzureZoneType
+	resolver          util.Resolver
 }
 
-// NewDNSProviderCredentials returns a DNSProvider instance configured for the Azure
-// DNS service using static credentials from its parameters
-func NewDNSProviderCredentials(environment, clientID, clientSecret, subscriptionID, tenantID, resourceGroupName, zoneName string, dns01Nameservers []string, ambient bool, managedIdentity *cmacme.AzureManagedIdentity) (*DNSProvider, error) {
-	env := azure.PublicCloud
-	if environment != "" {
-		var err error
-		env, err = azure.EnvironmentFromName(environment)
-		if err != nil {
-			return nil, err
-		}
+// ProviderOption is a legacy option for NewDNSProviderCredentials
+type ProviderOption func(*DNSProvider)
+
+// WithAzureZone is a provider option for specifying the type of Azure DNS zone (public or private) to be used by the DNSProvider.
+func WithAzureZone(zone cmacme.AzureZoneType) ProviderOption {
+	return func(d *DNSProvider) {
+		d.zoneType = zone
+	}
+}
+
+// NewDNSProviderFromOptions constructs an ACME DNS provider for AzureDNS.
+//
+// All options are passed via the variadic options parameter.
+//
+// Required options:
+// - Nameservers
+// - Resolver
+// - One of: ClientID (with ClientSecret and TenantID) or Ambient=true
+//
+// ctx is not used by this provider; it is accepted to standardize the constructor signature across all providers.
+func NewDNSProviderFromOptions(_ context.Context, options ...DNSProviderOption) (*DNSProvider, error) {
+	var opt DNSProviderOptions
+	for _, o := range options {
+		o.ApplyToDNSProviderOptions(&opt)
 	}
 
-	spt, err := getAuthorization(env, clientID, clientSecret, subscriptionID, tenantID, ambient, managedIdentity)
+	err := errors.Join(
+		utiloptions.NotEmpty(&opt.Nameservers, "nameservers is required"),
+		utiloptions.Required(&opt.Resolver, "resolver is required"),
+	)
+
 	if err != nil {
 		return nil, err
 	}
 
-	rc := dns.NewRecordSetsClientWithBaseURI(env.ResourceManagerEndpoint, subscriptionID)
-	rc.Authorizer = autorest.NewBearerAuthorizer(spt)
+	cloudCfg, err := getCloudConfiguration(opt.Environment)
+	if err != nil {
+		return nil, err
+	}
 
-	zc := dns.NewZonesClientWithBaseURI(env.ResourceManagerEndpoint, subscriptionID)
-	zc.Authorizer = autorest.NewBearerAuthorizer(spt)
+	clientOpt := policy.ClientOptions{Cloud: cloudCfg}
+	cred, err := getAuthorization(clientOpt, opt.ClientID, opt.ClientSecret, opt.TenantID, ptr.Deref(opt.Ambient, false), opt.ManagedIdentity)
+	if err != nil {
+		return nil, err
+	}
 
-	return &DNSProvider{
-		dns01Nameservers:  dns01Nameservers,
-		recordClient:      rc,
-		zoneClient:        zc,
-		resourceGroupName: resourceGroupName,
-		zoneName:          zoneName,
+	provider := &DNSProvider{
+		dns01Nameservers:  opt.Nameservers,
+		resourceGroupName: opt.ResourceGroupName,
+		zoneName:          opt.ZoneName,
+		zoneType:          opt.ZoneType,
 		log:               logf.Log.WithName("azure-dns"),
-	}, nil
+		resolver:          opt.Resolver,
+	}
+
+	if provider.zoneType == cmacme.PrivateAzureZone {
+		rc, err := privatedns.NewRecordSetsClient(opt.SubscriptionID, cred, &arm.ClientOptions{ClientOptions: clientOpt})
+		if err != nil {
+			return nil, err
+		}
+		provider.recordClient = NewPrivateRecordsClient(rc)
+
+		zc, err := privatedns.NewPrivateZonesClient(opt.SubscriptionID, cred, &arm.ClientOptions{ClientOptions: clientOpt})
+		if err != nil {
+			return nil, err
+		}
+		provider.zoneClient = NewPrivateZonesClient(zc)
+	} else {
+		rc, err := dns.NewRecordSetsClient(opt.SubscriptionID, cred, &arm.ClientOptions{ClientOptions: clientOpt})
+		if err != nil {
+			return nil, err
+		}
+		provider.recordClient = NewPublicRecordsClient(rc)
+
+		zc, err := dns.NewZonesClient(opt.SubscriptionID, cred, &arm.ClientOptions{ClientOptions: clientOpt})
+		if err != nil {
+			return nil, err
+		}
+		provider.zoneClient = NewPublicZonesClient(zc)
+	}
+
+	return provider, nil
 }
 
-func getAuthorization(env azure.Environment, clientID, clientSecret, subscriptionID, tenantID string, ambient bool, managedIdentity *cmacme.AzureManagedIdentity) (*adal.ServicePrincipalToken, error) {
+// NewDNSProviderCredentials returns a DNSProvider instance configured for the Azure
+// DNS service using static credentials from its parameters
+//
+// Deprecated: Use NewDNSProviderFromOptions
+func NewDNSProviderCredentials(environment, clientID, clientSecret, subscriptionID, tenantID, resourceGroupName, zoneName string, dns01Nameservers []string, ambient bool, managedIdentity *cmacme.AzureManagedIdentity, opts ...ProviderOption) (*DNSProvider, error) {
+	// Apply any legacy ProviderOptions to extract the zoneType they may have set;
+	// the resulting DNSProvider is otherwise unused.
+	var p DNSProvider
+	for _, opt := range opts {
+		opt(&p)
+	}
+
+	// Delegate to NewDNSProviderFromOptions
+	return NewDNSProviderFromOptions(context.Background(),
+		Environment(environment),
+		ClientID(clientID),
+		ClientSecret(clientSecret),
+		SubscriptionID(subscriptionID),
+		TenantID(tenantID),
+		ResourceGroupName(resourceGroupName),
+		ZoneName(zoneName),
+		Nameservers(dns01Nameservers),
+		Ambient(ambient),
+		ManagedIdentity(managedIdentity),
+		ZoneType(p.zoneType),
+		Resolver(util.LegacyCachedResolver()),
+	)
+}
+
+func getCloudConfiguration(name string) (cloud.Configuration, error) {
+	switch strings.ToUpper(name) {
+	case "AZURECLOUD", "AZUREPUBLICCLOUD", "":
+		return cloud.AzurePublic, nil
+	case "AZUREUSGOVERNMENT", "AZUREUSGOVERNMENTCLOUD":
+		return cloud.AzureGovernment, nil
+	case "AZURECHINACLOUD":
+		return cloud.AzureChina, nil
+	}
+	return cloud.Configuration{}, fmt.Errorf("unknown cloud configuration name: %s", name)
+}
+
+func getAuthorization(clientOpt policy.ClientOptions, clientID, clientSecret, tenantID string, ambient bool, managedIdentity *cmacme.AzureManagedIdentity) (azcore.TokenCredential, error) {
 	if clientID != "" {
 		logf.Log.V(logf.InfoLevel).Info("azuredns authenticating with clientID and secret key")
-		oauthConfig, err := adal.NewOAuthConfig(env.ActiveDirectoryEndpoint, tenantID)
+		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, &azidentity.ClientSecretCredentialOptions{ClientOptions: clientOpt})
 		if err != nil {
 			return nil, err
 		}
-		spt, err := adal.NewServicePrincipalToken(*oauthConfig, clientID, clientSecret, env.ResourceManagerEndpoint)
-		if err != nil {
-			return nil, err
-		}
-		return spt, nil
+		return cred, nil
 	}
-	logf.Log.V(logf.InfoLevel).Info("No ClientID found:  authenticating azuredns with managed identity (MSI)")
+
+	logf.Log.V(logf.InfoLevel).Info("No ClientID found: attempting to authenticate with ambient credentials (Azure Workload Identity or Azure Managed Service Identity, in that order)")
 	if !ambient {
-		return nil, fmt.Errorf("ClientID is not set but neither `--cluster-issuer-ambient-credentials` nor `--issuer-ambient-credentials` are set. These are necessary to enable Azure Managed Identities")
+		return nil, fmt.Errorf("ClientID was omitted without providing one of `--cluster-issuer-ambient-credentials` or `--issuer-ambient-credentials`. These are necessary to enable Azure Managed Identities")
 	}
 
-	opt := adal.ManagedIdentityOptions{}
+	// Use Workload Identity if present
+	if os.Getenv("AZURE_FEDERATED_TOKEN_FILE") != "" {
+		wcOpt := &azidentity.WorkloadIdentityCredentialOptions{
+			ClientOptions: clientOpt,
+		}
+		if managedIdentity != nil {
+			if managedIdentity.ClientID != "" {
+				wcOpt.ClientID = managedIdentity.ClientID
+			}
+			if managedIdentity.TenantID != "" {
+				wcOpt.TenantID = managedIdentity.TenantID
+			}
+		}
 
+		return azidentity.NewWorkloadIdentityCredential(wcOpt)
+	}
+
+	logf.Log.V(logf.InfoLevel).Info("No Azure Workload Identity found: attempting to authenticate with an Azure Managed Service Identity (MSI)")
+
+	msiOpt := &azidentity.ManagedIdentityCredentialOptions{ClientOptions: clientOpt}
 	if managedIdentity != nil {
-		opt.ClientID = managedIdentity.ClientID
-		opt.IdentityResourceID = managedIdentity.ResourceID
+		if managedIdentity.ClientID != "" {
+			msiOpt.ID = azidentity.ClientID(managedIdentity.ClientID)
+		}
+		if managedIdentity.ResourceID != "" {
+			msiOpt.ID = azidentity.ResourceID(managedIdentity.ResourceID)
+		}
 	}
 
-	spt, err := adal.NewServicePrincipalTokenFromManagedIdentity(env.ServiceManagementEndpoint, &opt)
+	cred, err := azidentity.NewManagedIdentityCredential(msiOpt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create the managed service identity token: %v", err)
+		return nil, fmt.Errorf("failed to create the managed service identity token: %w", err)
 	}
-	return spt, nil
+	return cred, nil
 }
 
 // Present creates a TXT record using the specified parameters
-func (c *DNSProvider) Present(domain, fqdn, value string) error {
-	return c.createRecord(fqdn, value, 60)
+func (c *DNSProvider) Present(ctx context.Context, domain, fqdn, value string) error {
+	return c.updateTXTRecord(ctx, fqdn, func(set RecordSet) {
+		var found bool
+		txtRecords := set.GetTXTRecords()
+		for _, r := range txtRecords {
+			if len(r) > 0 && *r[0] == value {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			txtRecords = append(txtRecords, []*string{
+				new(value),
+			})
+			set.SetTXTRecords(txtRecords)
+		}
+	})
 }
 
 // CleanUp removes the TXT record matching the specified parameters
-func (c *DNSProvider) CleanUp(domain, fqdn, value string) error {
-	z, err := c.getHostedZoneName(fqdn)
-	if err != nil {
-		c.log.Error(err, "Error getting hosted zone name for:", fqdn)
-		return err
-	}
+func (c *DNSProvider) CleanUp(ctx context.Context, domain, fqdn, value string) error {
+	return c.updateTXTRecord(ctx, fqdn, func(set RecordSet) {
+		txtRecords := set.GetTXTRecords()
+		records := make([][]*string, 0, len(txtRecords))
+		for _, r := range txtRecords {
+			if len(r) > 0 && *r[0] != value {
+				records = append(records, r)
+			}
+		}
 
-	_, err = c.recordClient.Delete(
-		context.TODO(),
-		c.resourceGroupName,
-		z,
-		c.trimFqdn(fqdn, z),
-		dns.TXT, "")
-
-	if err != nil {
-		return err
-	}
-	return nil
+		set.SetTXTRecords(records)
+	})
 }
 
-func (c *DNSProvider) createRecord(fqdn, value string, ttl int) error {
-	rparams := &dns.RecordSet{
-		RecordSetProperties: &dns.RecordSetProperties{
-			TTL: to.Int64Ptr(int64(ttl)),
-			TxtRecords: &[]dns.TxtRecord{
-				{Value: &[]string{value}},
-			},
-		},
-	}
-
-	z, err := c.getHostedZoneName(fqdn)
-	if err != nil {
-		c.log.Error(err, "Error getting hosted zone name for:", fqdn)
-		return err
-	}
-
-	_, err = c.recordClient.CreateOrUpdate(
-		context.TODO(),
-		c.resourceGroupName,
-		z,
-		c.trimFqdn(fqdn, z),
-		dns.TXT,
-		*rparams, "", "")
-
-	if err != nil {
-		c.log.Error(err, "Error creating TXT:", z)
-		return err
-	}
-	return nil
-}
-
-func (c *DNSProvider) getHostedZoneName(fqdn string) (string, error) {
+func (c *DNSProvider) getHostedZoneName(ctx context.Context, fqdn string) (string, error) {
 	if c.zoneName != "" {
 		return c.zoneName, nil
 	}
-	z, err := util.FindZoneByFqdn(fqdn, c.dns01Nameservers)
+	z, err := c.resolver.FindZoneByFQDN(ctx, fqdn, c.dns01Nameservers)
 	if err != nil {
 		return "", err
 	}
-
 	if len(z) == 0 {
 		return "", fmt.Errorf("Zone %s not found for domain %s", z, fqdn)
 	}
 
-	_, err = c.zoneClient.Get(context.TODO(), c.resourceGroupName, util.UnFqdn(z))
-
-	if err != nil {
-		return "", fmt.Errorf("Zone %s not found in AzureDNS for domain %s. Err: %v", z, fqdn, err)
+	if err := c.zoneClient.Get(ctx, c.resourceGroupName, util.UnFqdn(z), nil); err != nil {
+		c.log.Error(err, "Error getting Zone for domain", "zone", z, "domain", fqdn, "resource group", c.resourceGroupName)
+		return "", fmt.Errorf("Zone %s not found in AzureDNS for domain %s. Err: %w", z, fqdn, err)
 	}
 
 	return util.UnFqdn(z), nil
@@ -189,4 +286,88 @@ func (c *DNSProvider) trimFqdn(fqdn string, zone string) string {
 		z = c.zoneName
 	}
 	return strings.TrimSuffix(strings.TrimSuffix(fqdn, "."), "."+z)
+}
+
+// Updates or removes DNS TXT record while respecting optimistic concurrency control
+func (c *DNSProvider) updateTXTRecord(ctx context.Context, fqdn string, updater func(RecordSet)) error {
+	zone, err := c.getHostedZoneName(ctx, fqdn)
+	if err != nil {
+		return err
+	}
+
+	name := c.trimFqdn(fqdn, zone)
+
+	var set RecordSet
+
+	resp, err := c.recordClient.Get(ctx, c.resourceGroupName, zone, name, nil)
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr); respErr != nil && respErr.StatusCode == http.StatusNotFound {
+			// Conditional initialization to avoid nil pointer
+			if c.zoneType == cmacme.PrivateAzureZone {
+				set = &PrivateTXTRecordSet{
+					RS: &privatedns.RecordSet{
+						Properties: &privatedns.RecordSetProperties{
+							TTL:        to.Ptr[int64](60),
+							TxtRecords: []*privatedns.TxtRecord{},
+						},
+						Etag: new(""),
+					},
+				}
+			} else {
+				set = &PublicTXTRecordSet{
+					RS: &dns.RecordSet{
+						Properties: &dns.RecordSetProperties{
+							TTL:        to.Ptr[int64](60),
+							TxtRecords: []*dns.TxtRecord{},
+						},
+						Etag: new(""),
+					},
+				}
+			}
+		} else {
+			c.log.Error(err, "Error reading TXT", "zone", zone, "domain", fqdn, "resource group", c.resourceGroupName)
+			return err
+		}
+	} else {
+		set = resp
+	}
+
+	updater(set)
+
+	if len(set.GetTXTRecords()) == 0 {
+		if etag := set.GetETag(); etag != nil && *etag != "" {
+			// Etag will cause the deletion to fail if any updates happen concurrently
+			err = c.recordClient.Delete(ctx, c.resourceGroupName, zone, name, &ClientOptions{IfMatch: set.GetETag()})
+			if err != nil {
+				c.log.Error(err, "Error deleting TXT", "zone", zone, "domain", fqdn, "resource group", c.resourceGroupName)
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	opts := &ClientOptions{}
+	if etag := set.GetETag(); etag != nil && *etag == "" {
+		// This is used to indicate that we want the API call to fail if a conflicting record was created concurrently
+		// Only relevant when this is a new record, for updates conflicts are solved with Etag
+		opts.IfNoneMatch = new("*")
+	} else {
+		opts.IfMatch = set.GetETag()
+	}
+
+	_, err = c.recordClient.CreateOrUpdate(
+		ctx,
+		c.resourceGroupName,
+		zone,
+		name,
+		set,
+		opts)
+	if err != nil {
+		c.log.Error(err, "Error upserting TXT", "zone", zone, "domain", fqdn, "resource group", c.resourceGroupName)
+		return err
+	}
+
+	return nil
 }

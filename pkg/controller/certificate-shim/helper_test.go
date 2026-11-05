@@ -18,14 +18,18 @@ package shimhelper
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmutil "github.com/cert-manager/cert-manager/pkg/util"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
 
@@ -40,11 +44,20 @@ func Test_translateAnnotations(t *testing.T) {
 
 	validAnnotations := func() map[string]string {
 		return map[string]string{
-			cmapi.CommonNameAnnotationKey:           "www.example.com",
-			cmapi.DurationAnnotationKey:             "168h", // 1 week
-			cmapi.RenewBeforeAnnotationKey:          "24h",
-			cmapi.UsagesAnnotationKey:               "server auth,signing",
-			cmapi.RevisionHistoryLimitAnnotationKey: "7",
+			cmapi.CommonNameAnnotationKey:                 "www.example.com",
+			cmapi.DurationAnnotationKey:                   "168h", // 1 week
+			cmapi.RenewBeforeAnnotationKey:                "24h",
+			cmapi.UsagesAnnotationKey:                     "server auth,signing",
+			cmapi.RevisionHistoryLimitAnnotationKey:       "7",
+			cmapi.EmailsAnnotationKey:                     "test@example.com",
+			cmapi.SubjectOrganizationsAnnotationKey:       "Test Organization",
+			cmapi.SubjectOrganizationalUnitsAnnotationKey: "Test Organizational Unit",
+			cmapi.SubjectCountriesAnnotationKey:           "Country",
+			cmapi.SubjectProvincesAnnotationKey:           "Province",
+			cmapi.SubjectLocalitiesAnnotationKey:          "City",
+			cmapi.SubjectStreetAddressesAnnotationKey:     `"1725 Slough Avenue, Suite 200, Scranton Business Park","1800 Slough Avenue, Suite 200, Scranton Business Park"`,
+			cmapi.SubjectPostalCodesAnnotationKey:         "ABC123",
+			cmapi.SubjectSerialNumberAnnotationKey:        "123456",
 		}
 	}
 
@@ -57,7 +70,39 @@ func Test_translateAnnotations(t *testing.T) {
 				a.Equal(&metav1.Duration{Duration: time.Hour * 24 * 7}, crt.Spec.Duration)
 				a.Equal(&metav1.Duration{Duration: time.Hour * 24}, crt.Spec.RenewBefore)
 				a.Equal([]cmapi.KeyUsage{cmapi.UsageServerAuth, cmapi.UsageSigning}, crt.Spec.Usages)
-				a.Equal(pointer.Int32(7), crt.Spec.RevisionHistoryLimit)
+				a.Equal(new(int32(7)), crt.Spec.RevisionHistoryLimit)
+				a.Equal("123456", crt.Spec.Subject.SerialNumber)
+
+				splitAddresses, splitErr := cmutil.SplitWithEscapeCSV(`"1725 Slough Avenue, Suite 200, Scranton Business Park","1800 Slough Avenue, Suite 200, Scranton Business Park"`)
+				a.Equal(nil, splitErr)
+				a.Equal(splitAddresses, crt.Spec.Subject.StreetAddresses)
+
+				joinedAddresses, joinErr := cmutil.JoinWithEscapeCSV(crt.Spec.Subject.StreetAddresses)
+				a.Equal(nil, joinErr)
+				a.Equal(`"1725 Slough Avenue, Suite 200, Scranton Business Park","1800 Slough Avenue, Suite 200, Scranton Business Park"`, joinedAddresses)
+			},
+		},
+		"success renew before pct": {
+			crt: gen.Certificate("example-cert"),
+			annotations: map[string]string{
+				cmapi.CommonNameAnnotationKey:               "www.example.com",
+				cmapi.DurationAnnotationKey:                 "168h", // 1 week
+				cmapi.RenewBeforePercentageAnnotationKey:    "50",
+				cmapi.UsagesAnnotationKey:                   "server auth,signing",
+				cmapi.PrivateKeyAlgorithmAnnotationKey:      "RSA",
+				cmapi.PrivateKeyEncodingAnnotationKey:       "PKCS1",
+				cmapi.PrivateKeySizeAnnotationKey:           "2048",
+				cmapi.PrivateKeyRotationPolicyAnnotationKey: "Always",
+			},
+			check: func(a *assert.Assertions, crt *cmapi.Certificate) {
+				a.Equal("www.example.com", crt.Spec.CommonName)
+				a.Equal(&metav1.Duration{Duration: time.Hour * 24 * 7}, crt.Spec.Duration)
+				a.Equal(new(int32(50)), crt.Spec.RenewBeforePercentage)
+				a.Equal([]cmapi.KeyUsage{cmapi.UsageServerAuth, cmapi.UsageSigning}, crt.Spec.Usages)
+				a.Equal(cmapi.RSAKeyAlgorithm, crt.Spec.PrivateKey.Algorithm)
+				a.Equal(cmapi.PKCS1, crt.Spec.PrivateKey.Encoding)
+				a.Equal(2048, crt.Spec.PrivateKey.Size)
+				a.Equal(cmapi.RotationPolicyAlways, crt.Spec.PrivateKey.RotationPolicy)
 			},
 		},
 		"success rsa private key algorithm": {
@@ -156,6 +201,14 @@ func Test_translateAnnotations(t *testing.T) {
 			},
 			expectedError: errInvalidIngressAnnotation,
 		},
+		"bad renewBeforePercentage": {
+			crt:         gen.Certificate("example-cert"),
+			annotations: validAnnotations(),
+			mutate: func(tc *testCase) {
+				tc.annotations[cmapi.RenewBeforePercentageAnnotationKey] = "an un-parsable integer"
+			},
+			expectedError: errInvalidIngressAnnotation,
+		},
 		"bad usages": {
 			crt:         gen.Certificate("example-cert"),
 			annotations: validAnnotations(),
@@ -246,6 +299,14 @@ func Test_translateAnnotations(t *testing.T) {
 			},
 			expectedError: errInvalidIngressAnnotation,
 		},
+		"bad street addresses": {
+			crt:         gen.Certificate("example-cert"),
+			annotations: validAnnotations(),
+			mutate: func(tc *testCase) {
+				tc.annotations[cmapi.SubjectStreetAddressesAnnotationKey] = "invalid csv\","
+			},
+			expectedError: errInvalidIngressAnnotation,
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -268,10 +329,148 @@ func Test_translateAnnotations(t *testing.T) {
 	}
 }
 
+func Test_translateAnnotations_MLDSA(t *testing.T) {
+	tests := map[string]struct {
+		annotations    map[string]string
+		featureEnabled bool
+		check          func(*assert.Assertions, *cmapi.Certificate)
+		expectedError  error
+	}{
+		"ML-DSA with defaulted size and usages": {
+			annotations: map[string]string{
+				cmapi.PrivateKeyAlgorithmAnnotationKey: "MLDSA",
+			},
+			featureEnabled: true,
+			check: func(a *assert.Assertions, crt *cmapi.Certificate) {
+				a.Equal(cmapi.MLDSAKeyAlgorithm, crt.Spec.PrivateKey.Algorithm)
+				a.Equal(0, crt.Spec.PrivateKey.Size)
+				a.Equal([]cmapi.KeyUsage{cmapi.UsageDigitalSignature}, crt.Spec.Usages)
+			},
+		},
+		"ML-DSA with size and allowed usages": {
+			annotations: map[string]string{
+				cmapi.PrivateKeyAlgorithmAnnotationKey: "MLDSA",
+				cmapi.PrivateKeySizeAnnotationKey:      "87",
+				cmapi.UsagesAnnotationKey:              "digital signature,server auth",
+			},
+			featureEnabled: true,
+			check: func(a *assert.Assertions, crt *cmapi.Certificate) {
+				a.Equal(cmapi.MLDSAKeyAlgorithm, crt.Spec.PrivateKey.Algorithm)
+				a.Equal(87, crt.Spec.PrivateKey.Size)
+				a.Equal([]cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageServerAuth}, crt.Spec.Usages)
+			},
+		},
+		"ML-DSA with feature gate disabled": {
+			annotations: map[string]string{
+				cmapi.PrivateKeyAlgorithmAnnotationKey: "MLDSA",
+			},
+			expectedError: errInvalidIngressAnnotation,
+		},
+		"ML-DSA with unsupported size": {
+			annotations: map[string]string{
+				cmapi.PrivateKeyAlgorithmAnnotationKey: "MLDSA",
+				cmapi.PrivateKeySizeAnnotationKey:      "256",
+			},
+			featureEnabled: true,
+			expectedError:  errInvalidIngressAnnotation,
+		},
+		"ML-DSA with forbidden usages": {
+			annotations: map[string]string{
+				cmapi.PrivateKeyAlgorithmAnnotationKey: "MLDSA",
+				cmapi.UsagesAnnotationKey:              "digital signature,key encipherment",
+			},
+			featureEnabled: true,
+			expectedError:  errInvalidIngressAnnotation,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.MLDSAPrivateKeys, tc.featureEnabled)
+			crt := gen.Certificate("example-cert", gen.SetCertificateKeyUsages(cmapi.DefaultKeyUsages()...))
+
+			err := translateAnnotations(crt, tc.annotations)
+
+			if tc.expectedError != nil {
+				assertErrorIs(t, err, tc.expectedError)
+			} else {
+				assert.NoError(t, err)
+			}
+			if tc.check != nil {
+				tc.check(assert.New(t), crt)
+			}
+		})
+	}
+}
+
 // assertErrorIs checks that the supplied error has the target error in its chain.
 // TODO Upgrade to next release of testify package which has this built in.
 func assertErrorIs(t *testing.T, err, target error) {
 	if assert.Error(t, err) {
 		assert.Truef(t, errors.Is(err, target), "unexpected error type. err: %v, target: %v", err, target)
+	}
+}
+
+// Test_translateAnnotations_invalidAnnotationValues is a regression test for
+// cert-manager/cert-manager#9145: translateAnnotations copied several annotation
+// values into the Certificate spec without validating them, so admission
+// validation rejected the resulting Certificate and the Ingress author got no
+// certificate and only an opaque controller error. The shim must reject these
+// at sync time with errInvalidIngressAnnotation, naming the offending annotation.
+func Test_translateAnnotations_invalidAnnotationValues(t *testing.T) {
+	tests := map[string]struct {
+		annotations   map[string]string
+		expectedError error
+	}{
+		"ip-sans not an IP": {
+			annotations:   map[string]string{cmapi.IPSANAnnotationKey: "2160h"},
+			expectedError: errInvalidIngressAnnotation,
+		},
+		"email-sans not an email": {
+			annotations:   map[string]string{cmapi.EmailsAnnotationKey: "2160h"},
+			expectedError: errInvalidIngressAnnotation,
+		},
+		"email-sans display-name form rejected": {
+			annotations:   map[string]string{cmapi.EmailsAnnotationKey: "Name <test@example.com>"},
+			expectedError: errInvalidIngressAnnotation,
+		},
+		"duration too small": {
+			annotations:   map[string]string{cmapi.DurationAnnotationKey: "-5s"},
+			expectedError: errInvalidIngressAnnotation,
+		},
+		"renew-before too small": {
+			annotations:   map[string]string{cmapi.RenewBeforeAnnotationKey: "-5s"},
+			expectedError: errInvalidIngressAnnotation,
+		},
+		"common-name too long": {
+			annotations:   map[string]string{cmapi.CommonNameAnnotationKey: strings.Repeat("a", 65)},
+			expectedError: errInvalidIngressAnnotation,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			crt := gen.Certificate("example-cert")
+			err := translateAnnotations(crt, tc.annotations)
+			assertErrorIs(t, err, tc.expectedError)
+		})
+	}
+}
+
+// Test_translateAnnotations_validAnnotationValuesWithWhitespace ensures that,
+// when a valid annotation value contains surrounding whitespace, the shim
+// trims it before storing so the resulting Certificate passes admission
+// validation (regression for cert-manager/cert-manager#9145).
+func Test_translateAnnotations_validAnnotationValuesWithWhitespace(t *testing.T) {
+	crt := gen.Certificate("example-cert")
+	annotations := map[string]string{
+		cmapi.IPSANAnnotationKey:       "1.2.3.4, 5.6.7.8",
+		cmapi.EmailsAnnotationKey:      "test@example.com, admin@example.com",
+		cmapi.DurationAnnotationKey:    "2160h",
+		cmapi.RenewBeforeAnnotationKey: "5m",
+	}
+	err := translateAnnotations(crt, annotations)
+	if assert.NoError(t, err) {
+		assert.Equal(t, []string{"1.2.3.4", "5.6.7.8"}, crt.Spec.IPAddresses)
+		assert.Equal(t, []string{"test@example.com", "admin@example.com"}, crt.Spec.EmailAddresses)
 	}
 }

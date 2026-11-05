@@ -17,9 +17,7 @@ limitations under the License.
 package acme
 
 import (
-	"context"
 	"crypto/x509"
-	"reflect"
 	"testing"
 	"time"
 
@@ -31,10 +29,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	coretesting "k8s.io/client-go/testing"
 	fakeclock "k8s.io/utils/clock/testing"
 
+	"github.com/cert-manager/cert-manager/internal/test/testutil"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	"github.com/cert-manager/cert-manager/pkg/apis/certmanager"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -66,19 +66,19 @@ func Test_controllerBuilder(t *testing.T) {
 		existingCSR       runtime.Object
 		existingCMObjects []runtime.Object
 		givenCall         func(*testing.T, cmclient.Interface, kubernetes.Interface)
-		expectRequeueKey  string
+		expectRequeueKey  types.NamespacedName
 	}{
 		"if no request then no request should sync": {
 			existingCSR:       nil,
 			existingCMObjects: []runtime.Object{baseOrder},
 			givenCall:         func(t *testing.T, _ cmclient.Interface, _ kubernetes.Interface) {},
-			expectRequeueKey:  "",
+			expectRequeueKey:  types.NamespacedName{},
 		},
 		"if no changes to request or order, then no request should sync": {
 			existingCSR:       baseCSR,
 			existingCMObjects: []runtime.Object{baseOrder},
 			givenCall:         func(t *testing.T, _ cmclient.Interface, _ kubernetes.Interface) {},
-			expectRequeueKey:  "",
+			expectRequeueKey:  types.NamespacedName{},
 		},
 		"request should be synced if an owned order is updated": {
 			existingCSR: baseCSR,
@@ -92,10 +92,12 @@ func Test_controllerBuilder(t *testing.T) {
 					gen.SetOrderOwnerReference(*metav1.NewControllerRef(baseCSR, certificatesigningrequestGVK)),
 					gen.SetOrderURL("update"),
 				)
-				_, err := cmclient.AcmeV1().Orders("test-namespace").Update(context.TODO(), order, metav1.UpdateOptions{})
+				_, err := cmclient.AcmeV1().Orders("test-namespace").Update(t.Context(), order, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "test-csr",
+			expectRequeueKey: types.NamespacedName{
+				Name: "test-csr",
+			},
 		},
 		"request should not be synced if updated order is not owned": {
 			existingCSR: baseCSR,
@@ -106,10 +108,10 @@ func Test_controllerBuilder(t *testing.T) {
 				order := gen.OrderFrom(baseOrder,
 					gen.SetOrderURL("update"),
 				)
-				_, err := cmclient.AcmeV1().Orders("test-namespace").Update(context.TODO(), order, metav1.UpdateOptions{})
+				_, err := cmclient.AcmeV1().Orders("test-namespace").Update(t.Context(), order, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "",
+			expectRequeueKey: types.NamespacedName{},
 		},
 		"request should be synced if request is updated": {
 			existingCSR:       baseCSR,
@@ -118,10 +120,12 @@ func Test_controllerBuilder(t *testing.T) {
 				csr := gen.CertificateSigningRequestFrom(baseCSR,
 					gen.SetCertificateSigningRequestCertificate([]byte("update")),
 				)
-				_, err := kubeclient.CertificatesV1().CertificateSigningRequests().UpdateStatus(context.TODO(), csr, metav1.UpdateOptions{})
+				_, err := kubeclient.CertificatesV1().CertificateSigningRequests().UpdateStatus(t.Context(), csr, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "test-csr",
+			expectRequeueKey: types.NamespacedName{
+				Name: "test-csr",
+			},
 		},
 	}
 
@@ -158,7 +162,7 @@ func Test_controllerBuilder(t *testing.T) {
 			// to be nil.
 			time.AfterFunc(50*time.Millisecond, queue.ShutDown)
 
-			var gotKeys []string
+			var gotKeys []types.NamespacedName
 			for {
 				// Get blocks until either (1) a key is returned, or (2) the
 				// queue is shut down.
@@ -166,13 +170,13 @@ func Test_controllerBuilder(t *testing.T) {
 				if done {
 					break
 				}
-				gotKeys = append(gotKeys, gotKey.(string))
+				gotKeys = append(gotKeys, gotKey)
 			}
 			assert.Equal(t, 0, queue.Len(), "queue should be empty")
 
 			// We only expect 0 or 1 keys received in the queue.
-			if test.expectRequeueKey != "" {
-				assert.Equal(t, []string{test.expectRequeueKey}, gotKeys)
+			if test.expectRequeueKey != (types.NamespacedName{}) {
+				assert.Equal(t, []types.NamespacedName{test.expectRequeueKey}, gotKeys)
 			} else {
 				assert.Nil(t, gotKeys)
 			}
@@ -225,7 +229,7 @@ func Test_ProcessItem(t *testing.T) {
 		}),
 	)
 
-	tmpl, err := pki.GenerateTemplateFromCertificateSigningRequest(baseCSR)
+	tmpl, err := pki.CertificateTemplateFromCertificateSigningRequest(baseCSR)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +238,7 @@ func Test_ProcessItem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tmpl, err = pki.GenerateTemplateFromCertificateSigningRequest(gen.CertificateSigningRequestFrom(baseCSR,
+	tmpl, err = pki.CertificateTemplateFromCertificateSigningRequest(gen.CertificateSigningRequestFrom(baseCSR,
 		gen.SetCertificateSigningRequestRequest(csrPEMExampleNotPresent),
 	))
 	if err != nil {
@@ -288,7 +292,7 @@ func Test_ProcessItem(t *testing.T) {
 			builder: &testpkg.Builder{
 				CertManagerObjects: []runtime.Object{baseIssuer.DeepCopy()},
 				ExpectedEvents: []string{
-					"Warning RequestParsingError Failed to decode CSR in spec.request: error decoding certificate request PEM block",
+					"Warning RequestParsingError Failed to decode CSR in spec.request: error decoding certificate request PEM block: no PEM data was found in given input",
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewCreateAction(
@@ -328,7 +332,7 @@ func Test_ProcessItem(t *testing.T) {
 								Type:               certificatesv1.CertificateFailed,
 								Status:             corev1.ConditionTrue,
 								Reason:             "RequestParsingError",
-								Message:            "Failed to decode CSR in spec.request: error decoding certificate request PEM block",
+								Message:            "Failed to decode CSR in spec.request: error decoding certificate request PEM block: no PEM data was found in given input",
 								LastTransitionTime: metaFixedClockStart,
 								LastUpdateTime:     metaFixedClockStart,
 							}),
@@ -499,10 +503,11 @@ func Test_ProcessItem(t *testing.T) {
 							},
 						},
 					)),
-					testpkg.NewAction(coretesting.NewCreateAction(
+					testpkg.NewAction(coretesting.NewCreateActionWithOptions(
 						cmacme.SchemeGroupVersion.WithResource("orders"),
 						gen.DefaultTestNamespace,
 						baseOrder,
+						metav1.CreateOptions{FieldManager: testpkg.FieldManager},
 					)),
 				},
 			},
@@ -738,7 +743,7 @@ func Test_ProcessItem(t *testing.T) {
 					),
 				},
 				ExpectedEvents: []string{
-					"Warning OrderBadCertificate Deleting Order with bad certificate: error decoding certificate PEM block",
+					"Warning OrderBadCertificate Deleting Order with bad certificate: error decoding certificate PEM block: no valid certificates found",
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewCreateAction(
@@ -916,11 +921,15 @@ func Test_ProcessItem(t *testing.T) {
 			defer test.builder.Stop()
 
 			controller := controllerBuilder()
-			controller.Register(test.builder.Context)
+			if _, _, err := controller.Register(test.builder.Context); err != nil {
+				t.Fatal(err)
+			}
 
 			test.builder.Start()
 
-			err := controller.ProcessItem(context.Background(), test.csr.Name)
+			err := controller.ProcessItem(t.Context(), types.NamespacedName{
+				Name: test.csr.Name,
+			})
 			if (err != nil) != test.expectedErr {
 				t.Errorf("unexpected error, exp=%t got=%v", test.expectedErr, err)
 			}
@@ -963,7 +972,7 @@ func Test_buildOrder(t *testing.T) {
 					Request:    csrPEM,
 					CommonName: "example.com",
 					DNSNames:   []string{"example.com"},
-					IssuerRef: cmmeta.ObjectReference{
+					IssuerRef: cmmeta.IssuerReference{
 						Name:  "test-name",
 						Kind:  "Issuer",
 						Group: "cert-manager.io",
@@ -980,7 +989,7 @@ func Test_buildOrder(t *testing.T) {
 					CommonName: "example.com",
 					DNSNames:   []string{"example.com"},
 					Duration:   &metav1.Duration{Duration: time.Hour},
-					IssuerRef: cmmeta.ObjectReference{
+					IssuerRef: cmmeta.IssuerReference{
 						Name:  "test-name",
 						Kind:  "Issuer",
 						Group: "cert-manager.io",
@@ -1008,9 +1017,7 @@ func Test_buildOrder(t *testing.T) {
 			}
 
 			// for the current purpose we only test the spec
-			if !reflect.DeepEqual(got.Spec, test.want.Spec) {
-				t.Errorf("buildOrder() got = %v, want %v", got.Spec, test.want.Spec)
-			}
+			testutil.AssertEqual(t, test.want.Spec, got.Spec)
 		})
 	}
 

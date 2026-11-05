@@ -17,17 +17,16 @@ limitations under the License.
 package approver
 
 import (
-	"context"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	coretesting "k8s.io/client-go/testing"
 	fakeclock "k8s.io/utils/clock/testing"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 )
 
@@ -39,7 +38,7 @@ func TestProcessItem(t *testing.T) {
 		// key that should be passed to ProcessItem.
 		// if not set, the 'namespace/name' of the 'CertificateRequest' field will be used.
 		// if neither is set, the key will be ""
-		key string
+		key types.NamespacedName
 
 		// CertificateRequest to be synced for the test.
 		// if not set, the 'key' will be passed to ProcessItem instead.
@@ -59,14 +58,21 @@ func TestProcessItem(t *testing.T) {
 	}{
 		"do nothing if an empty 'key' is used": {},
 		"do nothing if an invalid 'key' is used": {
-			key: "abc/def/ghi",
+			key: types.NamespacedName{
+				Namespace: "abc",
+				Name:      "def/ghi",
+			},
 		},
 		"do nothing if a key references a Certificate that does not exist": {
-			key: "namespace/name",
+			key: types.NamespacedName{
+				Namespace: "namespace",
+				Name:      "name",
+			},
 		},
 		"do nothing if CertificateRequest already has 'Approved' True condition": {
 			request: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "test"},
+				Namespace: "testns",
+				Name:      "test",
 				Status: cmapi.CertificateRequestStatus{
 					Conditions: []cmapi.CertificateRequestCondition{
 						{
@@ -79,7 +85,8 @@ func TestProcessItem(t *testing.T) {
 		},
 		"do nothing if CertificateRequest already has 'Denied' True condition": {
 			request: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "test"},
+				Namespace: "testns",
+				Name:      "test",
 				Status: cmapi.CertificateRequestStatus{
 					Conditions: []cmapi.CertificateRequestCondition{
 						{
@@ -92,7 +99,8 @@ func TestProcessItem(t *testing.T) {
 		},
 		"do nothing if CertificateRequest already has 'Ready' Failed condition": {
 			request: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "test"},
+				Namespace: "testns",
+				Name:      "test",
 				Status: cmapi.CertificateRequestStatus{
 					Conditions: []cmapi.CertificateRequestCondition{
 						{
@@ -106,7 +114,8 @@ func TestProcessItem(t *testing.T) {
 		},
 		"do nothing if CertificateRequest already has 'Ready' Issued condition": {
 			request: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "test"},
+				Namespace: "testns",
+				Name:      "test",
 				Status: cmapi.CertificateRequestStatus{
 					Conditions: []cmapi.CertificateRequestCondition{
 						{
@@ -120,7 +129,8 @@ func TestProcessItem(t *testing.T) {
 		},
 		"approve CertificateRequest if no condition": {
 			request: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "test"},
+				Namespace: "testns",
+				Name:      "test",
 				Status: cmapi.CertificateRequestStatus{
 					Conditions: []cmapi.CertificateRequestCondition{},
 				},
@@ -138,7 +148,8 @@ func TestProcessItem(t *testing.T) {
 		},
 		"approve CertificateRequest has 'Ready' Pending condition": {
 			request: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "test"},
+				Namespace: "testns",
+				Name:      "test",
 				Status: cmapi.CertificateRequestStatus{
 					Conditions: []cmapi.CertificateRequestCondition{
 						{
@@ -206,15 +217,15 @@ func TestProcessItem(t *testing.T) {
 			defer builder.Stop()
 
 			key := test.key
-			if key == "" && test.request != nil {
-				key, err = controllerpkg.KeyFunc(test.request)
-				if err != nil {
-					t.Fatal(err)
+			if key == (types.NamespacedName{}) && test.request != nil {
+				key = types.NamespacedName{
+					Name:      test.request.Name,
+					Namespace: test.request.Namespace,
 				}
 			}
 
 			// Call ProcessItem
-			err = c.ProcessItem(context.Background(), key)
+			err = c.ProcessItem(t.Context(), key)
 			switch {
 			case err != nil:
 				if test.err != err.Error() {
@@ -230,9 +241,6 @@ func TestProcessItem(t *testing.T) {
 				builder.T.Error(err)
 			}
 			if err := builder.AllActionsExecuted(); err != nil {
-				builder.T.Error(err)
-			}
-			if err := builder.AllReactorsCalled(); err != nil {
 				builder.T.Error(err)
 			}
 		})

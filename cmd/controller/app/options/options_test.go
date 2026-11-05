@@ -19,46 +19,69 @@ package options
 import (
 	"testing"
 
+	config "github.com/cert-manager/cert-manager/internal/apis/config/controller"
+	defaults "github.com/cert-manager/cert-manager/internal/apis/config/controller/v1alpha1"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func TestEnabledControllers(t *testing.T) {
 	tests := map[string]struct {
 		controllers []string
-		expEnabled  sets.String
+		namespace   string
+		expEnabled  sets.Set[string]
 	}{
 		"if no controllers enabled, return empty": {
 			controllers: []string{},
-			expEnabled:  sets.NewString(),
+			expEnabled:  sets.New[string](),
 		},
 		"if some controllers enabled, return list": {
 			controllers: []string{"foo", "bar"},
-			expEnabled:  sets.NewString("foo", "bar"),
+			expEnabled:  sets.New("foo", "bar"),
 		},
 		"if some controllers enabled, one then disabled, return list without disabled": {
 			controllers: []string{"foo", "bar", "-foo"},
-			expEnabled:  sets.NewString("bar"),
+			expEnabled:  sets.New("bar"),
 		},
 		"if all default controllers enabled, return all default controllers": {
 			controllers: []string{"*"},
-			expEnabled:  sets.NewString(defaultEnabledControllers...),
+			expEnabled:  sets.New(defaults.DefaultEnabledControllers...),
 		},
-		"if all controllers enabled, some diabled, return all controllers with disabled": {
+		"if all controllers enabled, some disabled, return all controllers without disabled": {
 			controllers: []string{"*", "-clusterissuers", "-issuers"},
-			expEnabled:  sets.NewString(defaultEnabledControllers...).Delete("clusterissuers", "issuers"),
+			expEnabled:  sets.New(defaults.DefaultEnabledControllers...).Delete("clusterissuers", "issuers"),
+		},
+		"if only disabled controllers are specified, implicitly enable all default controllers": {
+			controllers: []string{"-clusterissuers", "-issuers"},
+			expEnabled:  sets.New(defaults.DefaultEnabledControllers...).Delete("clusterissuers", "issuers"),
+		},
+		"if namespace set, remove cluster-scoped controllers": {
+			controllers: []string{"*"},
+			namespace:   "test-ns",
+			expEnabled:  sets.New(defaults.DefaultEnabledControllers...).Delete(defaults.ClusterScopedControllers...),
+		},
+		"if namespace set with explicit controllers, preserve non-cluster-scoped and remove cluster-scoped": {
+			controllers: []string{"issuers", "clusterissuers"},
+			namespace:   "test-ns",
+			expEnabled:  sets.New("issuers"),
+		},
+		"if namespace set with wildcard and disabled controllers, remove cluster-scoped and disabled": {
+			controllers: []string{"*", "-issuers"},
+			namespace:   "test-ns",
+			expEnabled:  sets.New(defaults.DefaultEnabledControllers...).Delete(defaults.ClusterScopedControllers...).Delete("issuers"),
 		},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			o := ControllerOptions{
-				controllers: test.controllers,
+			o := config.ControllerConfiguration{
+				Controllers: test.controllers,
+				Namespace:   test.namespace,
 			}
 
-			got := o.EnabledControllers()
+			got := EnabledControllers(&o)
 			if !got.Equal(test.expEnabled) {
-				t.Errorf("got unexpected enabled, exp=%s got=%s",
-					test.expEnabled, got)
+				t.Errorf("got unexpected enabled controllers, exp=%v got=%v",
+					sets.List(test.expEnabled), sets.List(got))
 			}
 		})
 	}

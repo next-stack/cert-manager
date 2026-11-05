@@ -17,22 +17,21 @@ limitations under the License.
 package helper
 
 import (
-	"os"
-
+	cmscheme "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/scheme"
 	"k8s.io/apimachinery/pkg/runtime"
 	runtimejson "k8s.io/apimachinery/pkg/runtime/serializer/json"
-	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	kscheme "k8s.io/client-go/kubernetes/scheme"
 
-	cmscheme "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/scheme"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/log"
 )
 
 func (h *Helper) describeKubeObject(object runtime.Object) error {
-	serializer := runtimejson.NewSerializerWithOptions(runtimejson.DefaultMetaFactory, kubescheme.Scheme, kubescheme.Scheme, runtimejson.SerializerOptions{
+	serializer := runtimejson.NewSerializerWithOptions(runtimejson.DefaultMetaFactory, kscheme.Scheme, kscheme.Scheme, runtimejson.SerializerOptions{
 		Yaml:   true,
 		Pretty: true,
 	})
-	encoder := kubescheme.Codecs.WithoutConversion().EncoderForVersion(serializer, nil)
-	return encoder.Encode(object, os.Stdout)
+	encoder := kscheme.Codecs.WithoutConversion().EncoderForVersion(serializer, nil)
+	return encoder.Encode(object, log.Writer)
 }
 
 func (h *Helper) describeCMObject(object runtime.Object) error {
@@ -41,5 +40,5 @@ func (h *Helper) describeCMObject(object runtime.Object) error {
 		Pretty: true,
 	})
 	encoder := cmscheme.Codecs.WithoutConversion().EncoderForVersion(serializer, nil)
-	return encoder.Encode(object, os.Stdout)
+	return encoder.Encode(object, log.Writer)
 }

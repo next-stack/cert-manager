@@ -18,20 +18,20 @@ package acmeorders
 
 import (
 	"context"
-	"time"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/informers"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	"github.com/cert-manager/cert-manager/pkg/acme/accounts"
+	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	cminformers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
 	cmacmelisters "github.com/cert-manager/cert-manager/pkg/client/listers/acme/v1"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
@@ -39,8 +39,6 @@ import (
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/scheduler"
 )
-
-var keyFunc = controllerpkg.KeyFunc
 
 type controller struct {
 	// issuer helper is used to obtain references to issuers, used by Sync()
@@ -54,7 +52,7 @@ type controller struct {
 	challengeLister     cmacmelisters.ChallengeLister
 	issuerLister        cmlisters.IssuerLister
 	clusterIssuerLister cmlisters.ClusterIssuerLister
-	secretLister        corelisters.SecretLister
+	secretLister        internalinformers.SecretLister
 
 	// used for testing
 	clock clock.Clock
@@ -68,42 +66,35 @@ type controller struct {
 
 	// maintain a reference to the workqueue for this controller
 	// so the handleOwnedResource method can enqueue resources
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName]
 
 	// scheduledWorkQueue holds items to be re-queued after a period of time.
-	scheduledWorkQueue scheduler.ScheduledWorkQueue
-
-	// logger to be used by this controller
-	log logr.Logger
+	scheduledWorkQueue scheduler.ScheduledWorkQueue[types.NamespacedName]
 }
 
 // NewController constructs an orders controller using the provided options.
 func NewController(
 	log logr.Logger,
-	cmClient cmclient.Interface,
-	kubeInformerFactory informers.SharedInformerFactory,
-	cmInformerFactory cminformers.SharedInformerFactory,
-	accountRegistry accounts.Getter,
-	recorder record.EventRecorder,
-	clock clock.Clock,
+	ctx *controllerpkg.Context,
 	isNamespaced bool,
-	fieldManager string,
-) (*controller, workqueue.RateLimitingInterface, []cache.InformerSynced) {
+) (*controller, workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 
 	// Create a queue used to queue up Orders to be processed.
-	queue := workqueue.NewNamedRateLimitingQueue(
-		workqueue.NewItemExponentialFailureRateLimiter(time.Second*5, time.Minute*30),
-		ControllerName,
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultACMERateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
 	)
 
 	// Create a scheduledWorkQueue to schedule Orders for re-processing.
-	scheduledWorkQueue := scheduler.NewScheduledWorkQueue(clock, queue.Add)
+	scheduledWorkQueue := scheduler.NewScheduledWorkQueue(ctx.Clock, queue.Add)
 
 	// Obtain references to all the informers used by this controller.
-	orderInformer := cmInformerFactory.Acme().V1().Orders()
-	issuerInformer := cmInformerFactory.Certmanager().V1().Issuers()
-	challengeInformer := cmInformerFactory.Acme().V1().Challenges()
-	secretInformer := kubeInformerFactory.Core().V1().Secrets()
+	orderInformer := ctx.SharedInformerFactory.Acme().V1().Orders()
+	issuerInformer := ctx.SharedInformerFactory.Certmanager().V1().Issuers()
+	challengeInformer := ctx.SharedInformerFactory.Acme().V1().Challenges()
+	secretInformer := ctx.KubeSharedInformerFactory.Secrets()
 
 	// Build a list of InformerSynced functions. The controller will only begin
 	// processing items once all of these informers have synced.
@@ -124,28 +115,34 @@ func NewController(
 	// register event handlers and obtain a lister for ClusterIssuers.
 	var clusterIssuerLister cmlisters.ClusterIssuerLister
 	if !isNamespaced {
-		clusterIssuerInformer := cmInformerFactory.Certmanager().V1().ClusterIssuers()
+		clusterIssuerInformer := ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers()
 		mustSync = append(mustSync, clusterIssuerInformer.Informer().HasSynced)
 		clusterIssuerLister = clusterIssuerInformer.Lister()
 		// register handler function for clusterissuer resources
-		clusterIssuerInformer.Informer().AddEventHandler(
-			&controllerpkg.BlockingEventHandler{WorkFunc: handleGenericIssuerFunc(queue, orderLister)},
-		)
+		if _, err := clusterIssuerInformer.Informer().AddEventHandler(
+			controllerpkg.BlockingEventHandler(handleGenericIssuerFunc(queue, orderLister)),
+		); err != nil {
+			return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+		}
 	}
 
 	// register handler functions
-	orderInformer.Informer().AddEventHandler(
-		&controllerpkg.QueuingEventHandler{Queue: queue},
-	)
-	issuerInformer.Informer().AddEventHandler(
-		&controllerpkg.BlockingEventHandler{WorkFunc: handleGenericIssuerFunc(queue, orderLister)},
-	)
-	challengeInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		WorkFunc: controllerpkg.HandleOwnedResourceNamespacedFunc(log, queue, orderGvk, orderGetterFunc(orderLister)),
-	})
+	if _, err := orderInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(queue)); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := issuerInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(handleGenericIssuerFunc(queue, orderLister)),
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := challengeInformer.Informer().AddEventHandler(controllerpkg.BlockingEventHandler(
+		controllerpkg.HandleOwnedResourceNamespacedFunc(log, queue, orderGvk, orderGetterFunc(orderLister)),
+	)); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	return &controller{
-		clock:               clock,
+		clock:               ctx.Clock,
 		queue:               queue,
 		scheduledWorkQueue:  scheduledWorkQueue,
 		orderLister:         orderLister,
@@ -154,30 +151,26 @@ func NewController(
 		secretLister:        secretLister,
 		clusterIssuerLister: clusterIssuerLister,
 		helper:              issuer.NewHelper(issuerLister, clusterIssuerLister),
-		recorder:            recorder,
-		cmClient:            cmClient,
-		accountRegistry:     accountRegistry,
-		fieldManager:        fieldManager,
-	}, queue, mustSync
+		recorder:            ctx.Recorder,
+		cmClient:            ctx.CMClient,
+		accountRegistry:     ctx.ACMEAccountRegistry,
+		fieldManager:        ctx.FieldManager,
+	}, queue, mustSync, nil
 
 }
 
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx)
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key")
-		return nil
-	}
+	namespace, name := key.Namespace, key.Name
 
 	order, err := c.orderLister.Orders(namespace).Get(name)
-	if err != nil {
-		if k8sErrors.IsNotFound(err) {
-			log.Error(err, "order in work queue no longer exists")
-			return nil
-		}
-
+	if err != nil && !k8sErrors.IsNotFound(err) {
 		return err
+	}
+	if order == nil || order.DeletionTimestamp != nil {
+		// If the Order object was/ is being deleted, we don't want to update its status or
+		// create new Challenges.
+		return nil
 	}
 
 	ctx = logf.NewContext(ctx, logf.WithResource(log, order))
@@ -185,8 +178,8 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 }
 
 // Returns a function that finds a named Order in a particular namespace.
-func orderGetterFunc(orderLister cmacmelisters.OrderLister) func(string, string) (interface{}, error) {
-	return func(namespace, name string) (interface{}, error) {
+func orderGetterFunc(orderLister cmacmelisters.OrderLister) func(string, string) (*cmacme.Order, error) {
+	return func(namespace, name string) (*cmacme.Order, error) {
 		return orderLister.Orders(namespace).Get(name)
 	}
 }
@@ -206,27 +199,21 @@ type controllerWrapper struct {
 // Register registers a controller, created using the provided context.
 // It returns the workqueue to be used to enqueue items, a list of
 // InformerSynced functions that must be synced, or an error.
-func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// Construct a new named logger to be reused throughout the controller.
 	log := logf.FromContext(ctx.RootContext, ControllerName)
 
 	// If --namespace flag was set thus limiting cert-manager to a single namespace.
 	isNamespaced := ctx.Namespace != ""
 
-	ctrl, queue, mustSync := NewController(
+	ctrl, queue, mustSync, err := NewController(
 		log,
-		ctx.CMClient,
-		ctx.KubeSharedInformerFactory,
-		ctx.SharedInformerFactory,
-		ctx.ACMEOptions.AccountRegistry,
-		ctx.Recorder,
-		ctx.Clock,
+		ctx,
 		isNamespaced,
-		ctx.FieldManager,
 	)
 	c.controller = ctrl
 
-	return queue, mustSync, nil
+	return queue, mustSync, err
 }
 
 func init() {

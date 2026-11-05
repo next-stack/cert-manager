@@ -20,28 +20,27 @@ import (
 	"context"
 	"crypto"
 	"fmt"
-	"time"
+	"slices"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
-	"k8s.io/client-go/informers"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/ptr"
 
+	cminternal "github.com/cert-manager/cert-manager/internal/apis/certmanager/v1"
 	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	cminformers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates"
@@ -56,6 +55,9 @@ const (
 	reasonDecodeFailed        = "DecodeFailed"
 	reasonCannotRegenerateKey = "CannotRegenerateKey"
 	reasonDeleted             = "Deleted"
+	reasonNotOwned            = "NotOwned"
+	reasonGenerateFailed      = "GenerateFailed"
+	reasonMLDSADisabled       = "MLDSAPrivateKeysDisabled"
 )
 
 var (
@@ -64,7 +66,7 @@ var (
 
 type controller struct {
 	certificateLister cmlisters.CertificateLister
-	secretLister      corelisters.SecretLister
+	secretLister      internalinformers.SecretLister
 	client            cmclient.Interface
 	coreClient        kubernetes.Interface
 	recorder          record.EventRecorder
@@ -76,35 +78,46 @@ type controller struct {
 }
 
 func NewController(
-	log logr.Logger,
-	client cmclient.Interface,
-	coreClient kubernetes.Interface,
-	factory informers.SharedInformerFactory,
-	cmFactory cminformers.SharedInformerFactory,
-	recorder record.EventRecorder,
-	fieldManager string,
-) (*controller, workqueue.RateLimitingInterface, []cache.InformerSynced) {
+	log logr.Logger, ctx *controllerpkg.Context,
+) (*controller, workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// create a queue used to queue up items to be processed
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(time.Second*1, time.Second*30), ControllerName)
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultCertificateRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
 	// obtain references to all the informers used by this controller
-	certificateInformer := cmFactory.Certmanager().V1().Certificates()
-	secretsInformer := factory.Core().V1().Secrets()
+	certificateInformer := ctx.SharedInformerFactory.Certmanager().V1().Certificates()
+	secretsInformer := ctx.KubeSharedInformerFactory.Secrets()
 
-	certificateInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: queue})
+	if _, err := certificateInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(queue)); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
-	secretsInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		// Trigger reconciles on changes to any 'owned' secret resources
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(),
-			predicate.ResourceOwnerOf,
+	if _, err := secretsInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			// Trigger reconciles on changes to any 'owned' secret resources
+			certificates.EnqueueCertificatesForResourceUsingPredicates[*corev1.Secret](
+				log, queue, certificateInformer.Lister(),
+				predicate.ResourceOwnerOf,
+			),
 		),
-	})
-	secretsInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		// Trigger reconciles on changes to certificates named as spec.secretName
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(),
-			predicate.ExtractResourceName(predicate.CertificateSecretName),
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := secretsInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			// Trigger reconciles on changes to certificates named as spec.secretName
+			certificates.EnqueueCertificatesForResourceUsingPredicates(
+				log, queue, certificateInformer.Lister(),
+				predicate.ExtractResourceName[*corev1.Secret](predicate.CertificateSecretName),
+			),
 		),
-	})
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// build a list of InformerSynced functions that will be returned by the Register method.
 	// the controller will only begin processing items once all of these informers have synced.
@@ -116,46 +129,37 @@ func NewController(
 	return &controller{
 		certificateLister: certificateInformer.Lister(),
 		secretLister:      secretsInformer.Lister(),
-		client:            client,
-		coreClient:        coreClient,
-		recorder:          recorder,
-		fieldManager:      fieldManager,
-	}, queue, mustSync
+		client:            ctx.CMClient,
+		coreClient:        ctx.Client,
+		recorder:          ctx.Recorder,
+		fieldManager:      ctx.FieldManager,
+	}, queue, mustSync, nil
 }
 
-// isNextPrivateKeyLabelSelector is a label selector used to match Secret
-// resources with the `cert-manager.io/next-private-key: "true"` label.
-var isNextPrivateKeyLabelSelector labels.Selector
-
-func init() {
-	r, err := labels.NewRequirement("cert-manager.io/next-private-key", selection.Equals, []string{"true"})
-	if err != nil {
-		panic(err)
-	}
-	isNextPrivateKeyLabelSelector = labels.NewSelector().Add(*r)
-}
-
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx).WithValues("key", key)
 	ctx = logf.NewContext(ctx, log)
 
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key passed to ProcessItem")
-		return nil
-	}
+	namespace, name := key.Namespace, key.Name
 
 	crt, err := c.certificateLister.Certificates(namespace).Get(name)
-	if apierrors.IsNotFound(err) {
-		log.V(logf.DebugLevel).Info("certificate not found for key", "error", err.Error())
-		return nil
-	}
-	if err != nil {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
+	if crt == nil || crt.DeletionTimestamp != nil {
+		// If the Certificate object was/ is being deleted, we don't want to create any
+		// new Secret resources.
+		return nil
+	}
+
+	// Apply runtime defaults to apply default values that are governed by
+	// controller feature gates, such as DefaultPrivateKeyRotationPolicyAlways.
+	// We deep copy the object to avoid mutating the client-go cache.
+	crt = crt.DeepCopy()
+	cminternal.SetRuntimeDefaults_Certificate(crt)
 
 	// Discover all 'owned' secrets that have the `next-private-key` label
-	secrets, err := certificates.ListSecretsMatchingPredicates(c.secretLister.Secrets(crt.Namespace), isNextPrivateKeyLabelSelector, predicate.ResourceOwnedBy(crt))
+	secrets, err := certificates.ListNextPrivateKeySecrets(c.secretLister.Secrets(crt.Namespace), crt)
 	if err != nil {
 		return err
 	}
@@ -173,10 +177,9 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 
 	// if there is no existing Secret resource, create a new one
 	if len(secrets) == 0 {
-		rotationPolicy := cmapi.RotationPolicyNever
-		if crt.Spec.PrivateKey != nil && crt.Spec.PrivateKey.RotationPolicy != "" {
-			rotationPolicy = crt.Spec.PrivateKey.RotationPolicy
-		}
+		// PrivateKey is a pointer, but it will never be nil because we called
+		// the SetRuntimeDefaults function at the start of this function.
+		rotationPolicy := crt.Spec.PrivateKey.RotationPolicy
 		switch rotationPolicy {
 		case cmapi.RotationPolicyNever:
 			return c.createNextPrivateKeyRotationPolicyNever(ctx, crt)
@@ -188,25 +191,27 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 			return nil
 		}
 	}
-
 	// always clean up if multiple are found
 	if len(secrets) > 1 {
-		// TODO: if nextPrivateKeySecretName is set, we should skip deleting that one Secret resource
-		log.V(logf.DebugLevel).Info("Cleaning up Secret resources as multiple nextPrivateKeySecretName candidates found")
-		return c.deleteSecretResources(ctx, secrets)
+		// Delete all secrets, optionally skipping the one specified in nextPrivateKeySecretName
+		log.V(logf.DebugLevel).Info("Cleaning up Secret resources as multiple nextPrivateKeySecretName candidates found", "total_secrets", len(secrets))
+
+		// Use ptr.Deref to get the value or empty string if nil
+		return c.deleteSecretResources(ctx, secrets, ptr.Deref(crt.Status.NextPrivateKeySecretName, ""))
 	}
 
 	secret := secrets[0]
 	log = logf.WithRelatedResource(log, secret)
 	ctx = logf.NewContext(ctx, log)
 
-	if crt.Status.NextPrivateKeySecretName == nil {
+	// The Secret we own is the source of truth, not the status field. The
+	// field may be unset, may lag behind a Secret created on the previous
+	// reconcile, or may hold a name written by a principal with access only to
+	// the certificates/status subresource. In every case, point it at the
+	// Secret we own rather than deleting that Secret and generating a new key.
+	if ptr.Deref(crt.Status.NextPrivateKeySecretName, "") != secret.Name {
 		log.V(logf.DebugLevel).Info("Adopting existing private key Secret")
 		return c.setNextPrivateKeySecretName(ctx, crt, &secret.Name)
-	}
-	if *crt.Status.NextPrivateKeySecretName != secrets[0].Name {
-		log.V(logf.DebugLevel).Info("Deleting existing private key secret as name does not match status.nextPrivateKeySecretName")
-		return c.deleteSecretResources(ctx, secrets)
 	}
 
 	if secret.Data == nil || len(secret.Data[corev1.TLSPrivateKeyKey]) == 0 {
@@ -220,11 +225,7 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 		return c.deleteSecretResources(ctx, secrets)
 	}
 
-	violations, err := certificates.PrivateKeyMatchesSpec(pk, crt.Spec)
-	if err != nil {
-		log.Error(err, "Internal error verifying if private key matches spec - please open an issue.")
-		return nil
-	}
+	violations := pki.PrivateKeyMatchesSpec(pk, crt.Spec)
 	if len(violations) > 0 {
 		log.V(logf.DebugLevel).Info("Regenerating private key due to change in fields", "violations", violations)
 		c.recorder.Eventf(crt, corev1.EventTypeNormal, reasonDeleted, "Regenerating private key due to change in fields: %v", violations)
@@ -254,14 +255,12 @@ func (c *controller) createNextPrivateKeyRotationPolicyNever(ctx context.Context
 		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonDecodeFailed, "Failed to decode private key stored in Secret %q - generating new key", crt.Spec.SecretName)
 		return c.createAndSetNextPrivateKey(ctx, crt)
 	}
-	violations, err := certificates.PrivateKeyMatchesSpec(pk, crt.Spec)
-	if err != nil {
-		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonDecodeFailed, "Failed to check if private key stored in Secret %q is up to date - generating new key", crt.Spec.SecretName)
-		return c.createAndSetNextPrivateKey(ctx, crt)
-	}
+	violations := pki.PrivateKeyMatchesSpec(pk, crt.Spec)
 	if len(violations) > 0 {
 		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonCannotRegenerateKey, "User intervention required: existing private key in Secret %q does not match requirements on Certificate resource, mismatching fields: %v, but cert-manager cannot create new private key as the Certificate's .spec.privateKey.rotationPolicy is unset or set to Never. To allow cert-manager to create a new private key you can set .spec.privateKey.rotationPolicy to 'Always' (this will result in the private key being regenerated every time a cert is renewed) ", crt.Spec.SecretName, violations)
-		return nil
+		// There is no next private key, so do not leave a stale or untrusted
+		// name in the status field while we wait for the user.
+		return c.setNextPrivateKeySecretName(ctx, crt, nil)
 	}
 
 	nextPkSecret, err := c.createNewPrivateKeySecret(ctx, crt, pk)
@@ -275,8 +274,17 @@ func (c *controller) createNextPrivateKeyRotationPolicyNever(ctx context.Context
 }
 
 func (c *controller) createAndSetNextPrivateKey(ctx context.Context, crt *cmapi.Certificate) error {
+	// The trigger controller doesn't start issuance for ML-DSA Certificates
+	// while the MLDSAPrivateKeys feature gate is disabled, so this is only
+	// defence in depth. Retrying wouldn't help, so no error is returned.
+	if crt.Spec.PrivateKey.Algorithm == cmapi.MLDSAKeyAlgorithm && !utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) {
+		c.recorder.Event(crt, corev1.EventTypeWarning, reasonMLDSADisabled, "Not generating an ML-DSA private key because the MLDSAPrivateKeys feature gate is disabled")
+		return nil
+	}
+
 	pk, err := pki.GeneratePrivateKeyForCertificate(crt)
 	if err != nil {
+		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonGenerateFailed, "Failed to generate private key: %v", err)
 		return err
 	}
 
@@ -291,9 +299,13 @@ func (c *controller) createAndSetNextPrivateKey(ctx context.Context, crt *cmapi.
 }
 
 // deleteSecretResources will delete the given secret resources
-func (c *controller) deleteSecretResources(ctx context.Context, secrets []*corev1.Secret) error {
+func (c *controller) deleteSecretResources(ctx context.Context, secrets []*corev1.Secret, skip ...string) error {
 	log := logf.FromContext(ctx)
 	for _, s := range secrets {
+		// Skip deletion if the secret name is in the skip list
+		if slices.Contains(skip, s.Name) {
+			continue
+		}
 		if err := c.coreClient.CoreV1().Secrets(s.Namespace).Delete(ctx, s.Name, metav1.DeleteOptions{}); err != nil {
 			return err
 		}
@@ -323,21 +335,43 @@ func (c *controller) setNextPrivateKeySecretName(ctx context.Context, crt *cmapi
 func (c *controller) updateOrApplyStatus(ctx context.Context, crt *cmapi.Certificate) error {
 	if utilfeature.DefaultFeatureGate.Enabled(feature.ServerSideApply) {
 		return internalcertificates.ApplyStatus(ctx, c.client, c.fieldManager, &cmapi.Certificate{
-			ObjectMeta: metav1.ObjectMeta{Namespace: crt.Namespace, Name: crt.Name},
-			Status:     cmapi.CertificateStatus{NextPrivateKeySecretName: crt.Status.NextPrivateKeySecretName},
+			Namespace: crt.Namespace,
+			Name:      crt.Name,
+			Status:    cmapi.CertificateStatus{NextPrivateKeySecretName: crt.Status.NextPrivateKeySecretName},
 		})
 	} else {
-		_, err := c.client.CertmanagerV1().Certificates(crt.Namespace).UpdateStatus(ctx, crt, metav1.UpdateOptions{})
+		_, err := c.client.CertmanagerV1().Certificates(crt.Namespace).UpdateStatus(ctx, &cmapi.Certificate{
+			ObjectMeta: crt.ObjectMeta,
+			Status:     crt.Status,
+		}, metav1.UpdateOptions{})
 		return err
 	}
 }
 
 func (c *controller) createNewPrivateKeySecret(ctx context.Context, crt *cmapi.Certificate, pk crypto.Signer) (*corev1.Secret, error) {
-	// if the 'nextPrivateKeySecretName' field is already set, use this as the
-	// name of the Secret resource.
-	name := ""
-	if crt.Status.NextPrivateKeySecretName != nil {
-		name = *crt.Status.NextPrivateKeySecretName
+	// We only get here when the Secret LIST found nothing we own. The lister
+	// can lag the API server, so before creating a Secret check whether one
+	// we created on an earlier reconcile already exists. Read the Certificate
+	// live too, because status.nextPrivateKeySecretName may have been written
+	// by that earlier reconcile and not yet reached the cache.
+	latestCrt, err := c.client.CertmanagerV1().Certificates(crt.Namespace).Get(ctx, crt.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if name := ptr.Deref(latestCrt.Status.NextPrivateKeySecretName, ""); name != "" {
+		existing, err := c.coreClient.CoreV1().Secrets(crt.Namespace).Get(ctx, name, metav1.GetOptions{})
+		switch {
+		case err == nil && certificates.IsNextPrivateKeySecret(existing, crt):
+			return existing, nil
+		case err == nil:
+			// Anyone able to write the certificates/status subresource can put
+			// an arbitrary name there. Never adopt that Secret. The consumers of
+			// the field reject it too, so issuance only recovers once the field
+			// is repointed at a Secret we create below.
+			c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonNotOwned, "Ignoring status.nextPrivateKeySecretName %q: the Secret is not owned by this Certificate", name)
+		case !apierrors.IsNotFound(err):
+			return nil, err
+		}
 	}
 
 	pkData, err := pki.EncodePrivateKey(pk, cmapi.PKCS8)
@@ -345,28 +379,24 @@ func (c *controller) createNewPrivateKeySecret(ctx context.Context, crt *cmapi.C
 		return nil, err
 	}
 
+	// Always let the API server pick the name. A name taken from the status
+	// field cannot be trusted: it could be the spec.secretName of a Certificate
+	// that has not issued yet, and creating it here would let this Certificate
+	// later delete that one's Secret, or sign with its key.
 	s := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:       crt.Namespace,
-			Name:            name,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(crt, certificateGvk)},
-			Labels: map[string]string{
-				"cert-manager.io/next-private-key": "true",
-			},
+		Namespace: crt.Namespace,
+		// TODO: handle certificate resources that have especially long names
+		GenerateName:    crt.Name + "-",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(crt, certificateGvk)},
+		Labels: map[string]string{
+			cmapi.IsNextPrivateKeySecretLabelKey:      "true",
+			cmapi.PartOfCertManagerControllerLabelKey: "true",
 		},
 		Data: map[string][]byte{
 			corev1.TLSPrivateKeyKey: pkData,
 		},
 	}
-	if s.Name == "" {
-		// TODO: handle certificate resources that have especially long names
-		s.GenerateName = crt.Name + "-"
-	}
-	s, err = c.coreClient.CoreV1().Secrets(s.Namespace).Create(ctx, s, metav1.CreateOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
+	return c.coreClient.CoreV1().Secrets(s.Namespace).Create(ctx, s, metav1.CreateOptions{})
 }
 
 // controllerWrapper wraps the `controller` structure to make it implement
@@ -375,21 +405,14 @@ type controllerWrapper struct {
 	*controller
 }
 
-func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// construct a new named logger to be reused throughout the controller
 	log := logf.FromContext(ctx.RootContext, ControllerName)
 
-	ctrl, queue, mustSync := NewController(log,
-		ctx.CMClient,
-		ctx.Client,
-		ctx.KubeSharedInformerFactory,
-		ctx.SharedInformerFactory,
-		ctx.Recorder,
-		ctx.FieldManager,
-	)
+	ctrl, queue, mustSync, err := NewController(log, ctx)
 	c.controller = ctrl
 
-	return queue, mustSync, nil
+	return queue, mustSync, err
 }
 
 func init() {

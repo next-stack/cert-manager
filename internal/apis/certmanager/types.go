@@ -30,6 +30,33 @@ const (
 	// Annotation key for certificate common name.
 	CommonNameAnnotationKey = "cert-manager.io/common-name"
 
+	// Annotation key for emails subjectAltNames.
+	EmailsAnnotationKey = "cert-manager.io/email-sans"
+
+	// Annotation key for subject organization.
+	SubjectOrganizationsAnnotationKey = "cert-manager.io/subject-organizations"
+
+	// Annotation key for subject organizational units.
+	SubjectOrganizationalUnitsAnnotationKey = "cert-manager.io/subject-organizationalunits"
+
+	// Annotation key for subject organizational units.
+	SubjectCountriesAnnotationKey = "cert-manager.io/subject-countries"
+
+	// Annotation key for subject provinces.
+	SubjectProvincesAnnotationKey = "cert-manager.io/subject-provinces"
+
+	// Annotation key for subject localities.
+	SubjectLocalitiesAnnotationKey = "cert-manager.io/subject-localities"
+
+	// Annotation key for subject provinces.
+	SubjectStreetAddressesAnnotationKey = "cert-manager.io/subject-streetaddresses"
+
+	// Annotation key for subject postal codes.
+	SubjectPostalCodesAnnotationKey = "cert-manager.io/subject-postalcodes"
+
+	// Annotation key for subject serial number.
+	SubjectSerialNumberAnnotationKey = "cert-manager.io/subject-serialnumber"
+
 	// Annotation key the 'name' of the Issuer resource.
 	IssuerNameAnnotationKey = "cert-manager.io/issuer-name"
 
@@ -58,6 +85,9 @@ const (
 	// acmeIssuerHTTP01IngressClassAnnotation can be used to override the http01 ingressClass
 	// if the challenge type is set to http01
 	IngressACMEIssuerHTTP01IngressClassAnnotationKey = "acme.cert-manager.io/http01-ingress-class"
+	// acmeIssuerHTTP01IngressClassNameAnnotation can be used to override the http01 ingressClassName
+	// if the challenge type is set to http01
+	IngressACMEIssuerHTTP01IngressClassNameAnnotationKey = "acme.cert-manager.io/http01-ingress-ingressclassname"
 
 	// IngressClassAnnotationKey picks a specific "class" for the Ingress. The
 	// controller only processes Ingresses with this annotation either unset, or
@@ -122,8 +152,8 @@ const (
 
 // Issuer specific Annotations
 const (
-	// VenafiCustomFieldsAnnotationKey is the annotation that passes on JSON encoded custom fields to the Venafi issuer
-	// This will only work with Venafi TPP v19.3 and higher
+	// VenafiCustomFieldsAnnotationKey is the annotation that passes on JSON encoded custom fields to the Certificate Manager issuer
+	// This will only work with CyberArk Certificate Manager Self-Hosted v19.3 and higher
 	// The value is an array with objects containing the name and value keys
 	// for example: `[{"name": "custom-field", "value": "custom-value"}]`
 	VenafiCustomFieldsAnnotationKey = "venafi.cert-manager.io/custom-fields"
@@ -184,4 +214,16 @@ const (
 	UsageOCSPSigning       KeyUsage = "ocsp signing"
 	UsageMicrosoftSGC      KeyUsage = "microsoft sgc"
 	UsageNetscapeSGC       KeyUsage = "netscape sgc"
+)
+
+type SignatureAlgorithm string
+
+const (
+	SHA256WithRSA   SignatureAlgorithm = "SHA256WithRSA"
+	SHA384WithRSA   SignatureAlgorithm = "SHA384WithRSA"
+	SHA512WithRSA   SignatureAlgorithm = "SHA512WithRSA"
+	ECDSAWithSHA256 SignatureAlgorithm = "ECDSAWithSHA256"
+	ECDSAWithSHA384 SignatureAlgorithm = "ECDSAWithSHA384"
+	ECDSAWithSHA512 SignatureAlgorithm = "ECDSAWithSHA512"
+	PureEd25519     SignatureAlgorithm = "PureEd25519"
 )

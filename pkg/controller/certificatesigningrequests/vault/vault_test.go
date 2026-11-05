@@ -30,17 +30,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	coretesting "k8s.io/client-go/testing"
 	fakeclock "k8s.io/utils/clock/testing"
 
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	internalvault "github.com/cert-manager/cert-manager/internal/vault"
 	fakevault "github.com/cert-manager/cert-manager/internal/vault/fake"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	"github.com/cert-manager/cert-manager/pkg/apis/certmanager"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/pkg/controller"
+	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests/util"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
@@ -70,6 +71,7 @@ func TestProcessItem(t *testing.T) {
 					},
 				},
 			},
+			Server: "https://example.vault.com",
 		}),
 		gen.AddIssuerCondition(cmapi.IssuerCondition{
 			Type:   cmapi.IssuerConditionReady,
@@ -129,7 +131,7 @@ func TestProcessItem(t *testing.T) {
 					Status: corev1.ConditionTrue,
 				}),
 			),
-			clientBuilder: func(_ string, _ corelisters.SecretLister, _ cmapi.GenericIssuer) (internalvault.Interface, error) {
+			clientBuilder: func(_ context.Context, _ string, _ func(ns string) internalvault.CreateToken, _ internalinformers.SecretLister, _ cmapi.GenericIssuer, _ bool) (internalvault.Interface, error) {
 				return nil, apierrors.NewNotFound(schema.GroupResource{}, "test-secret")
 			},
 			builder: &testpkg.Builder{
@@ -190,7 +192,7 @@ func TestProcessItem(t *testing.T) {
 					Status: corev1.ConditionTrue,
 				}),
 			),
-			clientBuilder: func(_ string, _ corelisters.SecretLister, _ cmapi.GenericIssuer) (internalvault.Interface, error) {
+			clientBuilder: func(_ context.Context, _ string, _ func(ns string) internalvault.CreateToken, _ internalinformers.SecretLister, _ cmapi.GenericIssuer, _ bool) (internalvault.Interface, error) {
 				return nil, errors.New("generic error")
 			},
 			expectedErr: true,
@@ -234,7 +236,7 @@ func TestProcessItem(t *testing.T) {
 					Status: corev1.ConditionTrue,
 				}),
 			),
-			clientBuilder: func(_ string, _ corelisters.SecretLister, _ cmapi.GenericIssuer) (internalvault.Interface, error) {
+			clientBuilder: func(_ context.Context, _ string, _ func(ns string) internalvault.CreateToken, _ internalinformers.SecretLister, _ cmapi.GenericIssuer, _ bool) (internalvault.Interface, error) {
 				return fakevault.New(), nil
 			},
 			builder: &testpkg.Builder{
@@ -296,7 +298,7 @@ func TestProcessItem(t *testing.T) {
 					Status: corev1.ConditionTrue,
 				}),
 			),
-			clientBuilder: func(_ string, _ corelisters.SecretLister, _ cmapi.GenericIssuer) (internalvault.Interface, error) {
+			clientBuilder: func(_ context.Context, _ string, _ func(ns string) internalvault.CreateToken, _ internalinformers.SecretLister, _ cmapi.GenericIssuer, _ bool) (internalvault.Interface, error) {
 				return fakevault.New().WithSign(nil, nil, errors.New("sign error")), nil
 			},
 			builder: &testpkg.Builder{
@@ -357,7 +359,7 @@ func TestProcessItem(t *testing.T) {
 					Status: corev1.ConditionTrue,
 				}),
 			),
-			clientBuilder: func(_ string, _ corelisters.SecretLister, _ cmapi.GenericIssuer) (internalvault.Interface, error) {
+			clientBuilder: func(_ context.Context, _ string, _ func(ns string) internalvault.CreateToken, _ internalinformers.SecretLister, _ cmapi.GenericIssuer, _ bool) (internalvault.Interface, error) {
 				return fakevault.New().WithSign([]byte("signed-cert"), []byte("signing-ca"), nil), nil
 			},
 			builder: &testpkg.Builder{
@@ -436,12 +438,16 @@ func TestProcessItem(t *testing.T) {
 
 			controller := certificatesigningrequests.New(
 				apiutil.IssuerVault,
-				func(*controller.Context) certificatesigningrequests.Signer { return vault },
+				func(*controllerpkg.Context) certificatesigningrequests.Signer { return vault },
 			)
-			controller.Register(test.builder.Context)
+			if _, _, err := controller.Register(test.builder.Context); err != nil {
+				t.Fatal(err)
+			}
 			test.builder.Start()
 
-			err := controller.ProcessItem(context.Background(), test.csr.Name)
+			err := controller.ProcessItem(t.Context(), types.NamespacedName{
+				Name: test.csr.Name,
+			})
 			if err != nil && !test.expectedErr {
 				t.Errorf("expected to not get an error, but got: %v", err)
 			}

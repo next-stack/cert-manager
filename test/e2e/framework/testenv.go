@@ -26,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 )
 
 // Defines methods that help provision test environments
@@ -36,25 +35,47 @@ const (
 	Poll = 2 * time.Second
 )
 
-// CreateKubeNamespace creates a new Kubernetes Namespace for a test.
-func (f *Framework) CreateKubeNamespace(baseName string) (*v1.Namespace, error) {
+// CreateKubeNamespace creates a new Kubernetes Namespace for a test and waits
+// for the namespace's "default" ServiceAccount to be provisioned, since
+// Kubernetes creates it asynchronously after the Namespace itself. Pods
+// created without an explicit ServiceAccount (e.g. cert-manager's ACME HTTP01
+// solver pods) are admitted against this "default" ServiceAccount, so tests
+// that create such a Pod immediately after the Namespace can otherwise race
+// its creation and fail with "serviceaccount \"default\" not found". This
+// mirrors the equivalent wait in Kubernetes' own e2e framework
+// (WaitForDefaultServiceAccountInNamespace, called from CreateTestingNS),
+// which exists for the same reason: this race can occur on any sufficiently
+// slow or loaded cluster, not just this repo's CI.
+func (f *Framework) CreateKubeNamespace(ctx context.Context, baseName string) (*v1.Namespace, error) {
 	ns := &v1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("e2e-tests-%v-", baseName),
-		},
+		GenerateName: fmt.Sprintf("e2e-tests-%v-", baseName),
 	}
 
-	return f.KubeClientSet.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+	ns, err := f.KubeClientSet.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	pollErr := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err := f.KubeClientSet.CoreV1().ServiceAccounts(ns.Name).Get(ctx, "default", metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+	})
+	if pollErr != nil {
+		return nil, fmt.Errorf("waiting for default ServiceAccount in namespace %q: %w", ns.Name, pollErr)
+	}
+
+	return ns, nil
 }
 
 // CreateKubeResourceQuota provisions a ResourceQuota resource in the target
 // namespace.
-func (f *Framework) CreateKubeResourceQuota() (*v1.ResourceQuota, error) {
+func (f *Framework) CreateKubeResourceQuota(ctx context.Context) (*v1.ResourceQuota, error) {
 	quota := &v1.ResourceQuota{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "default-e2e-quota",
-			Namespace: f.Namespace.Name,
-		},
+		Name:      "default-e2e-quota",
+		Namespace: f.Namespace.Name,
 		Spec: v1.ResourceQuotaSpec{
 			Hard: v1.ResourceList{
 				"cpu":             resource.MustParse("16"),
@@ -66,29 +87,10 @@ func (f *Framework) CreateKubeResourceQuota() (*v1.ResourceQuota, error) {
 			},
 		},
 	}
-	return f.KubeClientSet.CoreV1().ResourceQuotas(f.Namespace.Name).Create(context.TODO(), quota, metav1.CreateOptions{})
+	return f.KubeClientSet.CoreV1().ResourceQuotas(f.Namespace.Name).Create(ctx, quota, metav1.CreateOptions{})
 }
 
 // DeleteKubeNamespace will delete a namespace resource
-func (f *Framework) DeleteKubeNamespace(namespace string) error {
-	return f.KubeClientSet.CoreV1().Namespaces().Delete(context.TODO(), namespace, metav1.DeleteOptions{})
-}
-
-// WaitForKubeNamespaceNotExist will wait for the namespace with the given name
-// to not exist for up to 2 minutes.
-func (f *Framework) WaitForKubeNamespaceNotExist(namespace string) error {
-	return wait.PollImmediate(Poll, time.Minute*2, namespaceNotExist(f.KubeClientSet, namespace))
-}
-
-func namespaceNotExist(c kubernetes.Interface, namespace string) wait.ConditionFunc {
-	return func() (bool, error) {
-		_, err := c.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return true, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return false, nil
-	}
+func (f *Framework) DeleteKubeNamespace(ctx context.Context, namespace string) error {
+	return f.KubeClientSet.CoreV1().Namespaces().Delete(ctx, namespace, metav1.DeleteOptions{})
 }

@@ -17,11 +17,12 @@ limitations under the License.
 package gen
 
 import (
-	"time"
+	"maps"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	internalv1 "github.com/cert-manager/cert-manager/internal/apis/certmanager/v1"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 )
@@ -38,19 +39,21 @@ func Certificate(name string, mods ...CertificateModifier) *v1.Certificate {
 	for _, mod := range mods {
 		mod(c)
 	}
+	internalv1.SetObjectDefaults_Certificate(c)
 	return c
 }
 
-func CertificateFrom(crt *v1.Certificate, mods ...CertificateModifier) *v1.Certificate {
-	crt = crt.DeepCopy()
+func CertificateFrom(c *v1.Certificate, mods ...CertificateModifier) *v1.Certificate {
+	c = c.DeepCopy()
 	for _, mod := range mods {
-		mod(crt)
+		mod(c)
 	}
-	return crt
+	internalv1.SetObjectDefaults_Certificate(c)
+	return c
 }
 
-// SetIssuer sets the Certificate.spec.issuerRef field
-func SetCertificateIssuer(o cmmeta.ObjectReference) CertificateModifier {
+// SetCertificateIssuer sets the Certificate.spec.issuerRef field
+func SetCertificateIssuer(o cmmeta.IssuerReference) CertificateModifier {
 	return func(c *v1.Certificate) {
 		c.Spec.IssuerRef = o
 	}
@@ -71,6 +74,12 @@ func SetCertificateCommonName(commonName string) CertificateModifier {
 func SetCertificateIPs(ips ...string) CertificateModifier {
 	return func(crt *v1.Certificate) {
 		crt.Spec.IPAddresses = ips
+	}
+}
+
+func SetCertificateOtherNames(otherNames ...v1.OtherName) CertificateModifier {
+	return func(crt *v1.Certificate) {
+		crt.Spec.OtherNames = otherNames
 	}
 }
 
@@ -126,15 +135,15 @@ func SetCertificateSecretTemplate(annotations, labels map[string]string) Certifi
 	}
 }
 
-func SetCertificateDuration(duration time.Duration) CertificateModifier {
+func SetCertificateDuration(duration *metav1.Duration) CertificateModifier {
 	return func(crt *v1.Certificate) {
-		crt.Spec.Duration = &metav1.Duration{Duration: duration}
+		crt.Spec.Duration = duration
 	}
 }
 
-func SetCertificateRenewBefore(renewBefore time.Duration) CertificateModifier {
+func SetCertificateRenewBefore(renewBefore *metav1.Duration) CertificateModifier {
 	return func(crt *v1.Certificate) {
-		crt.Spec.RenewBefore = &metav1.Duration{Duration: renewBefore}
+		crt.Spec.RenewBefore = renewBefore
 	}
 }
 
@@ -191,6 +200,9 @@ func SetCertificateRenewalTime(p metav1.Time) CertificateModifier {
 
 func SetCertificateOrganization(orgs ...string) CertificateModifier {
 	return func(ch *v1.Certificate) {
+		if ch.Spec.Subject == nil {
+			ch.Spec.Subject = &v1.X509Subject{}
+		}
 		ch.Spec.Subject.Organizations = orgs
 	}
 }
@@ -225,15 +237,29 @@ func SetCertificateGeneration(gen int64) CertificateModifier {
 	}
 }
 
+func SetCertificateCreationTimestamp(creationTimestamp metav1.Time) CertificateModifier {
+	return func(crt *v1.Certificate) {
+		crt.ObjectMeta.CreationTimestamp = creationTimestamp
+	}
+}
+
 func AddCertificateAnnotations(annotations map[string]string) CertificateModifier {
 	return func(crt *v1.Certificate) {
 		if crt.Annotations == nil {
 			crt.Annotations = make(map[string]string)
 		}
+		maps.Copy(crt.Annotations, annotations)
+	}
+}
 
-		for k, v := range annotations {
-			crt.Annotations[k] = v
+func SetCertificateRenewalWindows(windows []v1.CertificateRenewalWindows) CertificateModifier {
+	return func(crt *v1.Certificate) {
+		if crt.Spec.Renewal == nil {
+			crt.Spec.Renewal = new(v1.CertificateRenewal)
 		}
+
+		crt.Spec.Renewal.Policy = v1.CertificateRenewalPolicyRenewBefore
+		crt.Spec.Renewal.Windows = windows
 	}
 }
 
@@ -242,9 +268,7 @@ func AddCertificateLabels(labels map[string]string) CertificateModifier {
 		if crt.Labels == nil {
 			crt.Labels = make(map[string]string)
 		}
-		for k, v := range labels {
-			crt.Labels[k] = v
-		}
+		maps.Copy(crt.Labels, labels)
 	}
 }
 
@@ -276,5 +300,11 @@ func SetCertificateRevisionHistoryLimit(limit int32) CertificateModifier {
 func SetCertificateAdditionalOutputFormats(additionalOutputFormats ...v1.CertificateAdditionalOutputFormat) CertificateModifier {
 	return func(crt *v1.Certificate) {
 		crt.Spec.AdditionalOutputFormats = additionalOutputFormats
+	}
+}
+
+func SetCertificateKeystore(keystores *v1.CertificateKeystores) CertificateModifier {
+	return func(crt *v1.Certificate) {
+		crt.Spec.Keystores = keystores
 	}
 }

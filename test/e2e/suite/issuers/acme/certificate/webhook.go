@@ -20,25 +20,25 @@ import (
 	"context"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/log"
-	"github.com/cert-manager/cert-manager/test/e2e/util"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/log"
+	"github.com/cert-manager/cert-manager/e2e-tests/util"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = framework.CertManagerDescribe("ACME webhook DNS provider", func() {
 	f := framework.NewDefaultFramework("acme-dns01-sample-webhook")
-	//h := f.Helper()
 
 	Context("with the sample webhook solver deployed", func() {
 		issuerName := "test-acme-issuer"
@@ -46,8 +46,8 @@ var _ = framework.CertManagerDescribe("ACME webhook DNS provider", func() {
 		certificateSecretName := "test-acme-certificate"
 		dnsDomain := ""
 
-		BeforeEach(func() {
-			dnsDomain = "example.com"
+		BeforeEach(func(testingCtx context.Context) {
+			dnsDomain = "dns01.example.com"
 
 			By("Creating an Issuer")
 			issuer := gen.Issuer(issuerName,
@@ -75,10 +75,10 @@ var _ = framework.CertManagerDescribe("ACME webhook DNS provider", func() {
 					},
 				}))
 			issuer.Namespace = f.Namespace.Name
-			issuer, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+			_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			By("Waiting for Issuer to become Ready")
-			err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+			err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 				issuerName,
 				v1.IssuerCondition{
 					Type:   v1.IssuerConditionReady,
@@ -86,7 +86,7 @@ var _ = framework.CertManagerDescribe("ACME webhook DNS provider", func() {
 				})
 			Expect(err).NotTo(HaveOccurred())
 			By("Verifying the ACME account URI is set")
-			err = util.WaitForIssuerStatusFunc(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+			err = util.WaitForIssuerStatusFunc(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 				issuerName,
 				func(i *v1.Issuer) (bool, error) {
 					if i.GetStatus().ACMEStatus().URI == "" {
@@ -96,89 +96,90 @@ var _ = framework.CertManagerDescribe("ACME webhook DNS provider", func() {
 				})
 			Expect(err).NotTo(HaveOccurred())
 			By("Verifying ACME account private key exists")
-			secret, err := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Get(context.TODO(), f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.GetOptions{})
+			secret, err := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Get(testingCtx, f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			if len(secret.Data) != 1 {
 				Fail("Expected 1 key in ACME account private key secret, but there was %d", len(secret.Data))
 			}
 		})
 
-		AfterEach(func() {
+		AfterEach(func(testingCtx context.Context) {
 			By("Cleaning up")
-			f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(context.TODO(), issuerName, metav1.DeleteOptions{})
-			f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(context.TODO(), f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.DeleteOptions{})
-			f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(context.TODO(), certificateSecretName, metav1.DeleteOptions{})
+			err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(testingCtx, issuerName, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			err = f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(testingCtx, f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should call the dummy webhook provider and mark the challenges as presented=true", func() {
+		It("should call the dummy webhook provider and mark the challenges as presented=true with presentedAt set", func(testingCtx context.Context) {
 			By("Creating a Certificate")
 
 			certClient := f.CertManagerClientSet.CertmanagerV1().Certificates(f.Namespace.Name)
 
 			cert := gen.Certificate(certificateName,
 				gen.SetCertificateSecretName(certificateSecretName),
-				gen.SetCertificateIssuer(cmmeta.ObjectReference{Name: issuerName}),
+				gen.SetCertificateIssuer(cmmeta.IssuerReference{Name: issuerName}),
 				gen.SetCertificateDNSNames(dnsDomain),
 			)
 			cert.Namespace = f.Namespace.Name
 
-			cert, err := certClient.Create(context.TODO(), cert, metav1.CreateOptions{})
+			cert, err := certClient.Create(testingCtx, cert, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var order *cmacme.Order
 			logf, done := log.LogBackoff()
 			defer done()
-			pollErr := wait.PollImmediate(2*time.Second, time.Minute*1,
-				func() (bool, error) {
-					orders, err := listOwnedOrders(f.CertManagerClientSet, cert)
-					Expect(err).NotTo(HaveOccurred())
+			pollErr := wait.PollUntilContextTimeout(testingCtx, 2*time.Second, time.Minute*1, true, func(ctx context.Context) (bool, error) {
+				orders, err := listOwnedOrders(ctx, f.CertManagerClientSet, cert)
+				Expect(err).NotTo(HaveOccurred())
 
-					logf("Found %d orders for certificate", len(orders))
-					if len(orders) == 1 {
-						order = orders[0]
-						logf("Found order named %q", order.Name)
-						return true, nil
-					}
+				logf("Found %d orders for certificate", len(orders))
+				if len(orders) == 1 {
+					order = orders[0]
+					logf("Found order named %q", order.Name)
+					return true, nil
+				}
 
-					logf("Waiting as one Order should exist, but we found %d", len(orders))
-					return false, nil
-				},
-			)
+				logf("Waiting as one Order should exist, but we found %d", len(orders))
+				return false, nil
+			})
 			Expect(pollErr).NotTo(HaveOccurred())
 
 			logf, done = log.LogBackoff()
 			defer done()
-			pollErr = wait.PollImmediate(2*time.Second, time.Minute*3,
-				func() (bool, error) {
-					l, err := listOwnedChallenges(f.CertManagerClientSet, order)
-					Expect(err).NotTo(HaveOccurred())
+			pollErr = wait.PollUntilContextTimeout(testingCtx, 2*time.Second, time.Minute*3, true, func(ctx context.Context) (bool, error) {
+				l, err := listOwnedChallenges(ctx, f.CertManagerClientSet, order)
+				Expect(err).NotTo(HaveOccurred())
 
-					logf("Found %d challenges", len(l))
-					if len(l) == 0 {
-						logf("Waiting for at least one challenge to exist")
-						return false, nil
+				logf("Found %d challenges", len(l))
+				if len(l) == 0 {
+					logf("Waiting for at least one challenge to exist")
+					return false, nil
+				}
+
+				allPresented := true
+				for _, ch := range l {
+					logf("Found challenge named %q", ch.Name)
+
+					if !ch.Status.Presented {
+						logf("Challenge %q has not been 'Presented'", ch.Name)
+						allPresented = false
 					}
-
-					allPresented := true
-					for _, ch := range l {
-						logf("Found challenge named %q", ch.Name)
-
-						if ch.Status.Presented == false {
-							logf("Challenge %q has not been 'Presented'", ch.Name)
-							allPresented = false
-						}
+					if ch.Status.PresentedAt == nil {
+						logf("Challenge %q does not have PresentedAt set", ch.Name)
+						allPresented = false
 					}
+				}
 
-					return allPresented, nil
-				},
-			)
+				return allPresented, nil
+			})
 			Expect(pollErr).NotTo(HaveOccurred())
 		})
 	})
 })
 
-func listOwnedChallenges(cl versioned.Interface, owner *cmacme.Order) ([]*cmacme.Challenge, error) {
-	l, err := cl.AcmeV1().Challenges(owner.Namespace).List(context.TODO(), metav1.ListOptions{})
+func listOwnedChallenges(ctx context.Context, cl versioned.Interface, owner *cmacme.Order) ([]*cmacme.Challenge, error) {
+	l, err := cl.AcmeV1().Challenges(owner.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -194,8 +195,8 @@ func listOwnedChallenges(cl versioned.Interface, owner *cmacme.Order) ([]*cmacme
 	return owned, nil
 }
 
-func listOwnedOrders(cl versioned.Interface, owner *v1.Certificate) ([]*cmacme.Order, error) {
-	l, err := cl.AcmeV1().Orders(owner.Namespace).List(context.TODO(), metav1.ListOptions{})
+func listOwnedOrders(ctx context.Context, cl versioned.Interface, owner *v1.Certificate) ([]*cmacme.Order, error) {
+	l, err := cl.AcmeV1().Orders(owner.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}

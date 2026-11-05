@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,15 +28,22 @@ import (
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	applymetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/cert-manager/cert-manager/internal/controller/certificates"
-	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
-	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	utilpki "github.com/cert-manager/cert-manager/pkg/util/pki"
+)
+
+// DefaultPassword is the string "changeit", a commonly-used password for keystore files.
+const DefaultKeystorePassword = "changeit"
+
+const (
+	reasonKeystorePasswordSecretNotFound = "KeystorePasswordSecretNotFound"
+	reasonSecretDataFailed               = "SecretDataFailed"
 )
 
 var (
@@ -45,7 +53,8 @@ var (
 // SecretsManager creates and updates secrets with certificate and key data.
 type SecretsManager struct {
 	secretClient coreclient.SecretsGetter
-	secretLister corelisters.SecretLister
+	secretLister internalinformers.SecretLister
+	recorder     record.EventRecorder
 
 	// fieldManager is the manager name used for the Apply operations on Secrets.
 	fieldManager string
@@ -59,7 +68,9 @@ type SecretsManager struct {
 
 // SecretData is a structure wrapping private key, Certificate and CA data
 type SecretData struct {
-	PrivateKey, Certificate, CA []byte
+	PrivateKey, Certificate, CA         []byte // #nosec G117 -- holds runtime certificate material; not a hardcoded secret
+	CertificateName                     string
+	IssuerName, IssuerKind, IssuerGroup string
 }
 
 // NewSecretsManager returns a new SecretsManager. Setting
@@ -67,13 +78,15 @@ type SecretData struct {
 // when the corresponding Certificate is deleted.
 func NewSecretsManager(
 	secretClient coreclient.SecretsGetter,
-	secretLister corelisters.SecretLister,
+	secretLister internalinformers.SecretLister,
+	recorder record.EventRecorder,
 	fieldManager string,
 	enableSecretOwnerReferences bool,
 ) *SecretsManager {
 	return &SecretsManager{
 		secretClient:                secretClient,
 		secretLister:                secretLister,
+		recorder:                    recorder,
 		fieldManager:                fieldManager,
 		enableSecretOwnerReferences: enableSecretOwnerReferences,
 	}
@@ -84,7 +97,7 @@ func NewSecretsManager(
 // If the Secret resource does not exist, it will be created on Apply.
 // UpdateData will also update deprecated annotations if they exist.
 func (s *SecretsManager) UpdateData(ctx context.Context, crt *cmapi.Certificate, data SecretData) error {
-	secret, err := s.getCertificateSecret(ctx, crt)
+	secret, err := s.getCertificateSecret(crt)
 	if err != nil {
 		return err
 	}
@@ -93,6 +106,11 @@ func (s *SecretsManager) UpdateData(ctx context.Context, crt *cmapi.Certificate,
 	log = logf.WithResource(log, secret)
 
 	if err := s.setValues(crt, secret, data); err != nil {
+		// setValues is the single choke point for every failure to build the
+		// Secret contents. These are typically a misconfiguration of the
+		// Certificate that repeats on every reconcile, so record them rather
+		// than leaving them visible only in the controller logs.
+		s.recorder.Eventf(crt, corev1.EventTypeWarning, reasonSecretDataFailed, "Failed to build Secret data: %s", err.Error())
 		return err
 	}
 
@@ -137,11 +155,9 @@ func (s *SecretsManager) setValues(crt *cmapi.Certificate, secret *corev1.Secret
 		return fmt.Errorf("failed to add keystores to Secret: %w", err)
 	}
 
-	// Add additional output formats if feature enabled.
-	if utilfeature.DefaultFeatureGate.Enabled(feature.AdditionalCertificateOutputFormats) {
-		if err := setAdditionalOutputFormats(crt, secret, data); err != nil {
-			return fmt.Errorf("failed to add additional output formats to Secret: %w", err)
-		}
+	// Add additional output formats if enabled.
+	if err := setAdditionalOutputFormats(crt, secret, data); err != nil {
+		return fmt.Errorf("failed to add additional output formats to Secret: %w", err)
 	}
 
 	secret.Data[corev1.TLSPrivateKeyKey] = data.PrivateKey
@@ -150,36 +166,53 @@ func (s *SecretsManager) setValues(crt *cmapi.Certificate, secret *corev1.Secret
 		secret.Data[cmmeta.TLSCAKey] = data.CA
 	}
 
-	var certificate *x509.Certificate
-	if len(data.Certificate) > 0 {
-		var err error
-		certificate, err = utilpki.DecodeX509CertificateBytes(data.Certificate)
-		// TODO: handle InvalidData here?
-		if err != nil {
-			return err
-		}
+	if secret.Annotations == nil {
+		secret.Annotations = make(map[string]string)
 	}
 
-	secret.Annotations = certificates.AnnotationsForCertificateSecret(crt, certificate)
 	if secret.Labels == nil {
 		secret.Labels = make(map[string]string)
 	}
 
 	if crt.Spec.SecretTemplate != nil {
-		for k, v := range crt.Spec.SecretTemplate.Labels {
-			secret.Labels[k] = v
-		}
-		for k, v := range crt.Spec.SecretTemplate.Annotations {
-			secret.Annotations[k] = v
+		maps.Copy(secret.Labels, crt.Spec.SecretTemplate.Labels)
+		maps.Copy(secret.Annotations, crt.Spec.SecretTemplate.Annotations)
+	}
+
+	var certificate *x509.Certificate
+	if len(data.Certificate) > 0 {
+		var err error
+		certificate, err = utilpki.DecodeX509CertificateBytes(data.Certificate)
+		// TODO: handle InvalidData here? Maybe we should still patch the secret
+		// when we detect that the certificate bytes are invalid.
+		if err != nil {
+			return err
 		}
 	}
+
+	certificateDetailsAnnotations := certificates.AnnotationsForCertificate(certificate)
+	maps.Copy(secret.Annotations, certificateDetailsAnnotations)
+
+	// Add the certificate name and issuer details to the secret annotations.
+	// If the annotations are not set/ empty, we do not use them to determine
+	// if the secret needs to be updated.
+	if data.CertificateName != "" {
+		secret.Annotations[cmapi.CertificateNameKey] = data.CertificateName
+	}
+	if data.IssuerName != "" || data.IssuerKind != "" || data.IssuerGroup != "" {
+		secret.Annotations[cmapi.IssuerNameAnnotationKey] = data.IssuerName
+		secret.Annotations[cmapi.IssuerKindAnnotationKey] = data.IssuerKind
+		secret.Annotations[cmapi.IssuerGroupAnnotationKey] = data.IssuerGroup
+	}
+
+	secret.Labels[cmapi.PartOfCertManagerControllerLabelKey] = "true"
 
 	return nil
 }
 
 // getCertificateSecret will return a secret which is ready for fields to be
 // applied. Only the Secret Type will be persisted from the original Secret.
-func (s *SecretsManager) getCertificateSecret(ctx context.Context, crt *cmapi.Certificate) (*corev1.Secret, error) {
+func (s *SecretsManager) getCertificateSecret(crt *cmapi.Certificate) (*corev1.Secret, error) {
 	// Get existing secret if it exists.
 	existingSecret, err := s.secretLister.Secrets(crt.Namespace).Get(crt.Spec.SecretName)
 
@@ -187,12 +220,10 @@ func (s *SecretsManager) getCertificateSecret(ctx context.Context, crt *cmapi.Ce
 	// created.
 	if apierrors.IsNotFound(err) {
 		return &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      crt.Spec.SecretName,
-				Namespace: crt.Namespace,
-			},
-			Data: make(map[string][]byte),
-			Type: corev1.SecretTypeTLS,
+			Name:      crt.Spec.SecretName,
+			Namespace: crt.Namespace,
+			Data:      make(map[string][]byte),
+			Type:      corev1.SecretTypeTLS,
 		}, nil
 	}
 
@@ -204,11 +235,9 @@ func (s *SecretsManager) getCertificateSecret(ctx context.Context, crt *cmapi.Ce
 	// Only copy Secret Type to not take ownership of annotations or labels on
 	// Apply.
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      crt.Spec.SecretName,
-			Namespace: crt.Namespace,
-		},
-		Data: make(map[string][]byte),
+		Name:      crt.Spec.SecretName,
+		Namespace: crt.Namespace,
+		Data:      make(map[string][]byte),
 		// Use the existing Secret's type since this may not be of type
 		// `kubernetes.io/tls`, if for example it was created beforehand. Type is
 		// immutable, so we must keep it to its original value.
@@ -219,51 +248,112 @@ func (s *SecretsManager) getCertificateSecret(ctx context.Context, crt *cmapi.Ce
 // setKeystores will set extra Secret Data keys according to any Keystores
 // which have been configured.
 func (s *SecretsManager) setKeystores(crt *cmapi.Certificate, secret *corev1.Secret, data SecretData) error {
-	// Handle the experimental PKCS12 support
-	if crt.Spec.Keystores != nil && crt.Spec.Keystores.PKCS12 != nil && crt.Spec.Keystores.PKCS12.Create {
+	if crt.Spec.Keystores == nil {
+		return nil
+	}
+
+	// Handle PKCS#12 keystores
+	if crt.Spec.Keystores.PKCS12 != nil && crt.Spec.Keystores.PKCS12.Create {
+		var pw []byte
+
 		ref := crt.Spec.Keystores.PKCS12.PasswordSecretRef
-		pwSecret, err := s.secretLister.Secrets(crt.Namespace).Get(ref.Name)
-		if err != nil {
-			return fmt.Errorf("fetching PKCS12 keystore password from Secret: %v", err)
+
+		switch {
+		case ref.Name != "":
+			pwSecret, err := s.secretLister.Secrets(crt.Namespace).Get(ref.Name)
+
+			if apierrors.IsNotFound(err) {
+				s.recorder.Eventf(crt, corev1.EventTypeWarning, reasonKeystorePasswordSecretNotFound, "PKCS12 keystore password Secret %q not found", ref.Name)
+			}
+
+			if err != nil {
+				return fmt.Errorf("fetching PKCS12 keystore password from Secret: %v", err)
+			}
+
+			if pwSecret.Data == nil || len(pwSecret.Data[ref.Key]) == 0 {
+				return fmt.Errorf("PKCS12 keystore password Secret contains no data for key %q", ref.Key)
+			}
+
+			pw = pwSecret.Data[ref.Key]
+
+		case crt.Spec.Keystores.PKCS12.Password != nil:
+			if len(*crt.Spec.Keystores.PKCS12.Password) == 0 {
+				return fmt.Errorf("PKCS12 literal password cannot be empty")
+			}
+
+			pw = []byte(*crt.Spec.Keystores.PKCS12.Password)
+
+		default:
+			return fmt.Errorf("either passwordSecretRef or password must be set for PKCS#12 keystore")
 		}
-		if pwSecret.Data == nil || len(pwSecret.Data[ref.Key]) == 0 {
-			return fmt.Errorf("PKCS12 keystore password Secret contains no data for key %q", ref.Key)
-		}
-		pw := pwSecret.Data[ref.Key]
-		keystoreData, err := encodePKCS12Keystore(string(pw), data.PrivateKey, data.Certificate, data.CA)
+
+		profile := crt.Spec.Keystores.PKCS12.Profile
+
+		keystoreData, err := encodePKCS12Keystore(profile, string(pw), data.PrivateKey, data.Certificate, data.CA)
 		if err != nil {
 			return fmt.Errorf("error encoding PKCS12 bundle: %w", err)
 		}
+
 		// always overwrite the keystore entry for now
-		secret.Data[pkcs12SecretKey] = keystoreData
+		secret.Data[cmapi.PKCS12SecretKey] = keystoreData
 
 		if len(data.CA) > 0 {
-			truststoreData, err := encodePKCS12Truststore(string(pw), data.CA)
+			truststoreData, err := encodePKCS12Truststore(profile, string(pw), data.CA)
 			if err != nil {
 				return fmt.Errorf("error encoding PKCS12 trust store bundle: %w", err)
 			}
 			// always overwrite the truststore entry
-			secret.Data[pkcs12TruststoreKey] = truststoreData
+			secret.Data[cmapi.PKCS12TruststoreKey] = truststoreData
 		}
 	}
 
-	// Handle the experimental JKS support
-	if crt.Spec.Keystores != nil && crt.Spec.Keystores.JKS != nil && crt.Spec.Keystores.JKS.Create {
+	// Handle JKS keystores
+	if crt.Spec.Keystores.JKS != nil && crt.Spec.Keystores.JKS.Create {
+		var pw []byte
+
 		ref := crt.Spec.Keystores.JKS.PasswordSecretRef
-		pwSecret, err := s.secretLister.Secrets(crt.Namespace).Get(ref.Name)
-		if err != nil {
-			return fmt.Errorf("fetching JKS keystore password from Secret: %v", err)
+
+		switch {
+		case ref.Name != "":
+			pwSecret, err := s.secretLister.Secrets(crt.Namespace).Get(ref.Name)
+
+			if apierrors.IsNotFound(err) {
+				s.recorder.Eventf(crt, corev1.EventTypeWarning, reasonKeystorePasswordSecretNotFound, "JKS keystore password Secret %q not found", ref.Name)
+			}
+
+			if err != nil {
+				return fmt.Errorf("fetching JKS keystore password from Secret: %v", err)
+			}
+
+			if pwSecret.Data == nil || len(pwSecret.Data[ref.Key]) == 0 {
+				return fmt.Errorf("JKS keystore password Secret contains no data for key %q", ref.Key)
+			}
+
+			pw = pwSecret.Data[ref.Key]
+
+		case crt.Spec.Keystores.JKS.Password != nil:
+			if len(*crt.Spec.Keystores.JKS.Password) == 0 {
+				return fmt.Errorf("JKS literal password cannot be empty")
+			}
+
+			pw = []byte(*crt.Spec.Keystores.JKS.Password)
+
+		default:
+			return fmt.Errorf("either passwordSecretRef or password must be set for JKS keystore")
 		}
-		if pwSecret.Data == nil || len(pwSecret.Data[ref.Key]) == 0 {
-			return fmt.Errorf("JKS keystore password Secret contains no data for key %q", ref.Key)
+
+		alias := "certificate"
+		if crt.Spec.Keystores.JKS.Alias != nil {
+			alias = *crt.Spec.Keystores.JKS.Alias
 		}
-		pw := pwSecret.Data[ref.Key]
-		keystoreData, err := encodeJKSKeystore(pw, data.PrivateKey, data.Certificate, data.CA)
+
+		keystoreData, err := encodeJKSKeystore(pw, alias, data.PrivateKey, data.Certificate, data.CA)
 		if err != nil {
 			return fmt.Errorf("error encoding JKS bundle: %w", err)
 		}
+
 		// always overwrite the keystore entry
-		secret.Data[jksSecretKey] = keystoreData
+		secret.Data[cmapi.JKSSecretKey] = keystoreData
 
 		if len(data.CA) > 0 {
 			truststoreData, err := encodeJKSTruststore(pw, data.CA)
@@ -271,7 +361,7 @@ func (s *SecretsManager) setKeystores(crt *cmapi.Certificate, secret *corev1.Sec
 				return fmt.Errorf("error encoding JKS trust store bundle: %w", err)
 			}
 			// always overwrite the keystore entry
-			secret.Data[jksTruststoreKey] = truststoreData
+			secret.Data[cmapi.JKSTruststoreKey] = truststoreData
 		}
 	}
 

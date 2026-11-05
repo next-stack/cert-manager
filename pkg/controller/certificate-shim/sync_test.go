@@ -17,28 +17,36 @@ limitations under the License.
 package shimhelper
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"maps"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	coretesting "k8s.io/client-go/testing"
-	"k8s.io/utils/pointer"
-	gwapi "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	gwapi "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/pkg/controller"
+	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
 
@@ -79,38 +87,37 @@ func TestSync(t *testing.T) {
 	acmeClusterIssuer := gen.ClusterIssuer("issuer-name",
 		gen.SetIssuerACME(cmacme.ACMEIssuer{}))
 	type testT struct {
-		Name                string
-		IngressLike         metav1.Object
-		Issuer              cmapi.GenericIssuer
-		IssuerLister        []runtime.Object
-		ClusterIssuerLister []runtime.Object
-		CertificateLister   []runtime.Object
-		DefaultIssuerName   string
-		DefaultIssuerKind   string
-		DefaultIssuerGroup  string
-		Err                 bool
-		ExpectedCreate      []*cmapi.Certificate
-		ExpectedUpdate      []*cmapi.Certificate
-		ExpectedDelete      []*cmapi.Certificate
-		ExpectedEvents      []string
+		Name                     string
+		IngressLike              metav1.Object
+		Issuer                   cmapi.GenericIssuer
+		IssuerLister             []runtime.Object
+		ClusterIssuerLister      []runtime.Object
+		CertificateLister        []runtime.Object
+		DefaultIssuerName        string
+		DefaultIssuerKind        string
+		DefaultIssuerGroup       string
+		GatewayAPIExtraProtocols sets.Set[string]
+		Err                      bool
+		ExpectedCreate           []*cmapi.Certificate
+		ExpectedUpdate           []*cmapi.Certificate
+		ExpectedDelete           []*cmapi.Certificate
+		ExpectedEvents           []string
 	}
 	testIngressShim := []testT{
 		{
 			Name:   "return a single Certificate for an ingress with a single valid TLS entry and common-name annotation",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.CommonNameAnnotationKey:               "my-cn",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -124,19 +131,302 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						CommonName: "my-cn",
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for an ingress with dnsNames and ipv4 addresses",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com", "10.112.234.34", "1.1.1.1"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:    []string{"example.com", "www.example.com"},
+						IPAddresses: []string{"10.112.234.34", "1.1.1.1"},
+						CommonName:  "my-cn",
+						SecretName:  "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for an ingress with dnsNames and ipv6 addresses",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com", "2a00:1450:4009:819::aaaa", "2a00:1450:4009:819::eeee"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:    []string{"example.com", "www.example.com"},
+						IPAddresses: []string{"2a00:1450:4009:819::aaaa", "2a00:1450:4009:819::eeee"},
+						CommonName:  "my-cn",
+						SecretName:  "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for an ingress with dnsNames and ipv4 and ipv6 addresses",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com", "1.1.1.1", "2a00:1450:4009:819::eeee"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:    []string{"example.com", "www.example.com"},
+						IPAddresses: []string{"1.1.1.1", "2a00:1450:4009:819::eeee"},
+						CommonName:  "my-cn",
+						SecretName:  "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for an ingress with dnsNames and ipv4 and ipv6 addresses from ip-sans annotation",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					cmapi.IPSANAnnotationKey:                    "1.1.1.1,2a00:1450:4009:819::eeee",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:    []string{"example.com", "www.example.com"},
+						IPAddresses: []string{"1.1.1.1", "2a00:1450:4009:819::eeee"},
+						CommonName:  "my-cn",
+						SecretName:  "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for an ingress with dnsNames and empty alt-names annotation and ipv4 and ipv6 addresses",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					cmapi.AltNamesAnnotationKey:                 "",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com", "1.1.1.1", "2a00:1450:4009:819::eeee"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:    []string{"example.com", "www.example.com"},
+						IPAddresses: []string{"1.1.1.1", "2a00:1450:4009:819::eeee"},
+						CommonName:  "my-cn",
+						SecretName:  "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for an ingress with dnsNames and altNames from annotation and ipv4 and ipv6 addresses",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					cmapi.AltNamesAnnotationKey:                 "foo.alt.example.com,bar.alt.example.com",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com", "1.1.1.1", "2a00:1450:4009:819::eeee"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:    []string{"example.com", "www.example.com", "foo.alt.example.com", "bar.alt.example.com"},
+						IPAddresses: []string{"1.1.1.1", "2a00:1450:4009:819::eeee"},
+						CommonName:  "my-cn",
+						SecretName:  "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -149,18 +439,16 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an ingress with a single valid TLS entry and HTTP01 annotations using edit-in-place",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmacme.IngressEditInPlaceAnnotationKey:      "true",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmacme.IngressEditInPlaceAnnotationKey:      "true",
+				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -174,22 +462,20 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						Annotations: map[string]string{
-							cmacme.ACMECertificateHTTP01IngressNameOverride: "ingress-name",
-							cmapi.IssueTemporaryCertificateAnnotation:       "true",
-						},
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressNameOverride: "ingress-name",
+						cmapi.IssueTemporaryCertificateAnnotation:       "true",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -202,18 +488,16 @@ func TestSync(t *testing.T) {
 			Name:   "create a Certificate with the HTTP01 name override if the given ingress uses http01 annotations",
 			Issuer: gen.Issuer(acmeIssuer.Name),
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmacme.IngressEditInPlaceAnnotationKey:      "true",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmacme.IngressEditInPlaceAnnotationKey:      "true",
+				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -227,22 +511,20 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						Annotations: map[string]string{
-							cmacme.ACMECertificateHTTP01IngressNameOverride: "ingress-name",
-							cmapi.IssueTemporaryCertificateAnnotation:       "true",
-						},
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressNameOverride: "ingress-name",
+						cmapi.IssueTemporaryCertificateAnnotation:       "true",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -255,14 +537,12 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an ingress with a single valid TLS entry and HTTP01 annotations with no ingress class set",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -276,15 +556,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -297,15 +575,13 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an ingress with a single valid TLS entry and HTTP01 annotations with a custom ingress class",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:             "nginx-ing",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:             "nginx-ing",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -319,15 +595,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -340,16 +614,14 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an ingress with a single valid TLS entry and HTTP01 annotations with a certificate ingress class",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey:            "issuer-name",
-						cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey: "cert-ing",
-						cmapi.IngressClassAnnotationKey:                        "nginx-ing",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey:            "issuer-name",
+					cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey: "cert-ing",
+					cmapi.IngressClassAnnotationKey:                        "nginx-ing",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -363,18 +635,16 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-						Annotations: map[string]string{
-							cmacme.ACMECertificateHTTP01IngressClassOverride: "cert-ing",
-						},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressClassOverride: "cert-ing",
 					},
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -384,19 +654,16 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
-			Name:   "edit-in-place set to false should not trigger editing the ingress in-place",
+			Name:   "return a single HTTP01 Certificate for an ingress with a single valid TLS entry and HTTP01 annotations with a certificate ingressClassName",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:             "nginx-ing",
-						cmacme.IngressEditInPlaceAnnotationKey:      "false",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey:                "issuer-name",
+					cmapi.IngressACMEIssuerHTTP01IngressClassNameAnnotationKey: "cert-ing-class-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -410,15 +677,147 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressClassNameOverride: "cert-ing-class-name",
 					},
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single HTTP01 Certificate for an ingress with a single valid TLS entry and valid secret template annotation",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressSecretTemplate:                 `{ "annotations": { "example-annotation" : "dummy-value" }, "labels": { "example-label" : "dummy-value" } }`,
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com", "www.example.com"},
+						SecretName: "example-com-tls",
+						SecretTemplate: &cmapi.CertificateSecretTemplate{
+							Annotations: map[string]string{
+								"example-annotation": "dummy-value",
+							},
+							Labels: map[string]string{
+								"example-label": "dummy-value",
+							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "secret template annotation should not allow cert-manager.io/ annotations",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressSecretTemplate:                 `{ "annotations": { "cert-manager.io/disallowed-annotation" : "dummy-value" } }`,
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ExpectedEvents: []string{`Warning BadConfig invalid ingress annotation "cert-manager.io/secret-template": secretTemplate must not have cert-manager.io/ annotations: "cert-manager.io/disallowed-annotation"`},
+		},
+		{
+			Name:   "secret template annotation should not allow unknown fields",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressSecretTemplate:                 `{ "unknown-field": "true" }`,
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ExpectedEvents: []string{`Warning BadConfig invalid ingress annotation "cert-manager.io/secret-template": error parsing secret template JSON: json: unknown field "unknown-field"`},
+		},
+		{
+			Name:   "edit-in-place set to false should not trigger editing the ingress in-place",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:             "nginx-ing",
+					cmacme.IngressEditInPlaceAnnotationKey:      "false",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com", "www.example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -431,14 +830,12 @@ func TestSync(t *testing.T) {
 			Name:   "return a single DNS01 Certificate for an ingress with a single valid TLS entry",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -452,15 +849,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -477,14 +872,12 @@ func TestSync(t *testing.T) {
 			DefaultIssuerGroup:  "cert-manager.io",
 			ClusterIssuerLister: []runtime.Object{clusterIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						"kubernetes.io/tls-acme": "true",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					"kubernetes.io/tls-acme": "true",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -497,15 +890,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "ClusterIssuer",
 							Group: "cert-manager.io",
@@ -524,14 +915,12 @@ func TestSync(t *testing.T) {
 				`Normal CreateCertificate Successfully created Certificate "example-com-tls"`,
 			},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -546,16 +935,14 @@ func TestSync(t *testing.T) {
 			},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
 						Usages:     cmapi.DefaultKeyUsages(),
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -573,14 +960,12 @@ func TestSync(t *testing.T) {
 				`Normal CreateCertificate Successfully created Certificate "example-com-tls"`,
 			},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -595,16 +980,14 @@ func TestSync(t *testing.T) {
 			},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						SecretName: "example-com-tls",
 						Usages:     cmapi.DefaultKeyUsages(),
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -615,14 +998,12 @@ func TestSync(t *testing.T) {
 		{
 			Name: "should error if the specified issuer is not found",
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "invalid-issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "invalid-issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 			},
 		},
 		{
@@ -630,14 +1011,12 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -651,15 +1030,13 @@ func TestSync(t *testing.T) {
 			DefaultIssuerGroup: "cert-manager.io",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -674,14 +1051,12 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -694,22 +1069,20 @@ func TestSync(t *testing.T) {
 			CertificateLister: []runtime.Object{
 				buildCertificate("existing-crt",
 					gen.DefaultTestNamespace,
-					buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					buildIngressOwnerReferences("ingress-name"),
 				),
 			},
 			DefaultIssuerKind: "Issuer",
 			ExpectedEvents:    []string{`Normal UpdateCertificate Successfully updated Certificate "existing-crt"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -723,17 +1096,15 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -746,18 +1117,16 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cert-secret-name",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"a-different-value": "should be removed",
-						},
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:      "cert-secret-name",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"a-different-value": "should be removed",
 					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -768,18 +1137,16 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cert-secret-name",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:      "cert-secret-name",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -793,15 +1160,13 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey:    "issuer-name",
-						cmapi.RevisionHistoryLimitAnnotationKey: "1",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:    "issuer-name",
+					cmapi.RevisionHistoryLimitAnnotationKey: "1",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -814,40 +1179,36 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
 						Usages:               cmapi.DefaultKeyUsages(),
-						RevisionHistoryLimit: pointer.Int32(7),
+						RevisionHistoryLimit: new(int32(7)),
 					},
 				},
 			},
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
 						Usages:               cmapi.DefaultKeyUsages(),
-						RevisionHistoryLimit: pointer.Int32(1),
+						RevisionHistoryLimit: new(int32(1)),
 					},
 				},
 			},
@@ -857,16 +1218,14 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
-						cmapi.PrivateKeyAlgorithmAnnotationKey: "RSA",
-						cmapi.PrivateKeySizeAnnotationKey:      "4096",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
+					cmapi.PrivateKeyAlgorithmAnnotationKey: "RSA",
+					cmapi.PrivateKeySizeAnnotationKey:      "4096",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -879,15 +1238,13 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -902,15 +1259,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -928,16 +1283,14 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
-						cmapi.PrivateKeyAlgorithmAnnotationKey: "ECDSA",
-						cmapi.PrivateKeySizeAnnotationKey:      "384",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
+					cmapi.PrivateKeyAlgorithmAnnotationKey: "ECDSA",
+					cmapi.PrivateKeySizeAnnotationKey:      "384",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -950,15 +1303,13 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -973,15 +1324,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -999,17 +1348,15 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
-						cmapi.PrivateKeyAlgorithmAnnotationKey: "ECDSA",
-						cmapi.PrivateKeyEncodingAnnotationKey:  "PKCS8",
-						cmapi.PrivateKeySizeAnnotationKey:      "384",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
+					cmapi.PrivateKeyAlgorithmAnnotationKey: "ECDSA",
+					cmapi.PrivateKeyEncodingAnnotationKey:  "PKCS8",
+					cmapi.PrivateKeySizeAnnotationKey:      "384",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1022,15 +1369,13 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1045,15 +1390,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1072,18 +1415,16 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey:        "issuer-name",
-						cmapi.PrivateKeyAlgorithmAnnotationKey:      "ECDSA",
-						cmapi.PrivateKeyEncodingAnnotationKey:       "PKCS1",
-						cmapi.PrivateKeySizeAnnotationKey:           "384",
-						cmapi.PrivateKeyRotationPolicyAnnotationKey: "Always",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:        "issuer-name",
+					cmapi.PrivateKeyAlgorithmAnnotationKey:      "ECDSA",
+					cmapi.PrivateKeyEncodingAnnotationKey:       "PKCS1",
+					cmapi.PrivateKeySizeAnnotationKey:           "384",
+					cmapi.PrivateKeyRotationPolicyAnnotationKey: "Always",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1096,15 +1437,13 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1119,15 +1458,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "cert-secret-name",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1143,19 +1480,177 @@ func TestSync(t *testing.T) {
 			},
 		},
 		{
+			Name:         "should update an existing Certificate resource with different Duration if it does not match specified on the IngressLike",
+			Issuer:       acmeIssuer,
+			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.DurationAnnotationKey:          "3600s",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "cert-secret-name",
+						},
+					},
+				},
+			},
+			DefaultIssuerKind: "Issuer",
+			CertificateLister: []runtime.Object{
+				&cmapi.Certificate{
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "cert-secret-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "Issuer",
+						},
+						Usages:   cmapi.DefaultKeyUsages(),
+						Duration: &metav1.Duration{Duration: 7200 * time.Second},
+					},
+				},
+			},
+			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
+			ExpectedUpdate: []*cmapi.Certificate{
+				{
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "cert-secret-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "Issuer",
+						},
+						Usages:   cmapi.DefaultKeyUsages(),
+						Duration: &metav1.Duration{Duration: 3600 * time.Second},
+					},
+				},
+			},
+		},
+		{
+			Name:         "should update an existing Certificate resource with different RenewBefore if it does not match specified on the IngressLike",
+			Issuer:       acmeIssuer,
+			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.RenewBeforeAnnotationKey:       "3600s",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "cert-secret-name",
+						},
+					},
+				},
+			},
+			DefaultIssuerKind: "Issuer",
+			CertificateLister: []runtime.Object{
+				&cmapi.Certificate{
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "cert-secret-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "Issuer",
+						},
+						Usages:      cmapi.DefaultKeyUsages(),
+						RenewBefore: &metav1.Duration{Duration: 7200 * time.Second},
+					},
+				},
+			},
+			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
+			ExpectedUpdate: []*cmapi.Certificate{
+				{
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "cert-secret-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "Issuer",
+						},
+						Usages:      cmapi.DefaultKeyUsages(),
+						RenewBefore: &metav1.Duration{Duration: 3600 * time.Second},
+					},
+				},
+			},
+		},
+		{
+			Name:         "should not update an existing Certificate if there are no changes (testing elements that default to the nil pointer)",
+			Issuer:       acmeIssuer,
+			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:    "issuer-name",
+					cmapi.DurationAnnotationKey:             "7200s",
+					cmapi.RenewBeforeAnnotationKey:          "3600s",
+					cmapi.RevisionHistoryLimitAnnotationKey: "1",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "cert-secret-name",
+						},
+					},
+				},
+			},
+			DefaultIssuerKind: "Issuer",
+			CertificateLister: []runtime.Object{
+				&cmapi.Certificate{
+					Name:            "cert-secret-name",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "cert-secret-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "Issuer",
+						},
+						Usages:               cmapi.DefaultKeyUsages(),
+						Duration:             &metav1.Duration{Duration: 7200 * time.Second},
+						RenewBefore:          &metav1.Duration{Duration: 3600 * time.Second},
+						RevisionHistoryLimit: new(int32(1)),
+					},
+				},
+			},
+		},
+		{
 			Name:         "should not update certificate if it does not belong to any ingress",
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:      "toot-ing",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:      "toot-ing",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1167,15 +1662,13 @@ func TestSync(t *testing.T) {
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: []metav1.OwnerReference{},
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: []metav1.OwnerReference{},
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1189,15 +1682,13 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:      "toot-ing",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:      "toot-ing",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1209,15 +1700,13 @@ func TestSync(t *testing.T) {
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("not-ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("not-ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1231,26 +1720,22 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("ingress-name"),
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1261,15 +1746,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal DeleteCertificate Successfully deleted unrequired Certificate "existing-crt"`},
 			ExpectedDelete: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -1282,16 +1765,14 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IssuerKindAnnotationKey:        "Issuer",
-						cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IssuerKindAnnotationKey:        "Issuer",
+					cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1303,16 +1784,14 @@ func TestSync(t *testing.T) {
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
 						CommonName: "example-common-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -1324,15 +1803,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "example-com-tls"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -1350,16 +1827,14 @@ func TestSync(t *testing.T) {
 				`Warning BadConfig spec.tls[0].secretName: Invalid value: "example-com-tls": this secret name must only appear in a single TLS entry but is also used in spec.tls[1].secretName`,
 			},
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IssuerKindAnnotationKey:        "Issuer",
-						cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IssuerKindAnnotationKey:        "Issuer",
+					cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1378,22 +1853,20 @@ func TestSync(t *testing.T) {
 			Name:   "Failure to translateIngressAnnotations",
 			Issuer: acmeIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey:        "issuer-name",
-						cmapi.IssuerKindAnnotationKey:               "Issuer",
-						cmapi.IssuerGroupAnnotationKey:              "cert-manager.io",
-						cmapi.RenewBeforeAnnotationKey:              "invalid renew before value",
-						cmapi.RevisionHistoryLimitAnnotationKey:     "invalid revision history limit value",
-						cmapi.PrivateKeyAlgorithmAnnotationKey:      "invalid private key algorithm value",
-						cmapi.PrivateKeyEncodingAnnotationKey:       "invalid private key encoding value",
-						cmapi.PrivateKeySizeAnnotationKey:           "invalid private key size value",
-						cmapi.PrivateKeyRotationPolicyAnnotationKey: "invalid private key rotation policy value",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:        "issuer-name",
+					cmapi.IssuerKindAnnotationKey:               "Issuer",
+					cmapi.IssuerGroupAnnotationKey:              "cert-manager.io",
+					cmapi.RenewBeforeAnnotationKey:              "invalid renew before value",
+					cmapi.RevisionHistoryLimitAnnotationKey:     "invalid revision history limit value",
+					cmapi.PrivateKeyAlgorithmAnnotationKey:      "invalid private key algorithm value",
+					cmapi.PrivateKeyEncodingAnnotationKey:       "invalid private key encoding value",
+					cmapi.PrivateKeySizeAnnotationKey:           "invalid private key size value",
+					cmapi.PrivateKeyRotationPolicyAnnotationKey: "invalid private key rotation policy value",
 				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1403,25 +1876,47 @@ func TestSync(t *testing.T) {
 					},
 				},
 			},
-			Err: true,
+			ExpectedEvents: []string{`Warning BadConfig invalid ingress annotation "cert-manager.io/renew-before": time: invalid duration "invalid renew before value"`},
+		},
+		{
+			Name:   "should record a BadConfig event for an MLDSA private key algorithm annotation if the MLDSAPrivateKeys feature gate is disabled",
+			Issuer: acmeIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
+					cmapi.IssuerKindAnnotationKey:          "Issuer",
+					cmapi.IssuerGroupAnnotationKey:         "cert-manager.io",
+					cmapi.PrivateKeyAlgorithmAnnotationKey: "MLDSA",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ExpectedEvents: []string{`Warning BadConfig invalid ingress annotation "cert-manager.io/private-key-algorithm": private key algorithm "MLDSA" requires the MLDSAPrivateKeys feature gate to be enabled`},
 		},
 		{
 			Name:   "return a single Certificate for an ingress with a single valid TLS entry with common-name and keyusage annotation",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ingress-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.CommonNameAnnotationKey:               "my-cn",
-						"cert-manager.io/usages":                    "signing,digital signature,content commitment",
-					},
-					UID: types.UID("ingress-name"),
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					"cert-manager.io/usages":                    "signing,digital signature,content commitment",
+				},
+				UID: types.UID("ingress-name"),
 				Spec: networkingv1.IngressSpec{
 					TLS: []networkingv1.IngressTLS{
 						{
@@ -1435,19 +1930,17 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						OwnerReferences: buildIngressOwnerReferences("ingress-name", gen.DefaultTestNamespace),
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com"},
 						CommonName: "my-cn",
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1460,34 +1953,316 @@ func TestSync(t *testing.T) {
 				},
 			},
 		},
-	}
-
-	testGatewayShim := []testT{
 		{
-			Name:   "return a single Certificate for a Gateway with a single valid TLS entry and common-name annotation",
+			Name:   "return a single Certificate for an ingress with a single valid TLS entry with common-name and subject street addresses annotation",
 			Issuer: acmeClusterIssuer,
-			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					cmapi.SubjectStreetAddressesAnnotationKey:   `"1725 Slough Avenue, Suite 200, Scranton Business Park"`,
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
 					Namespace: gen.DefaultTestNamespace,
 					Labels: map[string]string{
 						"my-test-label": "should be copied",
 					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.CommonNameAnnotationKey:               "my-cn",
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com", "www.example.com"},
+						CommonName: "my-cn",
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Subject: &cmapi.X509Subject{
+							StreetAddresses: []string{"1725 Slough Avenue, Suite 200, Scranton Business Park"},
+						},
+						Usages: cmapi.DefaultKeyUsages(),
 					},
-					UID: types.UID("gateway-name"),
 				},
+			},
+		},
+		{
+			Name:                "should not trigger an ingress sync if deleted in foreground",
+			Issuer:              clusterIssuer,
+			DefaultIssuerName:   "issuer-name",
+			DefaultIssuerKind:   "ClusterIssuer",
+			DefaultIssuerGroup:  "cert-manager.io",
+			ClusterIssuerLister: []runtime.Object{clusterIssuer},
+			IngressLike:         buildIngressInDeletion(buildIngress("", "", map[string]string{cmapi.IngressIssuerNameAnnotationKey: ""}), &metav1.Time{}, []string{metav1.FinalizerDeleteDependents}),
+		},
+
+		{
+			Name:   "should not propagate the applyset label",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+					applysetLabel:   "should not be propagated",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+						// note that the applyset label should not be here
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com", "www.example.com"},
+						CommonName: "my-cn",
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "extra Ingress annotation is copied to Certificate object",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels:    map[string]string{},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					"venafi.cert-manager.io/custom-fields":      "foo",
+					"venafi.cert-manager.io/do-not-copy":        "bar",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com", "www.example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels:    map[string]string{},
+					Annotations: map[string]string{
+						"venafi.cert-manager.io/custom-fields": "foo",
+					},
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com", "www.example.com"},
+						CommonName: "my-cn",
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:         "should update a Certificate annotations if custom annotation is needed",
+			Issuer:       acmeIssuer,
+			IssuerLister: []runtime.Object{acmeIssuer},
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
+					cmapi.IssuerKindAnnotationKey:          "Issuer",
+					cmapi.IssuerGroupAnnotationKey:         "cert-manager.io",
+					"venafi.cert-manager.io/custom-fields": "foo",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			CertificateLister: []runtime.Object{
+				&cmapi.Certificate{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						CommonName: "example-common-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name:  "issuer-name",
+							Kind:  "Issuer",
+							Group: "cert-manager.io",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "example-com-tls"`},
+			ExpectedUpdate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Annotations: map[string]string{
+						"venafi.cert-manager.io/custom-fields": "foo",
+					},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name:  "issuer-name",
+							Kind:  "Issuer",
+							Group: "cert-manager.io",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:         "should append a Certificate annotations if annotation is set",
+			Issuer:       acmeIssuer,
+			IssuerLister: []runtime.Object{acmeIssuer},
+			IngressLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey:   "issuer-name",
+					cmapi.IssuerKindAnnotationKey:          "Issuer",
+					cmapi.IssuerGroupAnnotationKey:         "cert-manager.io",
+					"venafi.cert-manager.io/custom-fields": "foo",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+			CertificateLister: []runtime.Object{
+				&cmapi.Certificate{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Annotations: map[string]string{
+						"venafi.cert-manager.io/custom-fields": "bar",
+					},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						CommonName: "example-common-name",
+						IssuerRef: cmmeta.IssuerReference{
+							Name:  "issuer-name",
+							Kind:  "Issuer",
+							Group: "cert-manager.io",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "example-com-tls"`},
+			ExpectedUpdate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Annotations: map[string]string{
+						"venafi.cert-manager.io/custom-fields": "foo",
+					},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name:  "issuer-name",
+							Kind:  "Issuer",
+							Group: "cert-manager.io",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+	}
+
+	testGatewayShim := []testT{
+		{
+			Name:   "return a single Certificate for a Gateway with a single valid TLS entry and common-name annotation (HTTPS)",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{
 						{
 							Hostname: ptrHostname("example.com"),
 							Port:     443,
-							Protocol: "HTTPS",
-							TLS: &gwapi.GatewayTLSConfig{
-								Mode: ptrMode(gwapi.TLSModeTerminate),
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
 								CertificateRefs: []gwapi.SecretObjectReference{
 									{
 										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1504,19 +2279,164 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name:        "example-com-tls",
+					Namespace:   gen.DefaultTestNamespace,
+					Annotations: buildParentRefAnnotations(),
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						CommonName: "my-cn",
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			// Regression test: multiple listeners referencing the same Secret
+			// and hostname must yield a single dnsName, otherwise the CSR has
+			// more SANs than the ACME order has identifiers and finalize fails.
+			Name:   "de-duplicates the same hostname referenced by multiple listeners for one Secret",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Name:     "listener-1",
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+						{
+							Name:     "listener-2",
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+						{
+							Name:     "listener-3",
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "return a single Certificate for a Gateway with a single valid TLS entry and common-name annotation (TLS)",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.TLSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+					},
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						CommonName: "my-cn",
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1529,26 +2449,24 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for a Gateway with a single valid TLS entry and HTTP01 annotations using edit-in-place",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmacme.IngressEditInPlaceAnnotationKey:      "true",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmacme.IngressEditInPlaceAnnotationKey:      "true",
+				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1564,22 +2482,22 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						Annotations: map[string]string{
-							cmacme.ACMECertificateHTTP01IngressNameOverride: "gateway-name",
-							cmapi.IssueTemporaryCertificateAnnotation:       "true",
-						},
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressNameOverride: "gateway-name",
+						cmapi.IssueTemporaryCertificateAnnotation:       "true",
+						cmacme.ACMECertificateHTTP01ParentRefName:       "gateway-name",
+						cmacme.ACMECertificateHTTP01ParentRefKind:       "Gateway",
+					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1592,26 +2510,24 @@ func TestSync(t *testing.T) {
 			Name:   "create a Certificate with the HTTP01 name override if the given Gateway uses http01 annotations",
 			Issuer: gen.Issuer(acmeIssuer.Name),
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmacme.IngressEditInPlaceAnnotationKey:      "true",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmacme.IngressEditInPlaceAnnotationKey:      "true",
+				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1627,22 +2543,22 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						Annotations: map[string]string{
-							cmacme.ACMECertificateHTTP01IngressNameOverride: "gateway-name",
-							cmapi.IssueTemporaryCertificateAnnotation:       "true",
-						},
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressNameOverride: "gateway-name",
+						cmapi.IssueTemporaryCertificateAnnotation:       "true",
+						cmacme.ACMECertificateHTTP01ParentRefName:       "gateway-name",
+						cmacme.ACMECertificateHTTP01ParentRefKind:       "Gateway",
+					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1655,22 +2571,20 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an Gateway with a single valid TLS entry and HTTP01 annotations with no gateway class set",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1686,15 +2600,14 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1707,23 +2620,21 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an Gateway with a single valid TLS entry and HTTP01 annotations with a custom gateway class",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:             "nginx-ing",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:             "nginx-ing",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1739,15 +2650,14 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1760,24 +2670,22 @@ func TestSync(t *testing.T) {
 			Name:   "return a single HTTP01 Certificate for an Gateway with a single valid TLS entry and HTTP01 annotations with a certificate Gateway class",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey:            "issuer-name",
-						cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey: "cert-ing",
-						cmapi.IngressClassAnnotationKey:                        "nginx-ing",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey:            "issuer-name",
+					cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey: "cert-ing",
+					cmapi.IngressClassAnnotationKey:                        "nginx-ing",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1793,18 +2701,18 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-						Annotations: map[string]string{
-							cmacme.ACMECertificateHTTP01IngressClassOverride: "cert-ing",
-						},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01IngressClassOverride: "cert-ing",
+						cmacme.ACMECertificateHTTP01ParentRefName:        "gateway-name",
+						cmacme.ACMECertificateHTTP01ParentRefKind:        "Gateway",
 					},
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1817,24 +2725,22 @@ func TestSync(t *testing.T) {
 			Name:   "edit-in-place set to false should not trigger editing the Gateway in-place",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:             "nginx-ing",
-						cmacme.IngressEditInPlaceAnnotationKey:      "false",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:             "nginx-ing",
+					cmacme.IngressEditInPlaceAnnotationKey:      "false",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1850,15 +2756,14 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1871,22 +2776,20 @@ func TestSync(t *testing.T) {
 			Name:   "return a single DNS01 Certificate for a Gateway with a single valid TLS entry",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1902,15 +2805,14 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -1927,22 +2829,20 @@ func TestSync(t *testing.T) {
 			DefaultIssuerGroup:  "cert-manager.io",
 			ClusterIssuerLister: []runtime.Object{clusterIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						"kubernetes.io/tls-acme": "true",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					"kubernetes.io/tls-acme": "true",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1964,22 +2864,20 @@ func TestSync(t *testing.T) {
 				`Normal CreateCertificate Successfully created Certificate "example-com-tls"`,
 			},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -1991,9 +2889,9 @@ func TestSync(t *testing.T) {
 					}, {
 						Hostname: nil, // 🔥
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2007,16 +2905,15 @@ func TestSync(t *testing.T) {
 			},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
 						Usages:     cmapi.DefaultKeyUsages(),
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2033,30 +2930,28 @@ func TestSync(t *testing.T) {
 				`Normal CreateCertificate Successfully created Certificate "example-com-tls"`,
 			},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode:            ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode:            new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{},
 						},
 					}, {
 						Hostname: ptrHostname("www.example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2070,16 +2965,74 @@ func TestSync(t *testing.T) {
 			},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"www.example.com"},
 						SecretName: "example-com-tls",
 						Usages:     cmapi.DefaultKeyUsages(),
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "Issuer",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:         "should skip TLS protocol listener in TLS passthrough mode",
+			Issuer:       acmeIssuer,
+			IssuerLister: []runtime.Object{acmeIssuer},
+			ExpectedEvents: []string{
+				`Normal CreateCertificate Successfully created Certificate "example-com-tls"`,
+			},
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{{
+						Hostname: ptrHostname("example.com"),
+						Port:     443,
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
+							CertificateRefs: []gwapi.SecretObjectReference{
+								{
+									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+									Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+									Name:  "example-com-tls",
+								},
+							},
+						},
+					}, {
+						Hostname: ptrHostname("subdomain.example.com"),
+						Port:     443,
+						Protocol: gwapi.TLSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode:            new(gwapi.TLSModePassthrough),
+							CertificateRefs: []gwapi.SecretObjectReference{},
+						},
+					}},
+				},
+			},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						Usages:     cmapi.DefaultKeyUsages(),
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2090,14 +3043,12 @@ func TestSync(t *testing.T) {
 		{
 			Name: "should error if the specified issuer is not found",
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "invalid-issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "invalid-issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 			},
 		},
 		{
@@ -2105,22 +3056,20 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2136,15 +3085,13 @@ func TestSync(t *testing.T) {
 			DefaultIssuerGroup: "cert-manager.io",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -2159,22 +3106,20 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2187,24 +3132,33 @@ func TestSync(t *testing.T) {
 				},
 			},
 			CertificateLister: []runtime.Object{
-				buildCertificate("existing-crt",
-					gen.DefaultTestNamespace,
-					buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-				),
+				func() *cmapi.Certificate {
+					crt := buildCertificate("existing-crt",
+						gen.DefaultTestNamespace,
+						buildGatewayOwnerReferences("gateway-name"),
+					)
+					// An annotation the shim does not manage. The Update below
+					// replaces the whole object, so it has to carry it.
+					crt.Annotations = map[string]string{"user.io/keep": "me"}
+					return crt
+				}(),
 			},
 			DefaultIssuerKind: "Issuer",
 			ExpectedEvents:    []string{`Normal UpdateCertificate Successfully updated Certificate "existing-crt"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name: "existing-crt",
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01ParentRefName: "gateway-name",
+						cmacme.ACMECertificateHTTP01ParentRefKind: "Gateway",
+						"user.io/keep": "me",
 					},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2218,25 +3172,23 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuerNewFormat},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2251,18 +3203,16 @@ func TestSync(t *testing.T) {
 			DefaultIssuerKind: "Issuer",
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cert-secret-name",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"a-different-value": "should be removed",
-						},
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name:      "cert-secret-name",
+					Namespace: gen.DefaultTestNamespace,
+					Labels: map[string]string{
+						"a-different-value": "should be removed",
 					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2273,18 +3223,17 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "cert-secret-name"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cert-secret-name",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name:        "cert-secret-name",
+					Namespace:   gen.DefaultTestNamespace,
+					Annotations: buildParentRefAnnotations(),
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "cert-secret-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2298,23 +3247,21 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:      "toot-ing",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:      "toot-ing",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2328,15 +3275,13 @@ func TestSync(t *testing.T) {
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: []metav1.OwnerReference{},
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: []metav1.OwnerReference{},
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2350,23 +3295,21 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IngressClassAnnotationKey:      "toot-ing",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IngressClassAnnotationKey:      "toot-ing",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2380,15 +3323,13 @@ func TestSync(t *testing.T) {
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildIngressOwnerReferences("not-gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("not-gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2402,26 +3343,22 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
 				},
+				UID: types.UID("gateway-name"),
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2432,15 +3369,13 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal DeleteCertificate Successfully deleted unrequired Certificate "existing-crt"`},
 			ExpectedDelete: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "existing-crt",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "existing-crt",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "existing-crt",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "Issuer",
 						},
@@ -2453,24 +3388,22 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IssuerKindAnnotationKey:        "Issuer",
-						cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IssuerKindAnnotationKey:        "Issuer",
+					cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2484,16 +3417,14 @@ func TestSync(t *testing.T) {
 			},
 			CertificateLister: []runtime.Object{
 				&cmapi.Certificate{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
 						CommonName: "example-common-name",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -2505,15 +3436,14 @@ func TestSync(t *testing.T) {
 			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "example-com-tls"`},
 			ExpectedUpdate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Annotations:     buildParentRefAnnotations(),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -2528,24 +3458,22 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IssuerKindAnnotationKey:        "Issuer",
-						cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IssuerKindAnnotationKey:        "Issuer",
+					cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2557,9 +3485,9 @@ func TestSync(t *testing.T) {
 					}, {
 						Hostname: ptrHostname("www.example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2571,9 +3499,9 @@ func TestSync(t *testing.T) {
 					}, {
 						Hostname: ptrHostname("foo.example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2590,15 +3518,14 @@ func TestSync(t *testing.T) {
 			},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com", "www.example.com", "foo.example.com"},
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -2613,24 +3540,22 @@ func TestSync(t *testing.T) {
 			Issuer:       acmeIssuer,
 			IssuerLister: []runtime.Object{acmeIssuer},
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IssuerKindAnnotationKey:        "Issuer",
-						cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IssuerKindAnnotationKey:        "Issuer",
+					cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("foo.example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2642,9 +3567,9 @@ func TestSync(t *testing.T) {
 					}, {
 						Hostname: ptrHostname("bar.example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2662,15 +3587,14 @@ func TestSync(t *testing.T) {
 			},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "foo-example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "foo-example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"foo.example.com"},
 						SecretName: "foo-example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -2679,15 +3603,14 @@ func TestSync(t *testing.T) {
 					},
 				},
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            "bar-example-com-tls",
-						Namespace:       gen.DefaultTestNamespace,
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
-					},
+					Name:            "bar-example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"bar.example.com"},
 						SecretName: "bar-example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name:  "issuer-name",
 							Kind:  "Issuer",
 							Group: "cert-manager.io",
@@ -2701,25 +3624,23 @@ func TestSync(t *testing.T) {
 			Name:   "Failure to translate the Gateway annotations",
 			Issuer: acmeIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Annotations: map[string]string{
-						cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
-						cmapi.IssuerKindAnnotationKey:        "Issuer",
-						cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
-						cmapi.RenewBeforeAnnotationKey:       "invalid renew before value",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressIssuerNameAnnotationKey: "issuer-name",
+					cmapi.IssuerKindAnnotationKey:        "Issuer",
+					cmapi.IssuerGroupAnnotationKey:       "cert-manager.io",
+					cmapi.RenewBeforeAnnotationKey:       "invalid renew before value",
 				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2731,33 +3652,31 @@ func TestSync(t *testing.T) {
 					}},
 				},
 			},
-			Err: true,
+			ExpectedEvents: []string{`Warning BadConfig invalid ingress annotation "cert-manager.io/renew-before": time: invalid duration "invalid renew before value"`},
 		},
 		{
 			Name:   "return a single Certificate for a Gateway with a single valid TLS entry with common-name and keyusage annotation",
 			Issuer: acmeClusterIssuer,
 			IngressLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "gateway-name",
-					Namespace: gen.DefaultTestNamespace,
-					Labels: map[string]string{
-						"my-test-label": "should be copied",
-					},
-					Annotations: map[string]string{
-						cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
-						cmapi.CommonNameAnnotationKey:               "my-cn",
-						"cert-manager.io/usages":                    "signing,digital signature,content commitment",
-					},
-					UID: types.UID("gateway-name"),
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
 				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					"cert-manager.io/usages":                    "signing,digital signature,content commitment",
+				},
+				UID: types.UID("gateway-name"),
 				Spec: gwapi.GatewaySpec{
 					GatewayClassName: "test-gateway",
 					Listeners: []gwapi.Listener{{
 						Hostname: ptrHostname("example.com"),
 						Port:     443,
-						Protocol: "HTTPS",
-						TLS: &gwapi.GatewayTLSConfig{
-							Mode: ptrMode(gwapi.TLSModeTerminate),
+						Protocol: gwapi.HTTPSProtocolType,
+						TLS: &gwapi.ListenerTLSConfig{
+							Mode: new(gwapi.TLSModeTerminate),
 							CertificateRefs: []gwapi.SecretObjectReference{
 								{
 									Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -2773,19 +3692,18 @@ func TestSync(t *testing.T) {
 			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
 			ExpectedCreate: []*cmapi.Certificate{
 				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "example-com-tls",
-						Namespace: gen.DefaultTestNamespace,
-						Labels: map[string]string{
-							"my-test-label": "should be copied",
-						},
-						OwnerReferences: buildGatewayOwnerReferences("gateway-name", gen.DefaultTestNamespace),
+					Name:        "example-com-tls",
+					Namespace:   gen.DefaultTestNamespace,
+					Annotations: buildParentRefAnnotations(),
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
 					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
 					Spec: cmapi.CertificateSpec{
 						DNSNames:   []string{"example.com"},
 						CommonName: "my-cn",
 						SecretName: "example-com-tls",
-						IssuerRef: cmmeta.ObjectReference{
+						IssuerRef: cmmeta.IssuerReference{
 							Name: "issuer-name",
 							Kind: "ClusterIssuer",
 						},
@@ -2794,6 +3712,559 @@ func TestSync(t *testing.T) {
 							cmapi.UsageDigitalSignature,
 							cmapi.UsageContentCommitment,
 						},
+					},
+				},
+			},
+		},
+		{
+			Name:                "should not trigger a gateway sync if deleted in foreground",
+			Issuer:              clusterIssuer,
+			DefaultIssuerName:   "issuer-name",
+			DefaultIssuerKind:   "ClusterIssuer",
+			DefaultIssuerGroup:  "cert-manager.io",
+			ClusterIssuerLister: []runtime.Object{clusterIssuer},
+			IngressLike:         buildGatewayInDeletion(buildGateway("", "", map[string]string{cmapi.IngressIssuerNameAnnotationKey: ""}), &metav1.Time{}, []string{metav1.FinalizerDeleteDependents}),
+		},
+		{
+			Name:   "return a single Certificate for a Gateway with a single valid TLS entry and common-name annotation (HTTPS)",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should be copied",
+					applysetLabel:   "should not be propagated",
+				},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:        "example-com-tls",
+					Namespace:   gen.DefaultTestNamespace,
+					Annotations: buildParentRefAnnotations(),
+					Labels: map[string]string{
+						"my-test-label": "should be copied",
+						// note that the applyset label should not be here
+					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						CommonName: "my-cn",
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "extra Gateway annotation is copied to Certificate object",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels:    map[string]string{},
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CommonNameAnnotationKey:               "my-cn",
+					"venafi.cert-manager.io/custom-fields":      "foo",
+					"venafi.cert-manager.io/do-not-copy":        "bar",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Labels:    map[string]string{},
+					Annotations: map[string]string{
+						"venafi.cert-manager.io/custom-fields":    "foo",
+						cmacme.ACMECertificateHTTP01ParentRefName: "gateway-name",
+						cmacme.ACMECertificateHTTP01ParentRefKind: "Gateway",
+					},
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						CommonName: "my-cn",
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "Gateway: custom extra protocol with valid TLS block generates a Certificate",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			GatewayAPIExtraProtocols: sets.New[string]("CUSTOM-PROTOCOL"),
+			ClusterIssuerLister:      []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:           []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "Gateway: custom extra protocol with TLS passthrough is skipped (no Certificate)",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModePassthrough),
+							},
+						},
+					},
+				},
+			},
+			GatewayAPIExtraProtocols: sets.New[string]("CUSTOM-PROTOCOL"),
+			ClusterIssuerLister:      []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:           []string{},
+			ExpectedCreate:           nil,
+		},
+		// TODO: @hjoshi123 add more tests for listenersets like the ignore listener annotations when we re-enable listenerset e2e tests
+		{
+			Name:   "ListenerSet: custom extra protocol with valid TLS block generates a Certificate",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.ListenerSet{
+				Name:      "listenerset-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("listenerset-name"),
+				Spec: gwapi.ListenerSetSpec{
+					ParentRef: gwapi.ParentGatewayReference{
+						Name: "parent-gateway",
+					},
+					Listeners: []gwapi.ListenerEntry{
+						{
+							Name:     "custom-proto-listener",
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			GatewayAPIExtraProtocols: sets.New[string]("CUSTOM-PROTOCOL"),
+			ClusterIssuerLister:      []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:           []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01ParentRefName: "listenerset-name",
+						cmacme.ACMECertificateHTTP01ParentRefKind: "ListenerSet",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						*metav1.NewControllerRef(&gwapi.ListenerSet{
+							Name:      "listenerset-name",
+							Namespace: gen.DefaultTestNamespace,
+							UID:       types.UID("listenerset-name"),
+						}, listenerSetGVK),
+					},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "ListenerSet: fallback annotation causes Certificate to use parent Gateway as parentRef",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.ListenerSet{
+				Name:      "listenerset-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey:   "issuer-name",
+					cmacme.ACMECertificateHTTP01ParentRefFallback: "true",
+				},
+				UID: types.UID("listenerset-name"),
+				Spec: gwapi.ListenerSetSpec{
+					ParentRef: gwapi.ParentGatewayReference{
+						Name:      "parent-gateway",
+						Namespace: func() *gwapi.Namespace { n := gwapi.Namespace("gateway-namespace"); return &n }(),
+					},
+					Listeners: []gwapi.ListenerEntry{
+						{
+							Name:     "https",
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:      "example-com-tls",
+					Namespace: gen.DefaultTestNamespace,
+					Annotations: map[string]string{
+						cmacme.ACMECertificateHTTP01ParentRefKind:      "Gateway",
+						cmacme.ACMECertificateHTTP01ParentRefName:      "parent-gateway",
+						cmacme.ACMECertificateHTTP01ParentRefNamespace: "gateway-namespace",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						*metav1.NewControllerRef(&gwapi.ListenerSet{
+							Name:      "listenerset-name",
+							Namespace: gen.DefaultTestNamespace,
+							UID:       types.UID("listenerset-name"),
+						}, listenerSetGVK),
+					},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "Gateway: empty GatewayAPIExtraProtocols leaves custom protocol Listener unprocessed",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			GatewayAPIExtraProtocols: sets.New[string](),
+			ClusterIssuerLister:      []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:           []string{},
+			ExpectedCreate:           nil,
+		},
+		{
+			Name:   "Gateway: GatewayAPIExtraProtocols containing duplicate built-in HTTPS does not cause duplicate Certificate",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			GatewayAPIExtraProtocols: sets.New[string]("HTTPS"),
+			ClusterIssuerLister:      []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:           []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+		},
+		{
+			Name:   "GatewayAPI ListenerIgnoreAnnotation should ignore listeners",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CertificateIgnoreTLSListeners:         "custom-proto-listener",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Name:     "custom-proto-listener",
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{},
+			ExpectedCreate:      nil,
+		},
+		{
+			Name:   "GatewayAPI ListenerIgnoreAnnotation should ignore only listeners with matching name",
+			Issuer: acmeClusterIssuer,
+			IngressLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Annotations: map[string]string{
+					cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+					cmapi.CertificateIgnoreTLSListeners:         "custom-proto-listener,ignore-listener",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Name:     "custom-proto-listener",
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+						{
+							Hostname: ptrHostname("ignore.example.com"),
+							Port:     443,
+							Name:     "ignore-listener",
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "ignore-example-com-tls",
+									},
+								},
+							},
+						},
+						{
+							Hostname: ptrHostname("new.example.com"),
+							Port:     443,
+							Name:     "custom-proto-listener-new",
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
+										Kind:  func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+										Name:  "new-example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ClusterIssuerLister: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:      []string{`Normal CreateCertificate Successfully created Certificate "new-example-com-tls"`},
+			ExpectedCreate: []*cmapi.Certificate{
+				{
+					Name:            "new-example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					Annotations:     buildParentRefAnnotations(),
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"new.example.com"},
+						SecretName: "new-example-com-tls",
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "issuer-name",
+							Kind: "ClusterIssuer",
+						},
+						Usages: cmapi.DefaultKeyUsages(),
 					},
 				},
 			},
@@ -2809,28 +4280,37 @@ func TestSync(t *testing.T) {
 			var expectedActions []testpkg.Action
 			for _, cr := range test.ExpectedCreate {
 				expectedActions = append(expectedActions,
-					testpkg.NewAction(coretesting.NewCreateAction(
+					testpkg.NewAction(coretesting.NewCreateActionWithOptions(
 						cmapi.SchemeGroupVersion.WithResource("certificates"),
 						cr.Namespace,
 						cr,
+						metav1.CreateOptions{
+							FieldManager: testpkg.FieldManager,
+						},
 					)),
 				)
 			}
 			for _, cr := range test.ExpectedUpdate {
 				expectedActions = append(expectedActions,
-					testpkg.NewAction(coretesting.NewUpdateAction(
+					testpkg.NewAction(coretesting.NewUpdateActionWithOptions(
 						cmapi.SchemeGroupVersion.WithResource("certificates"),
 						cr.Namespace,
 						cr,
+						metav1.UpdateOptions{
+							// TODO: set field manager here too
+						},
 					)),
 				)
 			}
 			for _, cr := range test.ExpectedDelete {
 				expectedActions = append(expectedActions,
-					testpkg.NewAction(coretesting.NewDeleteAction(
+					testpkg.NewAction(coretesting.NewDeleteActionWithOptions(
 						cmapi.SchemeGroupVersion.WithResource("certificates"),
 						cr.Namespace,
 						cr.Name,
+						metav1.DeleteOptions{
+							// TODO: set field manager here too
+						},
 					)))
 			}
 			b := &testpkg.Builder{
@@ -2841,15 +4321,17 @@ func TestSync(t *testing.T) {
 			}
 			b.Init()
 			defer b.Stop()
-			sync := SyncFnFor(b.Recorder, logr.Discard(), b.CMClient, b.SharedInformerFactory.Certmanager().V1().Certificates().Lister(), controller.IngressShimOptions{
+			sync := SyncFnFor(b.Recorder, logr.Discard(), b.CMClient, b.SharedInformerFactory.Certmanager().V1().Certificates().Lister(), controllerpkg.IngressShimOptions{
 				DefaultIssuerName:                 test.DefaultIssuerName,
 				DefaultIssuerKind:                 test.DefaultIssuerKind,
 				DefaultIssuerGroup:                test.DefaultIssuerGroup,
 				DefaultAutoCertificateAnnotations: []string{"kubernetes.io/tls-acme"},
-			}, "cert-manager-test")
+				ExtraCertificateAnnotations:       []string{"venafi.cert-manager.io/custom-fields"},
+				GatewayAPIExtraProtocols:          test.GatewayAPIExtraProtocols,
+			}, testpkg.FieldManager)
 			b.Start()
 
-			err := sync(context.Background(), test.IngressLike)
+			err := sync(t.Context(), test.IngressLike)
 
 			// If test.Err == true, err should not be nil and vice versa
 			if test.Err == (err == nil) {
@@ -2859,11 +4341,8 @@ func TestSync(t *testing.T) {
 			if err := b.AllEventsCalled(); err != nil {
 				t.Error(err)
 			}
-			if err := b.AllReactorsCalled(); err != nil {
-				t.Errorf("Not all expected reactors were called: %v", err)
-			}
 			if err := b.AllActionsExecuted(); err != nil {
-				t.Errorf(err.Error())
+				t.Error(err)
 			}
 		}
 	}
@@ -2878,18 +4357,312 @@ func TestSync(t *testing.T) {
 			t.Run(test.Name, testFn(test))
 		}
 	})
-
 }
 
-type fakeHelper struct {
-	issuer cmapi.GenericIssuer
+// mustSerializeApply renders the bytes internalcertificates.Apply sends for crt.
+func mustSerializeApply(t *testing.T, crt *cmapi.Certificate) []byte {
+	t.Helper()
+	crt = crt.DeepCopy()
+	crt.TypeMeta = metav1.TypeMeta{Kind: cmapi.CertificateKind, APIVersion: cmapi.SchemeGroupVersion.Identifier()}
+	crt.Status = cmapi.CertificateStatus{}
+	data, err := json.Marshal(crt)
+	require.NoError(t, err)
+	return data
 }
 
-func (f *fakeHelper) GetGenericIssuer(ref cmmeta.ObjectReference, ns string) (cmapi.GenericIssuer, error) {
-	if f.issuer == nil {
-		return nil, fmt.Errorf("no issuer specified on fake helper")
+// TestSync_ServerSideApply checks the payloads the shim writes with the
+// ServerSideApply feature gate enabled.
+func TestSync_ServerSideApply(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature.ServerSideApply, true)
+
+	acmeClusterIssuer := gen.ClusterIssuer("issuer-name",
+		gen.SetIssuerACME(cmacme.ACMEIssuer{}))
+
+	ingress := &networkingv1.Ingress{
+		Name:      "ingress-name",
+		Namespace: gen.DefaultTestNamespace,
+		Labels: map[string]string{
+			"my-test-label": "should-be-applied",
+		},
+		Annotations: map[string]string{
+			cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+			cmapi.RevisionHistoryLimitAnnotationKey:     "7",
+			"example.com/foo":                           "bar",
+		},
+		UID: types.UID("ingress-name"),
+		Spec: networkingv1.IngressSpec{
+			TLS: []networkingv1.IngressTLS{
+				{
+					Hosts:      []string{"example.com"},
+					SecretName: "example-com-tls",
+				},
+			},
+		},
 	}
-	return f.issuer, nil
+
+	// A Gateway with no extra annotations configured: the only annotations the
+	// shim writes are the issuer-specific parentRef ones.
+	gateway := &gwapi.Gateway{
+		Name:      "gateway-name",
+		Namespace: gen.DefaultTestNamespace,
+		Annotations: map[string]string{
+			cmapi.IngressClusterIssuerNameAnnotationKey: "issuer-name",
+		},
+		UID: types.UID("gateway-name"),
+		Spec: gwapi.GatewaySpec{
+			GatewayClassName: "test-gateway",
+			Listeners: []gwapi.Listener{
+				{
+					Hostname: ptrHostname("example.com"),
+					Port:     443,
+					Protocol: gwapi.HTTPSProtocolType,
+					TLS: &gwapi.ListenerTLSConfig{
+						Mode: new(gwapi.TLSModeTerminate),
+						CertificateRefs: []gwapi.SecretObjectReference{
+							{
+								Group: new(gwapi.Group("core")),
+								Kind:  new(gwapi.Kind("Secret")),
+								Name:  "example-com-tls",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	type testT struct {
+		IngressLike                 metav1.Object
+		ExtraCertificateAnnotations []string
+		CertManagerObjects          []runtime.Object
+		// Created in the API server under another field manager and hidden from
+		// the lister, so sync takes the create path against an object it does
+		// not own.
+		UncachedCertificate   *cmapi.Certificate
+		ExpectedActions       []testpkg.Action
+		ExpectedEvents        []string
+		ExpectedConflictError bool
+	}
+
+	tests := map[string]testT{
+		"ingress create uses a non-forced Apply": {
+			IngressLike:                 ingress,
+			ExtraCertificateAnnotations: []string{"example.com/foo"},
+			CertManagerObjects:          []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:              []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewPatchActionWithOptions(
+					cmapi.SchemeGroupVersion.WithResource("certificates"),
+					gen.DefaultTestNamespace,
+					"example-com-tls",
+					types.ApplyPatchType,
+					mustSerializeApply(t, &cmapi.Certificate{
+						Name:            "example-com-tls",
+						Namespace:       gen.DefaultTestNamespace,
+						Labels:          map[string]string{"my-test-label": "should-be-applied"},
+						Annotations:     map[string]string{"example.com/foo": "bar"},
+						OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+						Spec: cmapi.CertificateSpec{
+							DNSNames:             []string{"example.com"},
+							SecretName:           "example-com-tls",
+							IssuerRef:            cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+							Usages:               cmapi.DefaultKeyUsages(),
+							RevisionHistoryLimit: new(int32(7)),
+						},
+					}),
+					metav1.PatchOptions{Force: new(false), FieldManager: testpkg.FieldManager},
+				)),
+			},
+		},
+		"ingress create surfaces the conflict with a Certificate the shim does not own": {
+			IngressLike:                 ingress,
+			ExtraCertificateAnnotations: []string{"example.com/foo"},
+			CertManagerObjects:          []runtime.Object{acmeClusterIssuer},
+			UncachedCertificate: &cmapi.Certificate{
+				Name:      "example-com-tls",
+				Namespace: gen.DefaultTestNamespace,
+				Spec: cmapi.CertificateSpec{
+					DNSNames:   []string{"hand.example.com"},
+					SecretName: "example-com-tls",
+					IssuerRef:  cmmeta.IssuerReference{Name: "hand-made-issuer", Kind: "Issuer"},
+				},
+			},
+			ExpectedConflictError: true,
+			ExpectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewPatchActionWithOptions(
+					cmapi.SchemeGroupVersion.WithResource("certificates"),
+					gen.DefaultTestNamespace,
+					"example-com-tls",
+					types.ApplyPatchType,
+					mustSerializeApply(t, &cmapi.Certificate{
+						Name:            "example-com-tls",
+						Namespace:       gen.DefaultTestNamespace,
+						Labels:          map[string]string{"my-test-label": "should-be-applied"},
+						Annotations:     map[string]string{"example.com/foo": "bar"},
+						OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+						Spec: cmapi.CertificateSpec{
+							DNSNames:             []string{"example.com"},
+							SecretName:           "example-com-tls",
+							IssuerRef:            cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+							Usages:               cmapi.DefaultKeyUsages(),
+							RevisionHistoryLimit: new(int32(7)),
+						},
+					}),
+					metav1.PatchOptions{Force: new(false), FieldManager: testpkg.FieldManager},
+				)),
+			},
+		},
+		"ingress update applies the full spec": {
+			IngressLike:                 ingress,
+			ExtraCertificateAnnotations: []string{"example.com/foo"},
+			CertManagerObjects: []runtime.Object{
+				acmeClusterIssuer,
+				&cmapi.Certificate{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+					Labels:          map[string]string{"stale-label": "remove-me"},
+					Annotations:     map[string]string{"user.io/keep": "me"},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:             []string{"example.com"},
+						SecretName:           "example-com-tls",
+						IssuerRef:            cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+						Usages:               cmapi.DefaultKeyUsages(),
+						RevisionHistoryLimit: new(int32(1)),
+					},
+				},
+			},
+			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "example-com-tls"`},
+			ExpectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewPatchActionWithOptions(
+					cmapi.SchemeGroupVersion.WithResource("certificates"),
+					gen.DefaultTestNamespace,
+					"example-com-tls",
+					types.ApplyPatchType,
+					mustSerializeApply(t, &cmapi.Certificate{
+						Name:            "example-com-tls",
+						Namespace:       gen.DefaultTestNamespace,
+						Labels:          map[string]string{"my-test-label": "should-be-applied"},
+						Annotations:     map[string]string{"example.com/foo": "bar"},
+						OwnerReferences: buildIngressOwnerReferences("ingress-name"),
+						Spec: cmapi.CertificateSpec{
+							DNSNames:             []string{"example.com"},
+							SecretName:           "example-com-tls",
+							IssuerRef:            cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+							Usages:               cmapi.DefaultKeyUsages(),
+							RevisionHistoryLimit: new(int32(7)),
+						},
+					}),
+					metav1.PatchOptions{Force: new(true), FieldManager: testpkg.FieldManager},
+				)),
+			},
+		},
+		// extractExtraAnnotations returns nil when --extra-certificate-annotations
+		// is not configured, and the payload used to be built from it.
+		"gateway create sends parentRef annotations when no extra annotations are configured": {
+			IngressLike:        gateway,
+			CertManagerObjects: []runtime.Object{acmeClusterIssuer},
+			ExpectedEvents:     []string{`Normal CreateCertificate Successfully created Certificate "example-com-tls"`},
+			ExpectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewPatchActionWithOptions(
+					cmapi.SchemeGroupVersion.WithResource("certificates"),
+					gen.DefaultTestNamespace,
+					"example-com-tls",
+					types.ApplyPatchType,
+					mustSerializeApply(t, &cmapi.Certificate{
+						Name:            "example-com-tls",
+						Namespace:       gen.DefaultTestNamespace,
+						Annotations:     buildParentRefAnnotations(),
+						OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+						Spec: cmapi.CertificateSpec{
+							DNSNames:   []string{"example.com"},
+							SecretName: "example-com-tls",
+							IssuerRef:  cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+							Usages:     cmapi.DefaultKeyUsages(),
+						},
+					}),
+					metav1.PatchOptions{Force: new(false), FieldManager: testpkg.FieldManager},
+				)),
+			},
+		},
+		"gateway update sends parentRef annotations when no extra annotations are configured": {
+			IngressLike: gateway,
+			CertManagerObjects: []runtime.Object{
+				acmeClusterIssuer,
+				&cmapi.Certificate{
+					Name:            "example-com-tls",
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+					Annotations:     map[string]string{"user.io/keep": "me"},
+					Spec: cmapi.CertificateSpec{
+						DNSNames:   []string{"stale.example.com"},
+						SecretName: "example-com-tls",
+						IssuerRef:  cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+						Usages:     cmapi.DefaultKeyUsages(),
+					},
+				},
+			},
+			ExpectedEvents: []string{`Normal UpdateCertificate Successfully updated Certificate "example-com-tls"`},
+			ExpectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewPatchActionWithOptions(
+					cmapi.SchemeGroupVersion.WithResource("certificates"),
+					gen.DefaultTestNamespace,
+					"example-com-tls",
+					types.ApplyPatchType,
+					mustSerializeApply(t, &cmapi.Certificate{
+						Name:            "example-com-tls",
+						Namespace:       gen.DefaultTestNamespace,
+						Annotations:     buildParentRefAnnotations(),
+						OwnerReferences: buildGatewayOwnerReferences("gateway-name"),
+						Spec: cmapi.CertificateSpec{
+							DNSNames:   []string{"example.com"},
+							SecretName: "example-com-tls",
+							IssuerRef:  cmmeta.IssuerReference{Name: "issuer-name", Kind: "ClusterIssuer"},
+							Usages:     cmapi.DefaultKeyUsages(),
+						},
+					}),
+					metav1.PatchOptions{Force: new(true), FieldManager: testpkg.FieldManager},
+				)),
+			},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := &testpkg.Builder{
+				T:                  t,
+				CertManagerObjects: test.CertManagerObjects,
+				ExpectedActions:    test.ExpectedActions,
+				ExpectedEvents:     test.ExpectedEvents,
+			}
+			b.Init()
+			defer b.Stop()
+
+			lister := b.SharedInformerFactory.Certmanager().V1().Certificates().Lister()
+			if test.UncachedCertificate != nil {
+				_, err := b.CMClient.CertmanagerV1().Certificates(test.UncachedCertificate.Namespace).
+					Create(t.Context(), test.UncachedCertificate, metav1.CreateOptions{FieldManager: "kubectl"})
+				require.NoError(t, err)
+				b.FakeCMClient().ClearActions()
+				lister = cmlisters.NewCertificateLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
+			}
+
+			sync := SyncFnFor(b.Recorder, logr.Discard(), b.CMClient, lister, controllerpkg.IngressShimOptions{
+				DefaultAutoCertificateAnnotations: []string{"kubernetes.io/tls-acme"},
+				ExtraCertificateAnnotations:       test.ExtraCertificateAnnotations,
+			}, testpkg.FieldManager)
+			b.Start()
+
+			err := sync(t.Context(), test.IngressLike)
+			if test.ExpectedConflictError {
+				assert.Truef(t, apierrors.IsConflict(err), "expected a conflict error, got: %v", err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.NoError(t, b.AllEventsCalled())
+			assert.NoError(t, b.AllActionsExecuted())
+		})
+	}
 }
 
 func TestIssuerForIngress(t *testing.T) {
@@ -2980,13 +4753,37 @@ func TestIssuerForIngress(t *testing.T) {
 	}
 }
 
+func TestExtractAnnotations(t *testing.T) {
+	type testT struct {
+		IngressLike *networkingv1.Ingress
+		Expected    map[string]string
+	}
+	tests := []testT{
+		{
+			IngressLike: buildIngress("ing1", "namespace1", map[string]string{
+				"key1": "value1",
+				"key2": "value2",
+			}),
+			Expected: map[string]string{
+				"key1": "value1",
+			},
+		},
+		{
+			IngressLike: buildIngress("name", "namespace", nil),
+			Expected:    nil,
+		},
+	}
+	for _, test := range tests {
+		annotations := extractExtraAnnotations(test.IngressLike, []string{"key1"})
+		assert.Equal(t, test.Expected, annotations, "annotations")
+	}
+}
+
 func buildCertificate(name, namespace string, ownerReferences []metav1.OwnerReference) *cmapi.Certificate {
 	return &cmapi.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       namespace,
-			OwnerReferences: ownerReferences,
-		},
+		Name:            name,
+		Namespace:       namespace,
+		OwnerReferences: ownerReferences,
 		Spec: cmapi.CertificateSpec{
 			SecretName: name,
 		},
@@ -2995,35 +4792,39 @@ func buildCertificate(name, namespace string, ownerReferences []metav1.OwnerRefe
 
 func buildIngress(name, namespace string, annotations map[string]string) *networkingv1.Ingress {
 	return &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   namespace,
-			Annotations: annotations,
-			UID:         types.UID(name),
-		},
+		Name:        name,
+		Namespace:   namespace,
+		Annotations: annotations,
+		UID:         types.UID(name),
 	}
 }
 
 func buildGateway(name, namespace string, annotations map[string]string) *gwapi.Gateway {
 	return &gwapi.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   namespace,
-			Annotations: annotations,
-		},
+		Name:        name,
+		Namespace:   namespace,
+		Annotations: annotations,
+		UID:         types.UID(name),
 	}
 }
 
-func buildIngressOwnerReferences(name, namespace string) []metav1.OwnerReference {
+func buildIngressOwnerReferences(name string) []metav1.OwnerReference {
 	return []metav1.OwnerReference{
-		*metav1.NewControllerRef(buildIngress(name, namespace, nil), ingressV1GVK),
+		*metav1.NewControllerRef(buildIngress(name, gen.DefaultTestNamespace, nil), ingressV1GVK),
 	}
 }
 
 // The Gateway name and UID are set to the same.
-func buildGatewayOwnerReferences(name, namespace string) []metav1.OwnerReference {
+func buildGatewayOwnerReferences(name string) []metav1.OwnerReference {
 	return []metav1.OwnerReference{
-		*metav1.NewControllerRef(buildIngress(name, namespace, nil), gatewayGVK),
+		*metav1.NewControllerRef(buildGateway(name, gen.DefaultTestNamespace, nil), gatewayGVK),
+	}
+}
+
+func buildParentRefAnnotations() map[string]string {
+	return map[string]string{
+		cmacme.ACMECertificateHTTP01ParentRefName: "gateway-name",
+		cmacme.ACMECertificateHTTP01ParentRefKind: "Gateway",
 	}
 }
 
@@ -3032,18 +4833,19 @@ func ptrHostname(hostname string) *gwapi.Hostname {
 	return &h
 }
 
-func ptrMode(mode gwapi.TLSModeType) *gwapi.TLSModeType {
-	return &mode
-}
-
 func Test_validateGatewayListenerBlock(t *testing.T) {
 	tests := []struct {
 		name     string
+		ingLike  metav1.Object
 		listener gwapi.Listener
 		wantErr  string
 	}{
 		{
 			name: "empty TLS block",
+			ingLike: &gwapi.Gateway{
+				Name:      "gateway",
+				Namespace: gen.DefaultTestNamespace,
+			},
 			listener: gwapi.Listener{
 				Hostname: ptrHostname("example.com"),
 				Port:     gwapi.PortNumber(443),
@@ -3053,12 +4855,16 @@ func Test_validateGatewayListenerBlock(t *testing.T) {
 		},
 		{
 			name: "empty hostname",
+			ingLike: &gwapi.Gateway{
+				Name:      "gateway",
+				Namespace: gen.DefaultTestNamespace,
+			},
 			listener: gwapi.Listener{
 				Hostname: ptrHostname(""),
 				Port:     gwapi.PortNumber(443),
 				Protocol: gwapi.HTTPSProtocolType,
-				TLS: &gwapi.GatewayTLSConfig{
-					Mode: ptrMode(gwapi.TLSModeTerminate),
+				TLS: &gwapi.ListenerTLSConfig{
+					Mode: new(gwapi.TLSModeTerminate),
 					CertificateRefs: []gwapi.SecretObjectReference{
 						{
 							Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -3072,12 +4878,16 @@ func Test_validateGatewayListenerBlock(t *testing.T) {
 		},
 		{
 			name: "empty group",
+			ingLike: &gwapi.Gateway{
+				Name:      "example",
+				Namespace: gen.DefaultTestNamespace,
+			},
 			listener: gwapi.Listener{
 				Hostname: ptrHostname("example.com"),
 				Port:     gwapi.PortNumber(443),
 				Protocol: gwapi.HTTPSProtocolType,
-				TLS: &gwapi.GatewayTLSConfig{
-					Mode: ptrMode(gwapi.TLSModeTerminate),
+				TLS: &gwapi.ListenerTLSConfig{
+					Mode: new(gwapi.TLSModeTerminate),
 					CertificateRefs: []gwapi.SecretObjectReference{
 						{
 							Group: func() *gwapi.Group { g := gwapi.Group(""); return &g }(),
@@ -3096,8 +4906,8 @@ func Test_validateGatewayListenerBlock(t *testing.T) {
 				Hostname: ptrHostname("example.com"),
 				Port:     gwapi.PortNumber(443),
 				Protocol: gwapi.HTTPSProtocolType,
-				TLS: &gwapi.GatewayTLSConfig{
-					Mode: ptrMode(gwapi.TLSModeTerminate),
+				TLS: &gwapi.ListenerTLSConfig{
+					Mode: new(gwapi.TLSModeTerminate),
 					CertificateRefs: []gwapi.SecretObjectReference{
 						{
 							Group: func() *gwapi.Group { g := gwapi.Group("invalid"); return &g }(),
@@ -3115,8 +4925,8 @@ func Test_validateGatewayListenerBlock(t *testing.T) {
 				Hostname: ptrHostname("example.com"),
 				Port:     gwapi.PortNumber(443),
 				Protocol: gwapi.HTTPSProtocolType,
-				TLS: &gwapi.GatewayTLSConfig{
-					Mode: ptrMode(gwapi.TLSModeTerminate),
+				TLS: &gwapi.ListenerTLSConfig{
+					Mode: new(gwapi.TLSModeTerminate),
 					CertificateRefs: []gwapi.SecretObjectReference{
 						{
 							Group: func() *gwapi.Group { g := gwapi.Group("core"); return &g }(),
@@ -3128,10 +4938,58 @@ func Test_validateGatewayListenerBlock(t *testing.T) {
 			},
 			wantErr: "spec.listeners[0].tls.certificateRef[0].kind: Unsupported value: \"SomeOtherKind\": supported values: \"Secret\", \"\"",
 		},
+		{
+			name: "cross-namespace secret ref",
+			ingLike: &gwapi.Gateway{
+				Name:      "example",
+				Namespace: gen.DefaultTestNamespace,
+			},
+			listener: gwapi.Listener{
+				Hostname: ptrHostname("example.com"),
+				Port:     gwapi.PortNumber(443),
+				Protocol: gwapi.HTTPSProtocolType,
+				TLS: &gwapi.ListenerTLSConfig{
+					Mode: new(gwapi.TLSModeTerminate),
+					CertificateRefs: []gwapi.SecretObjectReference{
+						{
+							Group:     func() *gwapi.Group { g := gwapi.Group(""); return &g }(),
+							Kind:      func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+							Name:      "example-com",
+							Namespace: func() *gwapi.Namespace { n := gwapi.Namespace("another-namespace"); return &n }(),
+						},
+					},
+				},
+			},
+			wantErr: "spec.listeners[0].tls.certificateRef[0].namespace: Invalid value: \"another-namespace\": cross-namespace secret references are not allowed in listeners",
+		},
+		{
+			name: "same namespace secret ref",
+			ingLike: &gwapi.Gateway{
+				Name:      "example",
+				Namespace: "another-namespace",
+			},
+			listener: gwapi.Listener{
+				Hostname: ptrHostname("example.com"),
+				Port:     gwapi.PortNumber(443),
+				Protocol: gwapi.HTTPSProtocolType,
+				TLS: &gwapi.ListenerTLSConfig{
+					Mode: new(gwapi.TLSModeTerminate),
+					CertificateRefs: []gwapi.SecretObjectReference{
+						{
+							Group:     func() *gwapi.Group { g := gwapi.Group(""); return &g }(),
+							Kind:      func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+							Name:      "example-com",
+							Namespace: func() *gwapi.Namespace { n := gwapi.Namespace("another-namespace"); return &n }(),
+						},
+					},
+				},
+			},
+			wantErr: "",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotErr := validateGatewayListenerBlock(field.NewPath("spec", "listeners").Index(0), test.listener).ToAggregate()
+			gotErr := validateGatewayListenerBlock(field.NewPath("spec", "listeners").Index(0), test.listener, test.ingLike).ToAggregate()
 			if test.wantErr == "" {
 				assert.NoError(t, gotErr)
 			} else {
@@ -3150,69 +5008,81 @@ func Test_findCertificatesToBeRemoved(t *testing.T) {
 	}{
 		{
 			name: "should not remove Certificate when not owned by the Ingress",
-			givenCerts: []*cmapi.Certificate{{
-				ObjectMeta: metav1.ObjectMeta{
+			givenCerts: []*cmapi.Certificate{
+				{
 					Name:            "cert-1",
-					Namespace:       "default",
-					OwnerReferences: buildGatewayOwnerReferences("ingress-1", "default"),
-				}, Spec: cmapi.CertificateSpec{
-					SecretName: "secret-name",
-				}},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("ingress-1"),
+					Spec: cmapi.CertificateSpec{
+						SecretName: "secret-name",
+					},
+				},
 			},
 			ingLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{Name: "ingress-2", Namespace: "default", UID: "ingress-2"},
-				Spec:       networkingv1.IngressSpec{TLS: []networkingv1.IngressTLS{{SecretName: "secret-name"}}},
+				Name:      "ingress-2",
+				Namespace: gen.DefaultTestNamespace,
+				UID:       "ingress-2",
+				Spec:      networkingv1.IngressSpec{TLS: []networkingv1.IngressTLS{{SecretName: "secret-name"}}},
 			},
 			wantToBeRemoved: nil,
 		},
 		{
 			name: "should not remove Certificate when Ingress references the secretName of the Certificate",
-			givenCerts: []*cmapi.Certificate{{
-				ObjectMeta: metav1.ObjectMeta{
+			givenCerts: []*cmapi.Certificate{
+				{
 					Name:            "cert-1",
-					Namespace:       "default",
-					OwnerReferences: buildGatewayOwnerReferences("ingress-1", "default"),
-				}, Spec: cmapi.CertificateSpec{
-					SecretName: "secret-name",
-				}},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("ingress-1"),
+					Spec: cmapi.CertificateSpec{
+						SecretName: "secret-name",
+					},
+				},
 			},
 			ingLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{Name: "ingress-1", Namespace: "default", UID: "ingress-1"},
-				Spec:       networkingv1.IngressSpec{TLS: []networkingv1.IngressTLS{{SecretName: "secret-name"}}},
+				Name:      "ingress-1",
+				Namespace: gen.DefaultTestNamespace,
+				UID:       "ingress-1",
+				Spec:      networkingv1.IngressSpec{TLS: []networkingv1.IngressTLS{{SecretName: "secret-name"}}},
 			},
 			wantToBeRemoved: nil,
 		},
 		{
 			name: "should remove Certificate when Ingress does not reference the secretName of the Certificate",
-			givenCerts: []*cmapi.Certificate{{
-				ObjectMeta: metav1.ObjectMeta{
+			givenCerts: []*cmapi.Certificate{
+				{
 					Name:            "cert-1",
-					Namespace:       "default",
-					OwnerReferences: buildGatewayOwnerReferences("ingress-1", "default"),
-				}, Spec: cmapi.CertificateSpec{
-					SecretName: "secret-name",
-				}},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("ingress-1"),
+					Spec: cmapi.CertificateSpec{
+						SecretName: "secret-name",
+					},
+				},
 			},
 			ingLike: &networkingv1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{Name: "ingress-1", Namespace: "default", UID: "ingress-1"},
+				Name:      "ingress-1",
+				Namespace: gen.DefaultTestNamespace,
+				UID:       "ingress-1",
 			},
 			wantToBeRemoved: []string{"cert-1"},
 		},
 		{
 			name: "should not remove Certificate when not owned by the Gateway",
-			givenCerts: []*cmapi.Certificate{{
-				ObjectMeta: metav1.ObjectMeta{
+			givenCerts: []*cmapi.Certificate{
+				{
 					Name:            "cert-1",
-					Namespace:       "default",
-					OwnerReferences: buildGatewayOwnerReferences("gw-1", "default"),
-				}, Spec: cmapi.CertificateSpec{
-					SecretName: "secret-name",
-				}},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gw-1"),
+					Spec: cmapi.CertificateSpec{
+						SecretName: "secret-name",
+					},
+				},
 			},
 			ingLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{Name: "gw-2", Namespace: "default", UID: "gw-2"},
+				Name:      "gw-2",
+				Namespace: gen.DefaultTestNamespace,
+				UID:       "gw-2",
 				Spec: gwapi.GatewaySpec{Listeners: []gwapi.Listener{{
-					TLS: &gwapi.GatewayTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{
+					TLS: &gwapi.ListenerTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{
 						{
 							Name: "secret-name",
 						},
@@ -3223,38 +5093,44 @@ func Test_findCertificatesToBeRemoved(t *testing.T) {
 		},
 		{
 			name: "should remove Certificate when Gateway does not reference the secretName of the Certificate in one of its listers",
-			givenCerts: []*cmapi.Certificate{{
-				ObjectMeta: metav1.ObjectMeta{
+			givenCerts: []*cmapi.Certificate{
+				{
 					Name:            "cert-1",
-					Namespace:       "default",
-					OwnerReferences: buildGatewayOwnerReferences("gw-1", "default"),
-				}, Spec: cmapi.CertificateSpec{
-					SecretName: "secret-name",
-				}},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gw-1"),
+					Spec: cmapi.CertificateSpec{
+						SecretName: "secret-name",
+					},
+				},
 			},
 			ingLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{Name: "gw-1", Namespace: "default", UID: "gw-1"},
+				Name:      "gw-1",
+				Namespace: gen.DefaultTestNamespace,
+				UID:       "gw-1",
 				Spec: gwapi.GatewaySpec{Listeners: []gwapi.Listener{
-					{TLS: &gwapi.GatewayTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{{Name: "not-secret-name"}}}},
+					{TLS: &gwapi.ListenerTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{{Name: "not-secret-name"}}}},
 				}},
 			},
 			wantToBeRemoved: []string{"cert-1"},
 		},
 		{
 			name: "should not remove Certificate when the Gateway references the secretName of the Certificate in one of its listers",
-			givenCerts: []*cmapi.Certificate{{
-				ObjectMeta: metav1.ObjectMeta{
+			givenCerts: []*cmapi.Certificate{
+				{
 					Name:            "cert-1",
-					Namespace:       "default",
-					OwnerReferences: buildGatewayOwnerReferences("gw-1", "default"),
-				}, Spec: cmapi.CertificateSpec{
-					SecretName: "secret-name",
-				}},
+					Namespace:       gen.DefaultTestNamespace,
+					OwnerReferences: buildGatewayOwnerReferences("gw-1"),
+					Spec: cmapi.CertificateSpec{
+						SecretName: "secret-name",
+					},
+				},
 			},
 			ingLike: &gwapi.Gateway{
-				ObjectMeta: metav1.ObjectMeta{Name: "gw-1", Namespace: "default", UID: "gw-1"},
+				Name:      "gw-1",
+				Namespace: gen.DefaultTestNamespace,
+				UID:       "gw-1",
 				Spec: gwapi.GatewaySpec{Listeners: []gwapi.Listener{
-					{TLS: &gwapi.GatewayTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{{Name: "secret-name"}}}},
+					{TLS: &gwapi.ListenerTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{{Name: "secret-name"}}}},
 				}},
 			},
 			wantToBeRemoved: nil,
@@ -3270,21 +5146,475 @@ func Test_findCertificatesToBeRemoved(t *testing.T) {
 
 func Test_secretNameUsedIn_nilPointerGateway(t *testing.T) {
 	got := secretNameUsedIn("secret-name", &gwapi.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: "gw-1", Namespace: "default", UID: "gw-1"},
+		Name:      "gw-1",
+		Namespace: gen.DefaultTestNamespace,
+		UID:       "gw-1",
 		Spec: gwapi.GatewaySpec{Listeners: []gwapi.Listener{
 			{TLS: nil},
-			{TLS: &gwapi.GatewayTLSConfig{CertificateRefs: nil}},
-			{TLS: &gwapi.GatewayTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{{Name: "secret-name"}}}},
+			{TLS: &gwapi.ListenerTLSConfig{CertificateRefs: nil}},
+			{TLS: &gwapi.ListenerTLSConfig{CertificateRefs: []gwapi.SecretObjectReference{{Name: "secret-name"}}}},
 		}},
 	})
 	assert.Equal(t, true, got)
 
 	got = secretNameUsedIn("secret-name", &gwapi.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: "gw-1", Namespace: "default", UID: "gw-1"},
+		Name:      "gw-1",
+		Namespace: gen.DefaultTestNamespace,
+		UID:       "gw-1",
 		Spec: gwapi.GatewaySpec{Listeners: []gwapi.Listener{
 			{TLS: nil},
-			{TLS: &gwapi.GatewayTLSConfig{CertificateRefs: nil}},
+			{TLS: &gwapi.ListenerTLSConfig{CertificateRefs: nil}},
 		}},
 	})
 	assert.Equal(t, false, got)
+}
+
+func buildIngressInDeletion(ingress *networkingv1.Ingress, deletionTimestamp *metav1.Time, finalizers []string) *networkingv1.Ingress {
+	if ingress == nil {
+		ingress = buildIngress("test-ingress", gen.DefaultTestNamespace, nil)
+	}
+
+	ingress.SetDeletionTimestamp(deletionTimestamp)
+	ingress.SetFinalizers(finalizers)
+	return ingress
+}
+
+func buildGatewayInDeletion(gateway *gwapi.Gateway, deletionTimestamp *metav1.Time, finalizers []string) *gwapi.Gateway {
+	if gateway == nil {
+		gateway = buildGateway("test-gw", gen.DefaultTestNamespace, nil)
+	}
+
+	gateway.SetDeletionTimestamp(deletionTimestamp)
+	gateway.SetFinalizers(finalizers)
+	return gateway
+}
+
+func Test_isDeletedInForeground(t *testing.T) {
+	type testT struct {
+		DeletionTimestamp *metav1.Time
+		Finalizers        []string
+		SkipSync          bool
+	}
+
+	tests := []testT{
+		{DeletionTimestamp: nil, Finalizers: nil, SkipSync: false},
+		{DeletionTimestamp: nil, Finalizers: []string{}, SkipSync: false},
+		{DeletionTimestamp: nil, Finalizers: []string{"cert-lock"}, SkipSync: false},
+		{DeletionTimestamp: &metav1.Time{}, Finalizers: []string{"cert-lock"}, SkipSync: true},
+		{DeletionTimestamp: &metav1.Time{}, Finalizers: nil, SkipSync: true},
+		{DeletionTimestamp: &metav1.Time{}, Finalizers: []string{}, SkipSync: true},
+		{DeletionTimestamp: nil, Finalizers: []string{metav1.FinalizerDeleteDependents}, SkipSync: true},
+		{DeletionTimestamp: &metav1.Time{}, Finalizers: []string{"cert-lock", metav1.FinalizerDeleteDependents}, SkipSync: true},
+	}
+
+	t.Run("should skip ingress sync if being deleted in foreground", func(t *testing.T) {
+		for _, test := range tests {
+			skipIngressSync := isDeletedInForeground(buildIngressInDeletion(nil, test.DeletionTimestamp, test.Finalizers))
+			if skipIngressSync != test.SkipSync {
+				t.Errorf("Expected skipIngressSync=%v for deletionTimestamp %#v, finalizers %#v", test.SkipSync, test.DeletionTimestamp, test.Finalizers)
+			}
+		}
+	})
+
+	t.Run("should skip gateway sync if being deleted in foreground", func(t *testing.T) {
+		for _, test := range tests {
+			skipGatewaySync := isDeletedInForeground(buildGatewayInDeletion(nil, test.DeletionTimestamp, test.Finalizers))
+			if skipGatewaySync != test.SkipSync {
+				t.Errorf("Expected skipGatewaySync=%v for deletionTimestamp %#v, finalizers %#v", test.SkipSync, test.DeletionTimestamp, test.Finalizers)
+			}
+		}
+	})
+}
+
+func Test_setIssuerSpecificConfig(t *testing.T) {
+	tests := []struct {
+		name               string
+		ingress            *networkingv1.Ingress
+		expectedCertAnnots map[string]string
+	}{
+		{
+			name: "should set ingressClassName override annotation",
+			ingress: buildIngress("test-ingress", gen.DefaultTestNamespace, map[string]string{
+				cmapi.IngressACMEIssuerHTTP01IngressClassNameAnnotationKey: "cert-ing-class-name",
+			}),
+			expectedCertAnnots: map[string]string{
+				cmacme.ACMECertificateHTTP01IngressClassNameOverride: "cert-ing-class-name",
+			},
+		},
+		{
+			name: "should set ingress class override annotation",
+			ingress: buildIngress("test-ingress", gen.DefaultTestNamespace, map[string]string{
+				cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey: "cert-ing",
+			}),
+			expectedCertAnnots: map[string]string{
+				cmacme.ACMECertificateHTTP01IngressClassOverride: "cert-ing",
+			},
+		},
+		{
+			name: "should not set annotation when ingressClassName value is empty",
+			ingress: buildIngress("test-ingress", gen.DefaultTestNamespace, map[string]string{
+				cmapi.IngressACMEIssuerHTTP01IngressClassNameAnnotationKey: "",
+			}),
+			expectedCertAnnots: nil,
+		},
+		{
+			name: "should not set annotation when ingress class value is empty",
+			ingress: buildIngress("test-ingress", gen.DefaultTestNamespace, map[string]string{
+				cmapi.IngressACMEIssuerHTTP01IngressClassAnnotationKey: "",
+			}),
+			expectedCertAnnots: nil,
+		},
+		{
+			name: "should set edit-in-place annotations",
+			ingress: buildIngress("test-ingress", gen.DefaultTestNamespace, map[string]string{
+				cmacme.IngressEditInPlaceAnnotationKey: "true",
+			}),
+			expectedCertAnnots: map[string]string{
+				cmacme.ACMECertificateHTTP01IngressNameOverride: "test-ingress",
+				cmapi.IssueTemporaryCertificateAnnotation:       "true",
+			},
+		},
+		{
+			name:               "should handle nil annotations",
+			ingress:            buildIngress("test-ingress", gen.DefaultTestNamespace, nil),
+			expectedCertAnnots: nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			crt := &cmapi.Certificate{
+				Name:      "test-cert",
+				Namespace: gen.DefaultTestNamespace,
+			}
+
+			setIssuerSpecificConfig(crt, test.ingress)
+
+			assert.Equal(t, test.expectedCertAnnots, crt.Annotations, "Certificate annotations do not match expected")
+		})
+	}
+}
+
+func TestIsTLSProtocol(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol gwapi.ProtocolType
+		extra    sets.Set[string]
+		want     bool
+	}{
+		{
+			name:     "built-in HTTPS returns true",
+			protocol: gwapi.HTTPSProtocolType,
+			extra:    nil,
+			want:     true,
+		},
+		{
+			name:     "built-in TLS returns true",
+			protocol: gwapi.TLSProtocolType,
+			extra:    nil,
+			want:     true,
+		},
+		{
+			name:     "unknown protocol with empty extra set returns false",
+			protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+			extra:    sets.New[string](),
+			want:     false,
+		},
+		{
+			name:     "custom protocol present in extra set returns true",
+			protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+			extra:    sets.New[string]("CUSTOM-PROTOCOL"),
+			want:     true,
+		},
+		{
+			name:     "custom protocol absent from extra set returns false",
+			protocol: gwapi.ProtocolType("CUSTOM-PROTOCOL"),
+			extra:    sets.New[string]("OTHER-PROTOCOL"),
+			want:     false,
+		},
+		{
+			name:     "duplicate built-in HTTPS in extra set returns true without error",
+			protocol: gwapi.HTTPSProtocolType,
+			extra:    sets.New[string]("HTTPS"),
+			want:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isGatewayAPITLSProtocol(tt.protocol, tt.extra)
+			if got != tt.want {
+				t.Errorf("isGatewayAPITLSProtocol(%q, %v) = %v, want %v", tt.protocol, tt.extra, got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_isGatewayAPIListenerIgnoredThroughAnnotation(t *testing.T) {
+	tests := []struct {
+		name         string
+		annotations  map[string]string
+		listenerName string
+		want         bool
+	}{
+		{
+			name:         "no annotations returns false",
+			annotations:  nil,
+			listenerName: "https",
+			want:         false,
+		},
+		{
+			name:         "annotation not present returns false",
+			annotations:  map[string]string{"other-annotation": "value"},
+			listenerName: "https",
+			want:         false,
+		},
+		{
+			name:         "single listener match returns true",
+			annotations:  map[string]string{cmapi.CertificateIgnoreTLSListeners: "https"},
+			listenerName: "https",
+			want:         true,
+		},
+		{
+			name:         "single listener no match returns false",
+			annotations:  map[string]string{cmapi.CertificateIgnoreTLSListeners: "other"},
+			listenerName: "https",
+			want:         false,
+		},
+		{
+			name:         "comma-separated list with match returns true",
+			annotations:  map[string]string{cmapi.CertificateIgnoreTLSListeners: "foo,https,bar"},
+			listenerName: "https",
+			want:         true,
+		},
+		{
+			name:         "comma-separated list without match returns false",
+			annotations:  map[string]string{cmapi.CertificateIgnoreTLSListeners: "foo,bar,baz"},
+			listenerName: "https",
+			want:         false,
+		},
+		{
+			name:         "empty annotation value returns false",
+			annotations:  map[string]string{cmapi.CertificateIgnoreTLSListeners: ""},
+			listenerName: "https",
+			want:         false,
+		},
+		{
+			name:         "exact match is required",
+			annotations:  map[string]string{cmapi.CertificateIgnoreTLSListeners: "https-extra"},
+			listenerName: "https",
+			want:         false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isGatewayAPIListenerIgnoredThroughAnnotation(tt.annotations, tt.listenerName)
+			if got != tt.want {
+				t.Errorf("isGatewayAPIListenerIgnoredThroughAnnotation(%v, %q) = %v, want %v", tt.annotations, tt.listenerName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeAnnotations(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing map[string]string
+		update   map[string]string
+		expected map[string]string
+	}{
+		{
+			name: "No conflicts, simple merge",
+			existing: map[string]string{
+				"env":  "prod",
+				"team": "alpha",
+			},
+			update: map[string]string{
+				"version": "1.0.0",
+			},
+			expected: map[string]string{
+				"env":     "prod",
+				"team":    "alpha",
+				"version": "1.0.0",
+			},
+		},
+		{
+			name: "Overwriting existing keys",
+			existing: map[string]string{
+				"owner": "team-a",
+			},
+			update: map[string]string{
+				"owner": "team-b",
+			},
+			expected: map[string]string{
+				"owner": "team-b",
+			},
+		},
+		{
+			name:     "Merging empty maps",
+			existing: map[string]string{},
+			update:   map[string]string{},
+			expected: map[string]string{},
+		},
+		{
+			name: "One empty map",
+			existing: map[string]string{
+				"key1": "value1",
+			},
+			update: map[string]string{},
+			expected: map[string]string{
+				"key1": "value1",
+			},
+		},
+		{
+			name: "Overlapping and new keys",
+			existing: map[string]string{
+				"key1": "value1",
+				"key2": "value2",
+			},
+			update: map[string]string{
+				"key2": "new-value2",
+				"key3": "value3",
+			},
+			expected: map[string]string{
+				"key1": "value1",
+				"key2": "new-value2", // Overwritten
+				"key3": "value3",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := mergeAnnotations(tt.existing, tt.update)
+			assert.Equal(t, tt.expected, result, "mergeAnnotations")
+		})
+	}
+}
+
+func Test_splitHosts(t *testing.T) {
+	tests := []struct {
+		name            string
+		hosts           []string
+		wantDNSNames    []string
+		wantIPAddresses []string
+	}{
+		{
+			name:         "de-duplicates repeated DNS names, keeping first-seen order",
+			hosts:        []string{"example.com", "www.example.com", "example.com", "www.example.com"},
+			wantDNSNames: []string{"example.com", "www.example.com"},
+		},
+		{
+			name:            "splits DNS names from IPv4 and IPv6 addresses",
+			hosts:           []string{"example.com", "192.0.2.1", "2001:db8::1"},
+			wantDNSNames:    []string{"example.com"},
+			wantIPAddresses: []string{"192.0.2.1", "2001:db8::1"},
+		},
+		{
+			name:            "de-duplicates across both DNS names and IP addresses",
+			hosts:           []string{"example.com", "192.0.2.1", "example.com", "192.0.2.1"},
+			wantDNSNames:    []string{"example.com"},
+			wantIPAddresses: []string{"192.0.2.1"},
+		},
+		{
+			name:         "empty input yields nil slices",
+			hosts:        nil,
+			wantDNSNames: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotDNSNames, gotIPAddresses := splitHosts(tt.hosts)
+			assert.Equal(t, tt.wantDNSNames, gotDNSNames, "dnsNames")
+			assert.Equal(t, tt.wantIPAddresses, gotIPAddresses, "ipAddresses")
+		})
+	}
+}
+
+func Test_buildCertificates_doesNotMutateIngressLikeLabels(t *testing.T) {
+	// The ingresses and gateways controllers hand the informer-cached object
+	// to buildCertificates without copying it, so the object passed here
+	// stands in for the object in the shared informer cache.
+	tests := []struct {
+		name    string
+		ingLike metav1.Object
+	}{
+		{
+			name: "ingress",
+			ingLike: &networkingv1.Ingress{
+				Name:      "ingress-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should-be-propagated",
+					applysetLabel:   "should-not-be-propagated",
+				},
+				UID: types.UID("ingress-name"),
+				Spec: networkingv1.IngressSpec{
+					TLS: []networkingv1.IngressTLS{
+						{
+							Hosts:      []string{"example.com"},
+							SecretName: "example-com-tls",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "gateway",
+			ingLike: &gwapi.Gateway{
+				Name:      "gateway-name",
+				Namespace: gen.DefaultTestNamespace,
+				Labels: map[string]string{
+					"my-test-label": "should-be-propagated",
+					applysetLabel:   "should-not-be-propagated",
+				},
+				UID: types.UID("gateway-name"),
+				Spec: gwapi.GatewaySpec{
+					GatewayClassName: "test-gateway",
+					Listeners: []gwapi.Listener{
+						{
+							Hostname: ptrHostname("example.com"),
+							Port:     443,
+							Protocol: gwapi.HTTPSProtocolType,
+							TLS: &gwapi.ListenerTLSConfig{
+								Mode: new(gwapi.TLSModeTerminate),
+								CertificateRefs: []gwapi.SecretObjectReference{
+									{
+										Group: new(gwapi.Group("core")),
+										Kind:  new(gwapi.Kind("Secret")),
+										Name:  "example-com-tls",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lister := cmlisters.NewCertificateLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
+			wantLabels := maps.Clone(test.ingLike.GetLabels())
+
+			newCrts, updateCrts, err := buildCertificates(
+				record.NewFakeRecorder(10), logr.Discard(), lister, test.ingLike,
+				"issuer-name", "ClusterIssuer", "cert-manager.io", nil, controllerpkg.IngressShimOptions{},
+			)
+			require.NoError(t, err)
+			require.Empty(t, updateCrts)
+			require.Len(t, newCrts, 1)
+
+			assert.Equal(t, wantLabels, test.ingLike.GetLabels(), "buildCertificates must not modify the labels of the object it was given")
+
+			crt := newCrts[0]
+			assert.Equal(t, map[string]string{"my-test-label": "should-be-propagated"}, crt.Labels)
+
+			// The Certificate must own its labels map: a later write to it must
+			// not show up on the (cached) input object.
+			crt.Labels["added-by-test"] = "should-not-leak"
+			assert.NotContains(t, test.ingLike.GetLabels(), "added-by-test", "Certificate labels alias the labels of the object passed to buildCertificates")
+		})
+	}
 }

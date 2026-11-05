@@ -18,22 +18,21 @@ package certificates
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"strings"
-
-	"github.com/kr/pretty"
-	corev1 "k8s.io/api/core/v1"
+	"time"
 
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/util"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/dump"
 )
 
 // ValidationFunc describes a Certificate validation helper function
@@ -44,11 +43,8 @@ func ExpectValidKeysInSecret(_ *cmapi.Certificate, secret *corev1.Secret) error 
 	validKeys := []string{corev1.TLSPrivateKeyKey, corev1.TLSCertKey, cmmeta.TLSCAKey, cmapi.CertificateOutputFormatDERKey, cmapi.CertificateOutputFormatCombinedPEMKey}
 	nbValidKeys := 0
 	for k := range secret.Data {
-		for _, k2 := range validKeys {
-			if k == k2 {
-				nbValidKeys++
-				break
-			}
+		if slices.Contains(validKeys, k) {
+			nbValidKeys++
 		}
 	}
 	if nbValidKeys < 2 {
@@ -82,31 +78,11 @@ func ExpectValidPrivateKeyData(certificate *cmapi.Certificate, secret *corev1.Se
 		return err
 	}
 
-	// validate private key is of the correct type (rsa, ed25519 or ecdsa)
-	if certificate.Spec.PrivateKey != nil {
-		switch certificate.Spec.PrivateKey.Algorithm {
-		case cmapi.PrivateKeyAlgorithm(""),
-			cmapi.RSAKeyAlgorithm:
-			_, ok := key.(*rsa.PrivateKey)
-			if !ok {
-				return fmt.Errorf("Expected private key of type RSA, but it was: %T", key)
-			}
-		case cmapi.ECDSAKeyAlgorithm:
-			_, ok := key.(*ecdsa.PrivateKey)
-			if !ok {
-				return fmt.Errorf("Expected private key of type ECDSA, but it was: %T", key)
-			}
-		case cmapi.Ed25519KeyAlgorithm:
-			_, ok := key.(ed25519.PrivateKey)
-			if !ok {
-				return fmt.Errorf("Expected private key of type Ed25519, but it was: %T", key)
-			}
-		default:
-			return fmt.Errorf("unrecognised requested private key algorithm %q", certificate.Spec.PrivateKey.Algorithm)
-		}
+	violations := pki.PrivateKeyMatchesSpec(key, certificate.Spec)
+	if len(violations) > 0 {
+		return fmt.Errorf("Private key does not match Certificate: %s", strings.Join(violations, ", "))
 	}
 
-	// TODO: validate private key KeySize
 	return nil
 }
 
@@ -132,7 +108,27 @@ func ExpectCertificateOrganizationToMatch(certificate *cmapi.Certificate, secret
 		return err
 	}
 
-	expectedOrganization := pki.OrganizationForCertificate(certificate)
+	var expectedOrganization []string
+	if certificate.Spec.Subject != nil {
+		expectedOrganization = certificate.Spec.Subject.Organizations
+	}
+	if certificate.Spec.LiteralSubject != "" {
+		sequence, err := pki.UnmarshalSubjectStringToRDNSequence(certificate.Spec.LiteralSubject)
+		if err != nil {
+			return err
+		}
+
+		for _, rdns := range sequence {
+			for _, atv := range rdns {
+				if atv.Type.Equal(pki.OIDConstants.Organization) {
+					if str, ok := atv.Value.(string); ok {
+						expectedOrganization = append(expectedOrganization, str)
+					}
+				}
+			}
+		}
+	}
+
 	if !util.EqualUnsorted(cert.Subject.Organization, expectedOrganization) {
 		return fmt.Errorf("Expected certificate valid for O %v, but got a certificate valid for O %v", expectedOrganization, cert.Subject.Organization)
 	}
@@ -147,9 +143,10 @@ func ExpectCertificateDNSNamesToMatch(certificate *cmapi.Certificate, secret *co
 		return err
 	}
 
-	expectedDNSNames := certificate.Spec.DNSNames
-	if !util.Subset(cert.DNSNames, expectedDNSNames) {
-		return fmt.Errorf("Expected certificate valid for DNSNames %v, but got a certificate valid for DNSNames %v", expectedDNSNames, cert.DNSNames)
+	x509DNSNames := sets.New(cert.DNSNames...)
+	expectedDNSNames := sets.New(certificate.Spec.DNSNames...)
+	if !x509DNSNames.IsSuperset(expectedDNSNames) {
+		return fmt.Errorf("Expected certificate valid for DNSNames %v, but got a certificate valid for DNSNames %v", sets.List(expectedDNSNames), sets.List(x509DNSNames))
 	}
 
 	return nil
@@ -162,20 +159,32 @@ func ExpectCertificateURIsToMatch(certificate *cmapi.Certificate, secret *corev1
 		return err
 	}
 
-	uris, err := pki.URIsForCertificate(certificate)
-	if err != nil {
-		return fmt.Errorf("failed to parse URIs: %s", err)
-	}
 	actualURIs := pki.URLsToString(cert.URIs)
-	expectedURIs := pki.URLsToString(uris)
+	expectedURIs := certificate.Spec.URIs
 	if !util.EqualUnsorted(actualURIs, expectedURIs) {
-		return fmt.Errorf("Expected certificate valid for URIs %v, but got a certificate valid for URIs %v", expectedURIs, pki.URLsToString(cert.URIs))
+		return fmt.Errorf("Expected certificate valid for URIs %v, but got a certificate valid for URIs %v", expectedURIs, actualURIs)
 	}
 
 	return nil
 }
 
-// ExpectValidCommonName checks if the issued certificate has the requested CN or one of the DNS SANs
+// ExpectCertificateIPsToMatch checks if the issued certificate has all IP SANs names it requested
+func ExpectCertificateIPsToMatch(certificate *cmapi.Certificate, secret *corev1.Secret) error {
+	cert, err := pki.DecodeX509CertificateBytes(secret.Data[corev1.TLSCertKey])
+	if err != nil {
+		return err
+	}
+
+	actualIPs := pki.IPAddressesToString(cert.IPAddresses)
+	expectedIPs := certificate.Spec.IPAddresses
+	if !util.EqualUnsorted(actualIPs, expectedIPs) {
+		return fmt.Errorf("Expected certificate valid for IPs %v, but got a certificate valid for IPs %v", expectedIPs, actualIPs)
+	}
+
+	return nil
+}
+
+// ExpectValidCommonName checks if the issued certificate has the requested CN or one of the DNS (or IP Address) SANs
 func ExpectValidCommonName(certificate *cmapi.Certificate, secret *corev1.Secret) error {
 	cert, err := pki.DecodeX509CertificateBytes(secret.Data[corev1.TLSCertKey])
 	if err != nil {
@@ -186,7 +195,7 @@ func ExpectValidCommonName(certificate *cmapi.Certificate, secret *corev1.Secret
 
 	if len(expectedCN) == 0 && len(cert.Subject.CommonName) > 0 {
 		// no CN is specified but our CA set one, checking if it is one of our DNS names or IP Addresses
-		if !util.Contains(cert.DNSNames, cert.Subject.CommonName) && !util.Contains(pki.IPAddressesToString(cert.IPAddresses), cert.Subject.CommonName) {
+		if !slices.Contains(cert.DNSNames, cert.Subject.CommonName) && !slices.Contains(pki.IPAddressesToString(cert.IPAddresses), cert.Subject.CommonName) {
 			return fmt.Errorf("Expected a common name for one of our DNSNames %v or IP Addresses %v, but got a CN of %v", cert.DNSNames, pki.IPAddressesToString(cert.IPAddresses), cert.Subject.CommonName)
 		}
 	} else if expectedCN != cert.Subject.CommonName {
@@ -196,7 +205,7 @@ func ExpectValidCommonName(certificate *cmapi.Certificate, secret *corev1.Secret
 	return nil
 }
 
-// ExpectValidNotAfterDate checks if the issued certificate matches the requested duration
+// ExpectValidNotAfterDate checks if the certificate's NotAfter status matches the NotAfter time of the encoded certificate.
 func ExpectValidNotAfterDate(certificate *cmapi.Certificate, secret *corev1.Secret) error {
 	cert, err := pki.DecodeX509CertificateBytes(secret.Data[corev1.TLSCertKey])
 	if err != nil {
@@ -213,15 +222,6 @@ func ExpectValidNotAfterDate(certificate *cmapi.Certificate, secret *corev1.Secr
 	return nil
 }
 
-func containsExtKeyUsage(s []x509.ExtKeyUsage, e x509.ExtKeyUsage) bool {
-	for _, a := range s {
-		if a == e {
-			return true
-		}
-	}
-	return false
-}
-
 // ExpectKeyUsageExtKeyUsageServerAuth checks if the issued certificate has the extended key usage of server auth
 func ExpectKeyUsageExtKeyUsageServerAuth(certificate *cmapi.Certificate, secret *corev1.Secret) error {
 	cert, err := pki.DecodeX509CertificateBytes(secret.Data[corev1.TLSCertKey])
@@ -229,7 +229,7 @@ func ExpectKeyUsageExtKeyUsageServerAuth(certificate *cmapi.Certificate, secret 
 		return err
 	}
 
-	if !containsExtKeyUsage(cert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+	if !slices.Contains(cert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
 		return fmt.Errorf("Expected certificate to have ExtKeyUsageServerAuth, but got %v", cert.ExtKeyUsage)
 	}
 	return nil
@@ -242,7 +242,7 @@ func ExpectKeyUsageExtKeyUsageClientAuth(certificate *cmapi.Certificate, secret 
 		return err
 	}
 
-	if !containsExtKeyUsage(cert.ExtKeyUsage, x509.ExtKeyUsageClientAuth) {
+	if !slices.Contains(cert.ExtKeyUsage, x509.ExtKeyUsageClientAuth) {
 		return fmt.Errorf("Expected certificate to have ExtKeyUsageClientAuth, but got %v", cert.ExtKeyUsage)
 	}
 	return nil
@@ -279,6 +279,31 @@ func ExpectKeyUsageUsageDataEncipherment(certificate *cmapi.Certificate, secret 
 	usage &= x509.KeyUsageDataEncipherment
 	if usage != x509.KeyUsageDataEncipherment {
 		return fmt.Errorf("Expected certificate to have KeyUsageDataEncipherment %#b, but got %v %#b", x509.KeyUsageDataEncipherment, usage, usage)
+	}
+
+	return nil
+}
+
+// ExpectMLDSAKeyUsages checks that the issued certificate has an ML-DSA public
+// key, has the KeyUsageDigitalSignature key usage set and has none of the key
+// usages that RFC 9881 forbids for ML-DSA keys.
+func ExpectMLDSAKeyUsages(certificate *cmapi.Certificate, secret *corev1.Secret) error {
+	cert, err := pki.DecodeX509CertificateBytes(secret.Data[corev1.TLSCertKey])
+	if err != nil {
+		return err
+	}
+
+	if cert.PublicKeyAlgorithm != x509.MLDSA {
+		return fmt.Errorf("Expected certificate to have an ML-DSA public key, but got %v", cert.PublicKeyAlgorithm)
+	}
+
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("Expected certificate to have KeyUsageDigitalSignature %#b, but got %#b", x509.KeyUsageDigitalSignature, cert.KeyUsage)
+	}
+
+	const forbidden = x509.KeyUsageKeyEncipherment | x509.KeyUsageDataEncipherment | x509.KeyUsageKeyAgreement | x509.KeyUsageEncipherOnly | x509.KeyUsageDecipherOnly
+	if usage := cert.KeyUsage & forbidden; usage != 0 {
+		return fmt.Errorf("Expected certificate to have no key usages forbidden for ML-DSA keys, but got %#b", usage)
 	}
 
 	return nil
@@ -322,10 +347,10 @@ func ExpectCorrectTrustChain(certificate *cmapi.Certificate, secret *corev1.Secr
 
 	if _, err := cert.Verify(opts); err != nil {
 		return fmt.Errorf(
-			"verify error. CERT:\n%s\nROOTS\n%s\nINTERMEDIATES\n%v\nERROR\n%s\n",
-			pretty.Sprint(cert),
-			pretty.Sprint(rootCertPool),
-			pretty.Sprint(intermediateCertPool),
+			"verify error. CERT:\n%s\nROOTS\n%s\nINTERMEDIATES\n%s\nERROR\n%s\n",
+			dump.Pretty(cert),
+			dump.Pretty(rootCertPool),
+			dump.Pretty(intermediateCertPool),
 			err,
 		)
 	}
@@ -387,7 +412,7 @@ func ExpectValidAdditionalOutputFormats(certificate *cmapi.Certificate, secret *
 					privateKey := secret.Data[corev1.TLSPrivateKeyKey]
 					block, _ := pem.Decode(privateKey)
 					if !bytes.Equal(derKey, block.Bytes) {
-						return fmt.Errorf("expected additional output Format DER %s to contain the binary formated private Key", cmapi.CertificateOutputFormatDERKey)
+						return fmt.Errorf("expected additional output Format DER %s to contain the binary formatted private Key", cmapi.CertificateOutputFormatDERKey)
 					}
 				} else {
 					return fmt.Errorf("expected additional output format DER key %s to be present in secret", cmapi.CertificateOutputFormatDERKey)
@@ -411,4 +436,37 @@ func ExpectValidAdditionalOutputFormats(certificate *cmapi.Certificate, secret *
 	}
 
 	return nil
+}
+
+// ExpectDuration checks if the issued certificate matches the Certificate's duration
+func ExpectDurationToMatch(certificate *cmapi.Certificate, secret *corev1.Secret) error {
+	certDuration := apiutil.DefaultCertDuration(certificate.Spec.Duration)
+	return ExpectDuration(certDuration, 30*time.Second)(certificate, secret)
+}
+
+// ExpectDuration checks if the issued certificate matches the provided duration
+func ExpectDuration(expectedDuration, fuzz time.Duration) func(certificate *cmapi.Certificate, secret *corev1.Secret) error {
+	return func(certificate *cmapi.Certificate, secret *corev1.Secret) error {
+		certBytes, ok := secret.Data[corev1.TLSCertKey]
+		if !ok {
+			return fmt.Errorf("no certificate data found in secret %q", secret.Name)
+		}
+		cert, err := pki.DecodeX509CertificateBytes(certBytes)
+		if err != nil {
+			return err
+		}
+
+		// Here we ensure that the requested duration is what is signed on the
+		// certificate. We tolerate fuzz either way.
+		actualDuration := cert.NotAfter.Sub(cert.NotBefore)
+		if actualDuration > (expectedDuration+fuzz) || actualDuration < (expectedDuration-fuzz) {
+			return fmt.Errorf(
+				"expected duration of %s, got %s (fuzz: %s) [NotBefore: %s, NotAfter: %s]",
+				expectedDuration, actualDuration, fuzz,
+				cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339),
+			)
+		}
+
+		return nil
+	}
 }

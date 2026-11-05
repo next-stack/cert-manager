@@ -19,62 +19,72 @@ package framework
 import (
 	"context"
 	"fmt"
+	"go/version"
+	"strings"
 	"time"
-
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/component-base/featuregate"
 
-	. "github.com/cert-manager/cert-manager/test/e2e/framework/log"
+	. "github.com/cert-manager/cert-manager/e2e-tests/framework/log"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 func nowStamp() string {
 	return time.Now().Format(time.StampMilli)
 }
 
-func Failf(format string, args ...interface{}) {
+func Failf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	Logf(msg)
 	Fail(nowStamp()+": "+msg, 1)
 }
 
-func Skipf(format string, args ...interface{}) {
+func Skipf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	Logf("INFO", msg)
 	Skip(nowStamp() + ": " + msg)
 }
 
-func RequireFeatureGate(f *Framework, featureSet featuregate.FeatureGate, gate featuregate.Feature) {
+func RequireFeatureGate(featureSet featuregate.FeatureGate, gate featuregate.Feature) {
 	if !featureSet.Enabled(gate) {
 		Skipf("feature gate %q is not enabled, skipping test", gate)
 	}
 }
 
+// RequireServerGoVersion skips the test if the Kubernetes API server was built
+// with a Go release older than minimum, such as "go1.27". It doesn't skip if
+// the API server doesn't report a valid Go version.
+func RequireServerGoVersion(ctx context.Context, f *Framework, minimum string) {
+	info, err := f.KubeClientSet.Discovery().ServerVersionWithContext(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	// Drop any GOEXPERIMENT suffix, as in "go1.26.3 X:boringcrypto".
+	goVersion, _, _ := strings.Cut(info.GoVersion, " ")
+	if version.IsValid(goVersion) && version.Compare(goVersion, minimum) < 0 {
+		Skipf("the Kubernetes API server was built with %s, which is older than %s, skipping test", info.GoVersion, minimum)
+	}
+}
+
 // TODO: move this function into a different package
-func RbacClusterRoleHasAccessToResource(f *Framework, clusterRole string, verb string, resource string) bool {
+func RbacClusterRoleHasAccessToResource(ctx context.Context, f *Framework, clusterRole string, verb string, resource string) bool {
 	By("Creating a service account")
 	viewServiceAccount := &v1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "rbac-test-",
-		},
+		GenerateName: "rbac-test-",
 	}
 	serviceAccountClient := f.KubeClientSet.CoreV1().ServiceAccounts(f.Namespace.Name)
-	serviceAccount, err := serviceAccountClient.Create(context.TODO(), viewServiceAccount, metav1.CreateOptions{})
+	serviceAccount, err := serviceAccountClient.Create(ctx, viewServiceAccount, metav1.CreateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	viewServiceAccountName := serviceAccount.Name
 
 	By("Creating ClusterRoleBinding to view " + clusterRole + " clusterRole")
 	viewRoleBinding := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: viewServiceAccountName + "-rb-",
-		},
+		GenerateName: viewServiceAccountName + "-rb-",
 		Subjects: []rbacv1.Subject{
 			{Kind: "ServiceAccount", Name: viewServiceAccountName, Namespace: f.Namespace.Name},
 		},
@@ -85,7 +95,7 @@ func RbacClusterRoleHasAccessToResource(f *Framework, clusterRole string, verb s
 		},
 	}
 	roleBindingClient := f.KubeClientSet.RbacV1().ClusterRoleBindings()
-	_, err = roleBindingClient.Create(context.TODO(), viewRoleBinding, metav1.CreateOptions{})
+	_, err = roleBindingClient.Create(ctx, viewRoleBinding, metav1.CreateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
 	By("Sleeping for a second.")
@@ -93,8 +103,7 @@ func RbacClusterRoleHasAccessToResource(f *Framework, clusterRole string, verb s
 	time.Sleep(time.Second)
 
 	By("Impersonating the Service Account")
-	var impersonateConfig *rest.Config
-	impersonateConfig = f.KubeClientConfig
+	impersonateConfig := f.KubeClientConfig
 	impersonateConfig.Impersonate.UserName = "system:serviceaccount:" + f.Namespace.Name + ":" + viewServiceAccountName
 	impersonateClient, err := kubernetes.NewForConfig(impersonateConfig)
 	Expect(err).NotTo(HaveOccurred())
@@ -111,7 +120,7 @@ func RbacClusterRoleHasAccessToResource(f *Framework, clusterRole string, verb s
 			},
 		},
 	}
-	response, err := sarClient.Create(context.TODO(), sar, metav1.CreateOptions{})
+	response, err := sarClient.Create(ctx, sar, metav1.CreateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	return response.Status.Allowed
 }

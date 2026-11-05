@@ -24,11 +24,9 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/informers"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -37,26 +35,36 @@ import (
 	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
 	"github.com/cert-manager/cert-manager/internal/controller/certificates/policies"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	cminformers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/scheduler"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
+	"github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/cert-manager/cert-manager/pkg/util/predicate"
 )
 
 const (
 	ControllerName = "certificates-trigger"
-	// stopIncreaseBackoff is the number of issuance attempts after which the backoff period should stop to increase
-	stopIncreaseBackoff = 6 // 2 ^ (6 - 1) = 32 = maxDelay
-	// maxDelay is the maximum backoff period
-	maxDelay = 32 * time.Hour
+
+	// reasonMLDSAPrivateKeysDisabled is the reason of the Warning event which
+	// is emitted when an ML-DSA Certificate must be re-issued but the
+	// MLDSAPrivateKeys feature gate is disabled.
+	reasonMLDSAPrivateKeysDisabled = "MLDSAPrivateKeysDisabled"
+
+	// mldsaPrivateKeysDisabledRecheckInterval is how often an ML-DSA
+	// Certificate that must be re-issued is checked again while the
+	// MLDSAPrivateKeys feature gate is disabled. The gate only changes when the
+	// controller restarts, so this only repeats the Warning event, which would
+	// otherwise expire (after one hour by default) long before the next
+	// informer resync.
+	mldsaPrivateKeysDisabledRecheckInterval = 30 * time.Minute
 )
 
 // This controller observes the state of the certificate's currently
@@ -65,12 +73,14 @@ const (
 // It triggers re-issuance by adding the `Issuing` status condition when a new
 // certificate is required.
 type controller struct {
-	certificateLister        cmlisters.CertificateLister
-	certificateRequestLister cmlisters.CertificateRequestLister
-	secretLister             corelisters.SecretLister
-	client                   cmclient.Interface
-	recorder                 record.EventRecorder
-	scheduledWorkQueue       scheduler.ScheduledWorkQueue
+	certificateLister                        cmlisters.CertificateLister
+	certificateRequestLister                 cmlisters.CertificateRequestLister
+	secretLister                             internalinformers.SecretLister
+	client                                   cmclient.Interface
+	recorder                                 record.EventRecorder
+	scheduledWorkQueue                       scheduler.ScheduledWorkQueue[types.NamespacedName]
+	certificateRequestMinimumBackoffDuration time.Duration
+	certificateRequestMaximumBackoffDuration time.Duration
 
 	// fieldManager is the string which will be used as the Field Manager on
 	// fields created or edited by the cert-manager Kubernetes client during
@@ -85,34 +95,49 @@ type controller struct {
 
 func NewController(
 	log logr.Logger,
-	client cmclient.Interface,
-	factory informers.SharedInformerFactory,
-	cmFactory cminformers.SharedInformerFactory,
-	recorder record.EventRecorder,
-	clock clock.Clock,
+	ctx *controllerpkg.Context,
 	shouldReissue policies.Func,
-	fieldManager string,
-) (*controller, workqueue.RateLimitingInterface, []cache.InformerSynced) {
+) (*controller, workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// create a queue used to queue up items to be processed
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(time.Second*1, time.Second*30), ControllerName)
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultCertificateRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
 	// obtain references to all the informers used by this controller
-	certificateInformer := cmFactory.Certmanager().V1().Certificates()
-	certificateRequestInformer := cmFactory.Certmanager().V1().CertificateRequests()
-	secretsInformer := factory.Core().V1().Secrets()
+	certificateInformer := ctx.SharedInformerFactory.Certmanager().V1().Certificates()
+	certificateRequestInformer := ctx.SharedInformerFactory.Certmanager().V1().CertificateRequests()
+	secretsInformer := ctx.KubeSharedInformerFactory.Secrets()
 
-	certificateInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: queue})
+	if _, err := certificateInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(queue)); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// When a CertificateRequest resource changes, enqueue the Certificate resource that owns it.
-	certificateRequestInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(), predicate.ResourceOwnerOf),
-	})
+	if _, err := certificateRequestInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			certificates.EnqueueCertificatesForResourceUsingPredicates[*cmapi.CertificateRequest](
+				log, queue, certificateInformer.Lister(),
+				predicate.ResourceOwnerOf,
+			),
+		),
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 	// When a Secret resource changes, enqueue any Certificate resources that name it as spec.secretName.
-	secretsInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		// Trigger reconciles on changes to the Secret named `spec.secretName`
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(),
-			predicate.ExtractResourceName(predicate.CertificateSecretName)),
-	})
+	if _, err := secretsInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			// Trigger reconciles on changes to the Secret named `spec.secretName`
+			certificates.EnqueueCertificatesForResourceUsingPredicates(
+				log, queue, certificateInformer.Lister(),
+				predicate.ExtractResourceName[*corev1.Secret](predicate.CertificateSecretName),
+			),
+		),
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// build a list of InformerSynced functions that will be returned by the Register method.
 	// the controller will only begin processing items once all of these informers have synced.
@@ -123,46 +148,67 @@ func NewController(
 	}
 
 	return &controller{
-		certificateLister:        certificateInformer.Lister(),
-		certificateRequestLister: certificateRequestInformer.Lister(),
-		secretLister:             secretsInformer.Lister(),
-		client:                   client,
-		recorder:                 recorder,
-		scheduledWorkQueue:       scheduler.NewScheduledWorkQueue(clock, queue.Add),
-		fieldManager:             fieldManager,
+		certificateLister:                        certificateInformer.Lister(),
+		certificateRequestLister:                 certificateRequestInformer.Lister(),
+		secretLister:                             secretsInformer.Lister(),
+		client:                                   ctx.CMClient,
+		recorder:                                 ctx.Recorder,
+		scheduledWorkQueue:                       scheduler.NewScheduledWorkQueue(ctx.Clock, queue.Add),
+		fieldManager:                             ctx.FieldManager,
+		certificateRequestMinimumBackoffDuration: ctx.CertificateRequestMinimumBackoffDuration,
+		certificateRequestMaximumBackoffDuration: ctx.CertificateRequestMaximumBackoffDuration,
 
 		// The following are used for testing purposes.
-		clock:         clock,
+		clock:         ctx.Clock,
 		shouldReissue: shouldReissue,
 		dataForCertificate: (&policies.Gatherer{
 			CertificateRequestLister: certificateRequestInformer.Lister(),
 			SecretLister:             secretsInformer.Lister(),
 		}).DataForCertificate,
-	}, queue, mustSync
+	}, queue, mustSync, nil
 }
 
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx).WithValues("key", key)
 	ctx = logf.NewContext(ctx, log)
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key passed to ProcessItem")
+	namespace, name := key.Namespace, key.Name
+
+	crt, err := c.certificateLister.Certificates(namespace).Get(name)
+	if err != nil && !k8sErrors.IsNotFound(err) {
+		return err
+	}
+	if crt == nil || crt.DeletionTimestamp != nil {
+		// If the Certificate object was/ is being deleted, we don't want to start scheduling
+		// renewals.
 		return nil
 	}
 
-	crt, err := c.certificateLister.Certificates(namespace).Get(name)
-	if apierrors.IsNotFound(err) {
-		log.V(logf.DebugLevel).Info("certificate not found for key", "error", err.Error())
-		return nil
-	}
-	if err != nil {
-		return err
-	}
 	if apiutil.CertificateHasCondition(crt, cmapi.CertificateCondition{
 		Type:   cmapi.CertificateConditionIssuing,
 		Status: cmmeta.ConditionTrue,
 	}) {
 		// Do nothing if an issuance is already in progress.
+		return nil
+	}
+
+	// It is possible for multiple Certificates to reference the same Secret. In that case, without this check,
+	// the duplicate Certificates would each be issued and store their version of the X.509 certificate in the
+	// target Secret, triggering the re-issuance of the other Certificate resources whose spec no longer matches
+	// what is in the Secret. This would cause a flood of re-issuance attempts and overloads the Kubernetes API
+	// and the API server of the issuing CA.
+	isOwner, duplicates, err := internalcertificates.CertificateOwnsSecret(ctx, c.certificateLister, c.secretLister, crt)
+	if err != nil {
+		return err
+	}
+	if !isOwner {
+		log.V(logf.DebugLevel).Info("Certificate.Spec.SecretName refers to the same Secret as other Certificates in the same namespace, skipping trigger.", "duplicates", duplicates)
+
+		// If the Certificate is not the owner of the Secret, we requeue the Certificate and wait for the
+		// Certificate to become the owner of the Secret. This can happen if the Certificate is updated to
+		// reference a different Secret, or if the conflicting Certificate is deleted or updated to no longer
+		// reference the Secret.
+		c.scheduledWorkQueue.Add(key, 3*time.Minute)
+
 		return nil
 	}
 
@@ -172,7 +218,7 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 	}
 
 	// Don't trigger issuance if we need to back off due to previous failures and Certificate's spec has not changed.
-	backoff, delay := shouldBackoffReissuingOnFailure(log, c.clock, input.Certificate, input.NextRevisionRequest)
+	backoff, delay := shouldBackoffReissuingOnFailure(log, c.clock, input.Certificate, input.NextRevisionRequest, c.certificateRequestMinimumBackoffDuration, c.certificateRequestMaximumBackoffDuration)
 	if backoff {
 		nextIssuanceRetry := c.clock.Now().Add(delay)
 		message := fmt.Sprintf("Backing off from issuance due to previously failed issuance(s). Issuance will next be attempted at %v", nextIssuanceRetry)
@@ -188,8 +234,25 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 	}
 
 	reason, message, reissue := c.shouldReissue(input)
+	if reason == policies.WindowError {
+		c.recorder.Event(crt, corev1.EventTypeWarning, reason, fmt.Sprintf("Renewing certificate without satisfying renewal windows due to %s", message))
+		message = fmt.Sprintf("Renewing certificate without satisfying renewal windows at: %s", crt.Status.RenewalTime)
+		reason = policies.Renewing
+	}
+
 	if !reissue {
-		// no re-issuance required, return early
+		return nil
+	}
+
+	// Don't start issuance for an ML-DSA Certificate (created while the
+	// MLDSAPrivateKeys feature gate was enabled) while the gate is disabled.
+	// The existing Secret is left alone so that workloads keep running.
+	if crt.Spec.PrivateKey != nil && crt.Spec.PrivateKey.Algorithm == cmapi.MLDSAKeyAlgorithm &&
+		!utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) {
+		message = fmt.Sprintf("Certificate must be re-issued (%s), but issuing certificates with ML-DSA private keys requires the MLDSAPrivateKeys feature gate to be enabled", reason)
+		log.V(logf.InfoLevel).Info("Not re-issuing Certificate because the MLDSAPrivateKeys feature gate is disabled", "reason", reason)
+		c.recorder.Event(crt, corev1.EventTypeWarning, reasonMLDSAPrivateKeysDisabled, message)
+		c.scheduledWorkQueue.Add(key, mldsaPrivateKeysDisabledRecheckInterval)
 		return nil
 	}
 
@@ -219,8 +282,9 @@ func (c *controller) updateOrApplyStatus(ctx context.Context, crt *cmapi.Certifi
 			conditions = []cmapi.CertificateCondition{*cond}
 		}
 		return internalcertificates.ApplyStatus(ctx, c.client, c.fieldManager, &cmapi.Certificate{
-			ObjectMeta: metav1.ObjectMeta{Namespace: crt.Namespace, Name: crt.Name},
-			Status:     cmapi.CertificateStatus{Conditions: conditions},
+			Namespace: crt.Namespace,
+			Name:      crt.Name,
+			Status:    cmapi.CertificateStatus{Conditions: conditions},
 		})
 	} else {
 		_, err := c.client.CertmanagerV1().Certificates(crt.Namespace).UpdateStatus(ctx, crt, metav1.UpdateOptions{})
@@ -230,9 +294,14 @@ func (c *controller) updateOrApplyStatus(ctx context.Context, crt *cmapi.Certifi
 
 // shouldBackOffReissuingOnFailure returns true if an issuance needs to be
 // delayed and the required delay after calculating the exponential backoff.
-// The backoff periods are 1h, 2h, 4h, 8h, 16h and 32h counting from when the last
-// failure occured,
-// so the returned delay will be backoff_period - (current_time - last_failure_time)
+// The backoff period is configured through ControllerConfig using the certificateRequestMinimumBackoffDuration
+// and certificateRequestMaximumBackoffDuration fields.
+// In the scenario where the fields are not set the default minimum duration is 1h and the default maximum
+// duration is 32h.
+// The backoff periods are calculated exponentially based on the initialDelay counting from when the last
+// failure occurred,
+// so the returned delay will be backoff_period - (current_time - last_failure_time).
+// The delay is capped at the configured maximum backoff duration.
 //
 // Notably, it returns no back-off when the certificate doesn't
 // match the "next" certificate (since a mismatch means that this certificate
@@ -240,7 +309,7 @@ func (c *controller) updateOrApplyStatus(ctx context.Context, crt *cmapi.Certifi
 //
 // Note that the request can be left nil: in that case, the returned back-off
 // will be 0 since it means the CR must be created immediately.
-func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.Certificate, nextCR *cmapi.CertificateRequest) (bool, time.Duration) {
+func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.Certificate, nextCR *cmapi.CertificateRequest, initialDelay time.Duration, maxDelay time.Duration) (bool, time.Duration) {
 	if crt.Status.LastFailureTime == nil {
 		return false, 0
 	}
@@ -258,7 +327,7 @@ func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.
 	if nextCR == nil {
 		log.V(logf.InfoLevel).Info("next CertificateRequest not available, skipping checking if Certificate matches the CertificateRequest")
 	} else {
-		mismatches, err := certificates.RequestMatchesSpec(nextCR, crt.Spec)
+		mismatches, err := pki.RequestMatchesSpec(nextCR, crt.Spec)
 		if err != nil {
 			log.V(logf.InfoLevel).Info("next CertificateRequest cannot be decoded, skipping checking if Certificate matches the CertificateRequest")
 			return false, 0
@@ -272,28 +341,32 @@ func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.
 	now := c.Now()
 	durationSinceFailure := now.Sub(crt.Status.LastFailureTime.Time)
 
-	initialDelay := time.Hour
+	if initialDelay <= 0 {
+		log.V(logf.InfoLevel).Info("initial backoff duration is less than or equal to zero, skipping backoff")
+		return false, 0
+	}
 	delay := initialDelay
-	failedIssuanceAttempts := 0
 	// It is possible that crt.Status.LastFailureTime != nil &&
 	// crt.Status.FailedIssuanceAttempts == nil (in case of the Certificate having
 	// failed for an installation of cert-manager before the issuance
 	// attempts were introduced). In such case delay = initialDelay.
 	if crt.Status.FailedIssuanceAttempts != nil {
-		failedIssuanceAttempts = *crt.Status.FailedIssuanceAttempts
-		delay = time.Hour * time.Duration(math.Pow(2, float64(failedIssuanceAttempts-1)))
+		if *crt.Status.FailedIssuanceAttempts <= 0 {
+			// FailedIssuanceAttempts <= 0 can only arise from a manual kubectl patch;
+			// treat it the same as nil (use initialDelay).
+			delay = initialDelay
+		} else {
+			computed := initialDelay * time.Duration(math.Pow(2, float64(*crt.Status.FailedIssuanceAttempts-1)))
+			if computed < initialDelay || computed > maxDelay {
+				delay = maxDelay
+			} else {
+				delay = computed
+			}
+		}
 	}
 
-	// Ensure that maximum returned delay is 32 hours
-	// delay cannot be calculated for large issuance numbers, so we
-	// cannot reliably check if delay > maxDelay directly
-	// (see i.e the result of time.Duration(math.Pow(2, 99)))
-	if failedIssuanceAttempts > stopIncreaseBackoff {
-		delay = maxDelay
-	}
-
-	// Ensure that minimum returned delay is 1 hour. This is here to guard
-	// against an edge case where the delay duration got messed
+	// Ensure that minimum returned delay is initialDelay that is configured by the operator.
+	// This is here to guard against an edge case where the delay duration got messed
 	// up as a result of maths misuse in the previous calculations
 	if delay < initialDelay {
 		delay = initialDelay
@@ -312,7 +385,7 @@ func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.
 // has elapsed.
 // If the 'durationUntilRenewalTime' is less than zero, it will not be
 // queued again.
-func (c *controller) scheduleRecheckOfCertificateIfRequired(log logr.Logger, key string, durationUntilRenewalTime time.Duration) {
+func (c *controller) scheduleRecheckOfCertificateIfRequired(log logr.Logger, key types.NamespacedName, durationUntilRenewalTime time.Duration) {
 	// don't schedule a re-queue if the time is in the past.
 	// if it is in the past, the resource will be triggered during the
 	// current call to the ProcessItem method. If we added the item to the
@@ -334,22 +407,17 @@ type controllerWrapper struct {
 	*controller
 }
 
-func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// construct a new named logger to be reused throughout the controller
 	log := logf.FromContext(ctx.RootContext, ControllerName)
 
-	ctrl, queue, mustSync := NewController(log,
-		ctx.CMClient,
-		ctx.KubeSharedInformerFactory,
-		ctx.SharedInformerFactory,
-		ctx.Recorder,
-		ctx.Clock,
+	ctrl, queue, mustSync, err := NewController(log,
+		ctx,
 		policies.NewTriggerPolicyChain(ctx.Clock).Evaluate,
-		ctx.FieldManager,
 	)
 	c.controller = ctrl
 
-	return queue, mustSync, nil
+	return queue, mustSync, err
 }
 
 func init() {

@@ -20,27 +20,32 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"slices"
 
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	"github.com/cert-manager/cert-manager/pkg/acme"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmacmeclientset "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/typed/acme/v1"
 	cmacmelisters "github.com/cert-manager/cert-manager/pkg/client/listers/acme/v1"
+	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificaterequests"
 	crutil "github.com/cert-manager/cert-manager/pkg/controller/certificaterequests/util"
 	issuerpkg "github.com/cert-manager/cert-manager/pkg/issuer"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
-	"github.com/cert-manager/cert-manager/pkg/util"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/go-logr/logr"
+	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
 )
 
 const (
@@ -56,8 +61,10 @@ type ACME struct {
 	recorder      record.EventRecorder
 	issuerOptions controllerpkg.IssuerOptions
 
-	orderLister cmacmelisters.OrderLister
-	acmeClientV cmacmeclientset.AcmeV1Interface
+	orderLister       cmacmelisters.OrderLister
+	certificateLister cmlisters.CertificateLister
+	secretsLister     internalinformers.SecretLister
+	acmeClientV       cmacmeclientset.AcmeV1Interface
 
 	reporter *crutil.Reporter
 
@@ -74,19 +81,21 @@ func init() {
 			For(certificaterequests.New(
 				apiutil.IssuerACME,
 				NewACME,
-				func(ctx *controllerpkg.Context, log logr.Logger, queue workqueue.RateLimitingInterface) ([]cache.InformerSynced, error) {
+				func(ctx *controllerpkg.Context, log logr.Logger, queue workqueue.TypedRateLimitingInterface[types.NamespacedName]) ([]cache.InformerSynced, error) {
 					orderInformer := ctx.SharedInformerFactory.Acme().V1().Orders().Informer()
 					certificateRequestLister := ctx.SharedInformerFactory.Certmanager().V1().CertificateRequests().Lister()
 
-					orderInformer.AddEventHandler(&controllerpkg.BlockingEventHandler{
-						WorkFunc: controllerpkg.HandleOwnedResourceNamespacedFunc(
+					if _, err := orderInformer.AddEventHandler(controllerpkg.BlockingEventHandler(
+						controllerpkg.HandleOwnedResourceNamespacedFunc(
 							log, queue,
 							cmapi.SchemeGroupVersion.WithKind(cmapi.CertificateRequestKind),
-							func(namespace, name string) (interface{}, error) {
+							func(namespace, name string) (*cmapi.CertificateRequest, error) {
 								return certificateRequestLister.CertificateRequests(namespace).Get(name)
 							},
 						),
-					})
+					)); err != nil {
+						return nil, fmt.Errorf("error setting up event handler: %v", err)
+					}
 					return []cache.InformerSynced{orderInformer.HasSynced}, nil
 				},
 			)).
@@ -97,12 +106,14 @@ func init() {
 // NewACME returns a configured controller.
 func NewACME(ctx *controllerpkg.Context) certificaterequests.Issuer {
 	return &ACME{
-		recorder:      ctx.Recorder,
-		issuerOptions: ctx.IssuerOptions,
-		orderLister:   ctx.SharedInformerFactory.Acme().V1().Orders().Lister(),
-		acmeClientV:   ctx.CMClient.AcmeV1(),
-		reporter:      crutil.NewReporter(ctx.Clock, ctx.Recorder),
-		fieldManager:  ctx.FieldManager,
+		recorder:          ctx.Recorder,
+		issuerOptions:     ctx.IssuerOptions,
+		orderLister:       ctx.SharedInformerFactory.Acme().V1().Orders().Lister(),
+		certificateLister: ctx.SharedInformerFactory.Certmanager().V1().Certificates().Lister(),
+		secretsLister:     ctx.KubeSharedInformerFactory.Secrets().Lister(),
+		acmeClientV:       ctx.CMClient.AcmeV1(),
+		reporter:          crutil.NewReporter(ctx.Clock, ctx.Recorder),
+		fieldManager:      ctx.FieldManager,
 	}
 }
 
@@ -127,7 +138,7 @@ func (a *ACME) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuer cm
 	}
 
 	// If the CommonName is also not present in the DNS names or IP Addresses of the Request then hard fail.
-	if len(csr.Subject.CommonName) > 0 && !util.Contains(csr.DNSNames, csr.Subject.CommonName) && !util.Contains(pki.IPAddressesToString(csr.IPAddresses), csr.Subject.CommonName) {
+	if len(csr.Subject.CommonName) > 0 && !slices.Contains(csr.DNSNames, csr.Subject.CommonName) && !slices.Contains(pki.IPAddressesToString(csr.IPAddresses), csr.Subject.CommonName) {
 		err = fmt.Errorf("%q does not exist in %s or %s", csr.Subject.CommonName, csr.DNSNames, pki.IPAddressesToString(csr.IPAddresses))
 		message := "The CSR PEM requests a commonName that is not present in the list of dnsNames or ipAddresses. If a commonName is set, ACME requires that the value is also present in the list of dnsNames or ipAddresses"
 
@@ -138,8 +149,17 @@ func (a *ACME) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuer cm
 		return nil, nil
 	}
 
+	// Resolve the ARI CertID of the certificate currently stored in the target
+	// Secret (if any). This is set as the `replaces` field on newOrder so the
+	// ACME server can correlate this renewal with the cert being replaced
+	// (RFC 9773).
+	var replaces string
+	if acme.ARIEnabledForIssuer(issuer) {
+		replaces = a.resolveReplacesCertID(ctx, cr)
+	}
+
 	// If we fail to build the order we have to hard fail.
-	expectedOrder, err := buildOrder(cr, csr, issuer.GetSpec().ACME.EnableDurationFeature)
+	expectedOrder, err := buildOrder(cr, csr, issuer.GetSpec().ACME.EnableDurationFeature, issuer.GetSpec().ACME.Profile, replaces)
 	if err != nil {
 		message := "Failed to build order"
 
@@ -151,6 +171,7 @@ func (a *ACME) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuer cm
 
 	order, err := a.orderLister.Orders(expectedOrder.Namespace).Get(expectedOrder.Name)
 	if k8sErrors.IsNotFound(err) {
+		log.V(logf.DebugLevel).Info("creating order", "profile", expectedOrder.Spec.Profile)
 		// Failing to create the order here is most likely network related.
 		// We should backoff and keep trying.
 		_, err = a.acmeClientV.Orders(expectedOrder.Namespace).Create(ctx, expectedOrder, metav1.CreateOptions{FieldManager: a.fieldManager})
@@ -232,14 +253,14 @@ func (a *ACME) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuer cm
 
 	log.V(logf.InfoLevel).Info("certificate issued")
 
-	// Order valid, return cert. The calling controller will update with ready if its happy with the cert.
+	// Order valid, return cert. The calling controller will update with ready if it's happy with the cert.
 	return &issuerpkg.IssueResponse{
 		Certificate: order.Status.Certificate,
 	}, nil
 }
 
 // Build order. If we error here it is a terminating failure.
-func buildOrder(cr *cmapi.CertificateRequest, csr *x509.CertificateRequest, enableDurationFeature bool) (*cmacme.Order, error) {
+func buildOrder(cr *cmapi.CertificateRequest, csr *x509.CertificateRequest, enableDurationFeature bool, profile string, replaces string) (*cmacme.Order, error) {
 	var ipAddresses []string
 	for _, ip := range csr.IPAddresses {
 		ipAddresses = append(ipAddresses, ip.String())
@@ -256,6 +277,8 @@ func buildOrder(cr *cmapi.CertificateRequest, csr *x509.CertificateRequest, enab
 		CommonName:  csr.Subject.CommonName,
 		DNSNames:    dnsNames,
 		IPAddresses: ipAddresses,
+		Profile:     profile,
+		Replaces:    replaces,
 	}
 
 	if enableDurationFeature {
@@ -266,7 +289,7 @@ func buildOrder(cr *cmapi.CertificateRequest, csr *x509.CertificateRequest, enab
 	// create a deep copy of the OrderSpec so we can overwrite the Request and NotAfter field
 	computeNameSpec.Request = nil
 
-	var hashObj interface{}
+	var hashObj any
 	hashObj = computeNameSpec
 	if len(cr.Name) >= 52 {
 		// Pass a unique struct for hashing so that names at or longer than 52 characters
@@ -289,16 +312,68 @@ func buildOrder(cr *cmapi.CertificateRequest, csr *x509.CertificateRequest, enab
 	// hash (uint32) will be at most 10 digits long, and we account for
 	// the hyphen.
 	return &cmacme.Order{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cr.Namespace,
-			Labels:    cr.Labels,
-			// Annotations include the filtered annotations copied from the Certificate.
-			Annotations: cr.Annotations,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(cr, cmapi.SchemeGroupVersion.WithKind(cmapi.CertificateRequestKind)),
-			},
+		Name:      name,
+		Namespace: cr.Namespace,
+		Labels:    cr.Labels,
+		// Annotations include the filtered annotations copied from the Certificate.
+		Annotations: cr.Annotations,
+		OwnerReferences: []metav1.OwnerReference{
+			*metav1.NewControllerRef(cr, cmapi.SchemeGroupVersion.WithKind(cmapi.CertificateRequestKind)),
 		},
 		Spec: spec,
 	}, nil
+}
+
+// resolveReplacesCertID returns the ARI CertID derived from the leaf certificate
+// currently stored in the target Secret of the CertificateRequest's parent
+// Certificate, or "" if it cannot be determined.
+//
+// Any failure (missing annotation, parent Certificate not found, no Secret,
+// invalid PEM, missing AKI, etc.) is non-fatal and logged at debug level –
+// the order is still placed without a replaces hint.
+func (a *ACME) resolveReplacesCertID(ctx context.Context, cr *cmapi.CertificateRequest) string {
+	log := logf.FromContext(ctx, "resolve-replaces")
+
+	certName, ok := cr.Annotations[cmapi.CertificateNameKey]
+	if !ok || certName == "" {
+		return ""
+	}
+
+	crt, err := a.certificateLister.Certificates(cr.Namespace).Get(certName)
+	if err != nil {
+		log.V(logf.DebugLevel).Info("could not resolve parent Certificate for ARI replaces", "error", err)
+		return ""
+	}
+	if crt.Spec.SecretName == "" {
+		return ""
+	}
+
+	secret, err := a.secretsLister.Secrets(cr.Namespace).Get(crt.Spec.SecretName)
+	if err != nil {
+		log.V(logf.DebugLevel).Info("could not resolve Secret for ARI replaces", "error", err)
+		return ""
+	}
+
+	if !apiutil.SecretIssuerAnnotationsMatch(secret, cr.Spec.IssuerRef) {
+		log.V(logf.DebugLevel).Info("skipping ARI replaces: Secret issuer annotations do not match CertificateRequest issuerRef", "secret", secret.Name, "issuerRef", cr.Spec.IssuerRef)
+		return ""
+	}
+
+	pemBytes, ok := secret.Data[corev1.TLSCertKey]
+	if !ok || len(pemBytes) == 0 {
+		return ""
+	}
+
+	leaf, err := pki.DecodeX509CertificateBytes(pemBytes)
+	if err != nil {
+		log.V(logf.DebugLevel).Info("could not decode current leaf for ARI replaces", "error", err)
+		return ""
+	}
+
+	certID, err := acmeapi.CertificateARIID(leaf)
+	if err != nil {
+		log.V(logf.DebugLevel).Info("could not derive ARI CertID for replaces", "error", err)
+		return ""
+	}
+	return certID
 }

@@ -20,12 +20,11 @@ import (
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
-	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
-	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/util/predicate"
 )
 
@@ -37,33 +36,33 @@ import (
 // call when enqueuing Certificate resources.
 // If no predicate constructors are given, all Certificate resources will be
 // enqueued on every invocation.
-func EnqueueCertificatesForResourceUsingPredicates(log logr.Logger, queue workqueue.Interface, lister cmlisters.CertificateLister, selector labels.Selector, predicateBuilders ...predicate.ExtractorFunc) func(obj interface{}) {
-	return func(obj interface{}) {
-		s, ok := obj.(metav1.Object)
+func EnqueueCertificatesForResourceUsingPredicates[U metav1.Object](
+	log logr.Logger, queue workqueue.TypedInterface[types.NamespacedName],
+	lister cmlisters.CertificateLister,
+	predicateBuilders ...predicate.ExtractorFunc[*cmapi.Certificate, U],
+) func(metav1.Object) {
+	return func(s metav1.Object) {
+		u, ok := s.(U)
 		if !ok {
-			log.V(logf.ErrorLevel).Info("Non-Object type resource passed to EnqueueCertificatesForSecretUsingPredicates")
 			return
 		}
 
-		// 'Construct' the predicate functions using the given Secret
-		predicates := make(predicate.Funcs, len(predicateBuilders))
+		predicates := make(predicate.Funcs[*cmapi.Certificate], len(predicateBuilders))
 		for i, b := range predicateBuilders {
-			predicates[i] = b(s.(runtime.Object))
+			predicates[i] = b(u)
 		}
 
-		certs, err := ListCertificatesMatchingPredicates(lister.Certificates(s.GetNamespace()), selector, predicates...)
+		certs, err := ListCertificatesMatchingPredicates(lister.Certificates(s.GetNamespace()), labels.Everything(), predicates...)
 		if err != nil {
 			log.Error(err, "Failed listing Certificate resources")
 			return
 		}
 
 		for _, cert := range certs {
-			key, err := controllerpkg.KeyFunc(cert)
-			if err != nil {
-				log.Error(err, "Error determining 'key' for resource")
-				continue
-			}
-			queue.Add(key)
+			queue.Add(types.NamespacedName{
+				Name:      cert.Name,
+				Namespace: cert.Namespace,
+			})
 		}
 	}
 }

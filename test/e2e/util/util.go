@@ -22,31 +22,36 @@ import (
 	"context"
 	"crypto"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
 	"net"
 	"net/url"
 	"time"
-
-	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	networkingv1beta1 "k8s.io/api/networking/v1beta1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/discovery"
-	gwapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	clientset "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/typed/certmanager/v1"
 	"github.com/cert-manager/cert-manager/pkg/util"
-	"github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/log"
+	"github.com/cert-manager/cert-manager/pkg/util/predicate"
+	"github.com/cert-manager/cert-manager/test/unit/gen"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	networkingv1beta1 "k8s.io/api/networking/v1beta1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	gwapi "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/log"
+
+	. "github.com/onsi/gomega"
 )
 
 func CertificateOnlyValidForDomains(cert *x509.Certificate, commonName string, dnsNames ...string) bool {
@@ -56,43 +61,40 @@ func CertificateOnlyValidForDomains(cert *x509.Certificate, commonName string, d
 	return true
 }
 
-func WaitForIssuerStatusFunc(client clientset.IssuerInterface, name string, fn func(*v1.Issuer) (bool, error)) error {
-	return wait.PollImmediate(500*time.Millisecond, time.Minute,
-		func() (bool, error) {
-			issuer, err := client.Get(context.TODO(), name, metav1.GetOptions{})
-			if err != nil {
-				return false, fmt.Errorf("error getting Issuer %q: %v", name, err)
-			}
-			return fn(issuer)
-		})
+func WaitForIssuerStatusFunc(ctx context.Context, client clientset.IssuerInterface, name string, fn func(*v1.Issuer) (bool, error)) error {
+	return wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		issuer, err := client.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Errorf("error getting Issuer %q: %v", name, err)
+		}
+		return fn(issuer)
+	})
 }
 
 // WaitForIssuerCondition waits for the status of the named issuer to contain
 // a condition whose type and status matches the supplied one.
-func WaitForIssuerCondition(client clientset.IssuerInterface, name string, condition v1.IssuerCondition) error {
+func WaitForIssuerCondition(ctx context.Context, client clientset.IssuerInterface, name string, condition v1.IssuerCondition) error {
 	logf, done := log.LogBackoff()
 	defer done()
-	pollErr := wait.PollImmediate(500*time.Millisecond, time.Minute,
-		func() (bool, error) {
-			logf("Waiting for issuer %v condition %#v", name, condition)
-			issuer, err := client.Get(context.TODO(), name, metav1.GetOptions{})
-			if nil != err {
-				return false, fmt.Errorf("error getting Issuer %q: %v", name, err)
-			}
+	pollErr := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		logf("Waiting for issuer %v condition %#v", name, condition)
+		issuer, err := client.Get(ctx, name, metav1.GetOptions{})
+		if nil != err {
+			return false, fmt.Errorf("error getting Issuer %q: %v", name, err)
+		}
 
-			return apiutil.IssuerHasCondition(issuer, condition), nil
-		},
-	)
-	return wrapErrorWithIssuerStatusCondition(client, pollErr, name, condition.Type)
+		return apiutil.IssuerHasCondition(issuer, condition), nil
+	})
+	return wrapErrorWithIssuerStatusCondition(ctx, client, pollErr, name, condition.Type)
 }
 
 // try to retrieve last condition to help diagnose tests.
-func wrapErrorWithIssuerStatusCondition(client clientset.IssuerInterface, pollErr error, name string, conditionType v1.IssuerConditionType) error {
+func wrapErrorWithIssuerStatusCondition(ctx context.Context, client clientset.IssuerInterface, pollErr error, name string, conditionType v1.IssuerConditionType) error {
 	if pollErr == nil {
 		return nil
 	}
 
-	issuer, err := client.Get(context.TODO(), name, metav1.GetOptions{})
+	issuer, err := client.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return pollErr
 	}
@@ -101,7 +103,6 @@ func wrapErrorWithIssuerStatusCondition(client clientset.IssuerInterface, pollEr
 		if cond.Type == conditionType {
 			return fmt.Errorf("%s: Last Status: '%s' Reason: '%s', Message: '%s'", pollErr.Error(), cond.Status, cond.Reason, cond.Message)
 		}
-
 	}
 
 	return pollErr
@@ -109,30 +110,28 @@ func wrapErrorWithIssuerStatusCondition(client clientset.IssuerInterface, pollEr
 
 // WaitForClusterIssuerCondition waits for the status of the named issuer to contain
 // a condition whose type and status matches the supplied one.
-func WaitForClusterIssuerCondition(client clientset.ClusterIssuerInterface, name string, condition v1.IssuerCondition) error {
+func WaitForClusterIssuerCondition(ctx context.Context, client clientset.ClusterIssuerInterface, name string, condition v1.IssuerCondition) error {
 	logf, done := log.LogBackoff()
 	defer done()
-	pollErr := wait.PollImmediate(500*time.Millisecond, time.Minute,
-		func() (bool, error) {
-			logf("Waiting for clusterissuer %v condition %#v", name, condition)
-			issuer, err := client.Get(context.TODO(), name, metav1.GetOptions{})
-			if nil != err {
-				return false, fmt.Errorf("error getting ClusterIssuer %v: %v", name, err)
-			}
+	pollErr := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		logf("Waiting for clusterissuer %v condition %#v", name, condition)
+		issuer, err := client.Get(ctx, name, metav1.GetOptions{})
+		if nil != err {
+			return false, fmt.Errorf("error getting ClusterIssuer %v: %v", name, err)
+		}
 
-			return apiutil.IssuerHasCondition(issuer, condition), nil
-		},
-	)
-	return wrapErrorWithClusterIssuerStatusCondition(client, pollErr, name, condition.Type)
+		return apiutil.IssuerHasCondition(issuer, condition), nil
+	})
+	return wrapErrorWithClusterIssuerStatusCondition(ctx, client, pollErr, name, condition.Type)
 }
 
 // try to retrieve last condition to help diagnose tests.
-func wrapErrorWithClusterIssuerStatusCondition(client clientset.ClusterIssuerInterface, pollErr error, name string, conditionType v1.IssuerConditionType) error {
+func wrapErrorWithClusterIssuerStatusCondition(ctx context.Context, client clientset.ClusterIssuerInterface, pollErr error, name string, conditionType v1.IssuerConditionType) error {
 	if pollErr == nil {
 		return nil
 	}
 
-	issuer, err := client.Get(context.TODO(), name, metav1.GetOptions{})
+	issuer, err := client.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return pollErr
 	}
@@ -141,7 +140,6 @@ func wrapErrorWithClusterIssuerStatusCondition(client clientset.ClusterIssuerInt
 		if cond.Type == conditionType {
 			return fmt.Errorf("%s: Last Status: '%s' Reason: '%s', Message: '%s'", pollErr.Error(), cond.Status, cond.Reason, cond.Message)
 		}
-
 	}
 
 	return pollErr
@@ -149,57 +147,32 @@ func wrapErrorWithClusterIssuerStatusCondition(client clientset.ClusterIssuerInt
 
 // WaitForCRDToNotExist waits for the CRD with the given name to no
 // longer exist.
-func WaitForCRDToNotExist(client apiextensionsv1.CustomResourceDefinitionInterface, name string) error {
+func WaitForCRDToNotExist(ctx context.Context, client apiextensionsv1.CustomResourceDefinitionInterface, name string) error {
 	logf, done := log.LogBackoff()
 	defer done()
-	return wait.PollImmediate(500*time.Millisecond, time.Minute,
-		func() (bool, error) {
-			logf("Waiting for CRD %v to not exist", name)
-			_, err := client.Get(context.TODO(), name, metav1.GetOptions{})
-			if nil == err {
-				return false, nil
-			}
-
-			if errors.IsNotFound(err) {
-				return true, nil
-			}
-
+	return wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		logf("Waiting for CRD %v to not exist", name)
+		_, err := client.Get(ctx, name, metav1.GetOptions{})
+		if nil == err {
 			return false, nil
-		},
-	)
-}
+		}
 
-// Deprecated: use test/unit/gen/Certificate in future
-func NewCertManagerBasicCertificate(name, secretName, issuerName string, issuerKind string, duration, renewBefore *metav1.Duration, dnsNames ...string) *v1.Certificate {
-	cn := "test.domain.com"
-	if len(dnsNames) > 0 {
-		cn = dnsNames[0]
-	}
-	return &v1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
-		Spec: v1.CertificateSpec{
-			CommonName: cn,
-			DNSNames:   dnsNames,
-			Subject: &v1.X509Subject{
-				Organizations: []string{"test-org"},
-			},
-			SecretName:  secretName,
-			Duration:    duration,
-			RenewBefore: renewBefore,
-			PrivateKey:  &v1.CertificatePrivateKey{},
-			IssuerRef: cmmeta.ObjectReference{
-				Name: issuerName,
-				Kind: issuerKind,
-			},
-		},
-	}
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+
+		return false, nil
+	})
 }
 
 // Deprecated: use test/unit/gen/CertificateRequest in future
-func NewCertManagerBasicCertificateRequest(name, issuerName string, issuerKind string, duration *metav1.Duration,
-	dnsNames []string, ips []net.IP, uris []string, keyAlgorithm x509.PublicKeyAlgorithm) (*v1.CertificateRequest, crypto.Signer, error) {
+func NewCertManagerBasicCertificateRequest(
+	name, namespace string,
+	issuerName, issuerKind string,
+	duration *metav1.Duration,
+	dnsNames []string, ips []net.IP, uris []string,
+	keyAlgorithm x509.PublicKeyAlgorithm,
+) (*v1.CertificateRequest, crypto.Signer, error) {
 	cn := "test.domain.com"
 	if len(dnsNames) > 0 {
 		cn = dnsNames[0]
@@ -214,81 +187,36 @@ func NewCertManagerBasicCertificateRequest(name, issuerName string, issuerKind s
 		parsedURIs = append(parsedURIs, parsed)
 	}
 
-	var sk crypto.Signer
-	var signatureAlgorithm x509.SignatureAlgorithm
-	var err error
-
-	switch keyAlgorithm {
-	case x509.RSA:
-		sk, err = pki.GenerateRSAPrivateKey(2048)
-		if err != nil {
-			return nil, nil, err
-		}
-		signatureAlgorithm = x509.SHA256WithRSA
-	case x509.ECDSA:
-		sk, err = pki.GenerateECPrivateKey(pki.ECCurve256)
-		if err != nil {
-			return nil, nil, err
-		}
-		signatureAlgorithm = x509.ECDSAWithSHA256
-	case x509.Ed25519:
-		sk, err = pki.GenerateEd25519PrivateKey()
-		if err != nil {
-			return nil, nil, err
-		}
-		signatureAlgorithm = x509.PureEd25519
-	default:
-		return nil, nil, fmt.Errorf("unrecognised key algorithm: %s", err)
-	}
-
-	csr := &x509.CertificateRequest{
-		Version:            3,
-		SignatureAlgorithm: signatureAlgorithm,
-		PublicKeyAlgorithm: keyAlgorithm,
-		PublicKey:          sk.Public(),
-		Subject: pkix.Name{
-			CommonName: cn,
-		},
-		DNSNames:    dnsNames,
-		IPAddresses: ips,
-		URIs:        parsedURIs,
-	}
-
-	csrBytes, err := pki.EncodeCSR(csr, sk)
+	csrPEM, sk, err := gen.CSR(keyAlgorithm,
+		gen.SetCSRCommonName(cn),
+		gen.SetCSRDNSNames(dnsNames...),
+		gen.SetCSRIPAddresses(ips...),
+		gen.SetCSRURIs(parsedURIs...),
+	)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	csrPEM := pem.EncodeToMemory(&pem.Block{
-		Type: "CERTIFICATE REQUEST", Bytes: csrBytes,
-	})
-
-	return &v1.CertificateRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
-		Spec: v1.CertificateRequestSpec{
-			Duration: duration,
-			Request:  csrPEM,
-			IssuerRef: cmmeta.ObjectReference{
-				Name: issuerName,
-				Kind: issuerKind,
-			},
-		},
-	}, sk, nil
+	return gen.CertificateRequest(name,
+		gen.SetCertificateRequestNamespace(namespace),
+		gen.SetCertificateRequestDuration(duration),
+		gen.SetCertificateRequestCSR(csrPEM),
+		gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{
+			Name: issuerName,
+			Kind: issuerKind,
+		}),
+	), sk, nil
 }
 
-func NewCertManagerVaultCertificate(name, secretName, issuerName string, issuerKind string, duration, renewBefore *metav1.Duration) *v1.Certificate {
+func NewCertManagerVaultCertificate(name, secretName, issuerName string, issuerKind string, duration *metav1.Duration, renewBefore *metav1.Duration) *v1.Certificate {
 	return &v1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
+		Name: name,
 		Spec: v1.CertificateSpec{
 			CommonName:  "test.domain.com",
 			SecretName:  secretName,
 			Duration:    duration,
 			RenewBefore: renewBefore,
-			IssuerRef: cmmeta.ObjectReference{
+			IssuerRef: cmmeta.IssuerReference{
 				Name: issuerName,
 				Kind: issuerKind,
 			},
@@ -298,10 +226,8 @@ func NewCertManagerVaultCertificate(name, secretName, issuerName string, issuerK
 
 func NewIngress(name, secretName string, annotations map[string]string, dnsNames ...string) *networkingv1.Ingress {
 	return &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Annotations: annotations,
-		},
+		Name:        name,
+		Annotations: annotations,
 		Spec: networkingv1.IngressSpec{
 			TLS: []networkingv1.IngressTLS{
 				{
@@ -312,18 +238,16 @@ func NewIngress(name, secretName string, annotations map[string]string, dnsNames
 			Rules: []networkingv1.IngressRule{
 				{
 					Host: dnsNames[0],
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     "/",
-									PathType: pathTypePrefix(),
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: "somesvc",
-											Port: networkingv1.ServiceBackendPort{
-												Number: 80,
-											},
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{
+							{
+								Path:     "/",
+								PathType: pathTypePrefix(),
+								Backend: networkingv1.IngressBackend{
+									Service: &networkingv1.IngressServiceBackend{
+										Name: "somesvc",
+										Port: networkingv1.ServiceBackendPort{
+											Number: 80,
 										},
 									},
 								},
@@ -338,10 +262,8 @@ func NewIngress(name, secretName string, annotations map[string]string, dnsNames
 
 func NewV1Beta1Ingress(name, secretName string, annotations map[string]string, dnsNames ...string) *networkingv1beta1.Ingress {
 	return &networkingv1beta1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Annotations: annotations,
-		},
+		Name:        name,
+		Annotations: annotations,
 		Spec: networkingv1beta1.IngressSpec{
 			TLS: []networkingv1beta1.IngressTLS{
 				{
@@ -352,15 +274,13 @@ func NewV1Beta1Ingress(name, secretName string, annotations map[string]string, d
 			Rules: []networkingv1beta1.IngressRule{
 				{
 					Host: dnsNames[0],
-					IngressRuleValue: networkingv1beta1.IngressRuleValue{
-						HTTP: &networkingv1beta1.HTTPIngressRuleValue{
-							Paths: []networkingv1beta1.HTTPIngressPath{
-								{
-									Path: "/",
-									Backend: networkingv1beta1.IngressBackend{
-										ServiceName: "somesvc",
-										ServicePort: intstr.FromInt(80),
-									},
+					HTTP: &networkingv1beta1.HTTPIngressRuleValue{
+						Paths: []networkingv1beta1.HTTPIngressPath{
+							{
+								Path: "/",
+								Backend: networkingv1beta1.IngressBackend{
+									ServiceName: "somesvc",
+									ServicePort: intstr.FromInt32(80),
 								},
 							},
 						},
@@ -380,19 +300,16 @@ func pathTypePrefix() *networkingv1.PathType {
 // watching the 'foo' gateway class, so this Gateway will not be used to
 // actually route traffic, but can be used to test cert-manager controllers that
 // sync Gateways, such as gateway-shim.
-func NewGateway(gatewayName, ns, secretName string, annotations map[string]string, dnsNames ...string) *gwapiv1alpha2.Gateway {
-
-	return &gwapiv1alpha2.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        gatewayName,
-			Annotations: annotations,
-		},
-		Spec: gwapiv1alpha2.GatewaySpec{
+func NewGateway(gatewayName, ns, secretName string, annotations map[string]string, dnsNames ...string) *gwapi.Gateway {
+	return &gwapi.Gateway{
+		Name:        gatewayName,
+		Annotations: annotations,
+		Spec: gwapi.GatewaySpec{
 			GatewayClassName: "foo",
-			Listeners: []gwapiv1alpha2.Listener{{
-				AllowedRoutes: &gwapiv1alpha2.AllowedRoutes{
-					Namespaces: &gwapiv1alpha2.RouteNamespaces{
-						From: func() *gwapiv1alpha2.FromNamespaces { f := gwapiv1alpha2.NamespacesFromSame; return &f }(),
+			Listeners: []gwapi.Listener{{
+				AllowedRoutes: &gwapi.AllowedRoutes{
+					Namespaces: &gwapi.RouteNamespaces{
+						From: func() *gwapi.FromNamespaces { f := gwapi.NamespacesFromSame; return &f }(),
 						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
 							"gw": gatewayName,
 						}},
@@ -400,16 +317,94 @@ func NewGateway(gatewayName, ns, secretName string, annotations map[string]strin
 					Kinds: nil,
 				},
 				Name:     "acme-solver",
-				Protocol: gwapiv1alpha2.TCPProtocolType,
-				Port:     gwapiv1alpha2.PortNumber(80),
-				Hostname: (*gwapiv1alpha2.Hostname)(&dnsNames[0]),
-				TLS: &gwapiv1alpha2.GatewayTLSConfig{
-					CertificateRefs: []gwapiv1alpha2.SecretObjectReference{
+				Protocol: gwapi.TLSProtocolType,
+				Port:     gwapi.PortNumber(443),
+				Hostname: (*gwapi.Hostname)(&dnsNames[0]),
+				TLS: &gwapi.ListenerTLSConfig{
+					CertificateRefs: []gwapi.SecretObjectReference{
 						{
-							Kind:      func() *gwapiv1alpha2.Kind { k := gwapiv1alpha2.Kind("Secret"); return &k }(),
-							Name:      gwapiv1alpha2.ObjectName(secretName),
-							Group:     func() *gwapiv1alpha2.Group { g := gwapiv1alpha2.Group(corev1.GroupName); return &g }(),
-							Namespace: (*gwapiv1alpha2.Namespace)(&ns),
+							Kind:      func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+							Name:      gwapi.ObjectName(secretName),
+							Group:     func() *gwapi.Group { g := gwapi.Group(corev1.GroupName); return &g }(),
+							Namespace: (*gwapi.Namespace)(&ns),
+						},
+					},
+				},
+			}},
+		},
+	}
+}
+
+// NewGatewayWithProtocol creates a new test Gateway identical to NewGateway
+// except that the Listener Protocol field is set to the supplied protocol
+// rather than the default gwapi.TLSProtocolType. This allows tests to verify
+// that gateway-shim correctly handles custom/extra protocol types.
+func NewGatewayWithProtocol(gatewayName, ns, secretName string, annotations map[string]string, protocol gwapi.ProtocolType, dnsNames ...string) *gwapi.Gateway {
+	return &gwapi.Gateway{
+		Name:        gatewayName,
+		Annotations: annotations,
+		Spec: gwapi.GatewaySpec{
+			GatewayClassName: "foo",
+			Listeners: []gwapi.Listener{{
+				AllowedRoutes: &gwapi.AllowedRoutes{
+					Namespaces: &gwapi.RouteNamespaces{
+						From: func() *gwapi.FromNamespaces { f := gwapi.NamespacesFromSame; return &f }(),
+						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+							"gw": gatewayName,
+						}},
+					},
+					Kinds: nil,
+				},
+				Name:     "acme-solver",
+				Protocol: protocol,
+				Port:     gwapi.PortNumber(443),
+				Hostname: (*gwapi.Hostname)(&dnsNames[0]),
+				TLS: &gwapi.ListenerTLSConfig{
+					CertificateRefs: []gwapi.SecretObjectReference{
+						{
+							Kind:      func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+							Name:      gwapi.ObjectName(secretName),
+							Group:     func() *gwapi.Group { g := gwapi.Group(corev1.GroupName); return &g }(),
+							Namespace: (*gwapi.Namespace)(&ns),
+						},
+					},
+				},
+			}},
+		},
+	}
+}
+
+func NewListenerSet(ls string, ns, secretName string, annotations map[string]string, dnsNames ...string) *gwapi.ListenerSet {
+	return &gwapi.ListenerSet{
+		Name:        ls,
+		Namespace:   ns,
+		Annotations: annotations,
+		Spec: gwapi.ListenerSetSpec{
+			ParentRef: gwapi.ParentGatewayReference{
+				Name:      gwapi.ObjectName(ls),
+				Namespace: (*gwapi.Namespace)(&ns),
+			},
+			Listeners: []gwapi.ListenerEntry{{
+				AllowedRoutes: &gwapi.AllowedRoutes{
+					Namespaces: &gwapi.RouteNamespaces{
+						From: func() *gwapi.FromNamespaces { f := gwapi.NamespacesFromSame; return &f }(),
+						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+							"gw": ls,
+						}},
+					},
+					Kinds: nil,
+				},
+				Name:     "acme-solver",
+				Protocol: gwapi.TLSProtocolType,
+				Port:     gwapi.PortNumber(443),
+				Hostname: (*gwapi.Hostname)(&dnsNames[0]),
+				TLS: &gwapi.ListenerTLSConfig{
+					CertificateRefs: []gwapi.SecretObjectReference{
+						{
+							Kind:      func() *gwapi.Kind { k := gwapi.Kind("Secret"); return &k }(),
+							Name:      gwapi.ObjectName(secretName),
+							Group:     func() *gwapi.Group { g := gwapi.Group(corev1.GroupName); return &g }(),
+							Namespace: (*gwapi.Namespace)(&ns),
 						},
 					},
 				},
@@ -420,8 +415,8 @@ func NewGateway(gatewayName, ns, secretName string, annotations map[string]strin
 
 // HasIngresses lets you know if an API exists in the discovery API
 // calling this function always performs a request to the API server.
-func HasIngresses(d discovery.DiscoveryInterface, GroupVersion string) bool {
-	resourceList, err := d.ServerResourcesForGroupVersion(GroupVersion)
+func HasIngresses(d discovery.DiscoveryInterface, groupVersion string) bool {
+	resourceList, err := d.ServerResourcesForGroupVersion(groupVersion)
 	if err != nil {
 		return false
 	}
@@ -431,4 +426,66 @@ func HasIngresses(d discovery.DiscoveryInterface, GroupVersion string) bool {
 		}
 	}
 	return false
+}
+
+// AddFinalizer will add a finalizer to the given object, it is designed to
+// be used within Eventually calls so conflicts get resolved
+func AddFinalizer(g Gomega, ctx context.Context, cli client.Client, obj client.Object, finalizer string) {
+	key := client.ObjectKeyFromObject(obj)
+	g.Expect(cli.Get(ctx, key, obj)).NotTo(HaveOccurred(), "failed to get %T", obj)
+
+	if controllerutil.AddFinalizer(obj, finalizer) {
+		g.Expect(cli.Update(ctx, obj)).NotTo(HaveOccurred(), "failed to update %T", obj)
+	}
+}
+
+// RemoveFinalizer will remove a finalizer to the given object, it is designed to
+// be used within Eventually calls so conflicts get resolved. If the object
+// does not exist then no error is returned as removing the finalizer may cause
+// deletion
+func RemoveFinalizer(g Gomega, ctx context.Context, cli client.Client, obj client.Object, finalizer string) {
+	key := client.ObjectKeyFromObject(obj)
+
+	if err := cli.Get(ctx, key, obj); err != nil {
+		g.Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred(), "failed to get %T", obj)
+		return
+	}
+
+	if controllerutil.RemoveFinalizer(obj, finalizer) {
+		g.Expect(client.IgnoreNotFound(cli.Update(ctx, obj))).NotTo(HaveOccurred(), "failed to update %T", obj)
+	}
+}
+
+// ObjectPtrConstraint is a constraint used for ensuring T is a both a pointer
+// and implements client.Object
+type ObjectPtrConstraint[T any] interface {
+	*T
+	client.Object
+}
+
+// ObjectListPtrConstraint is a constraint used for ensuring T is a both a
+// pointer and implements client.ObjectList
+type ObjectListPtrConstraint[T any] interface {
+	*T
+	client.ObjectList
+}
+
+// ListMatchingPredicates will list the objects that match a set of predicates
+func ListMatchingPredicates[O any, OL any, P ObjectPtrConstraint[O], PL ObjectListPtrConstraint[OL]](g Gomega, ctx context.Context, cli client.Client, predicates ...predicate.Func[P]) []O {
+	list := PL(new(OL))
+	g.Expect(cli.List(ctx, list)).ToNot(HaveOccurred(), "failed to list objects")
+
+	// Evaluate predicates
+	funcs := predicate.Funcs[P](predicates)
+	out := make([]O, 0)
+	err := meta.EachListItem(list, func(o runtime.Object) error {
+		typedObj := o.(P)
+		if funcs.Evaluate(typedObj) {
+			out = append(out, *typedObj)
+		}
+		return nil
+	})
+	Expect(err).NotTo(HaveOccurred(), "failed to iterate over objects")
+
+	return out
 }

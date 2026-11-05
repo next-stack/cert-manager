@@ -17,15 +17,15 @@ limitations under the License.
 package akamai
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
-	"fmt"
-	"reflect"
-
-	dns "github.com/akamai/AkamaiOPEN-edgegrid-golang/configdns-v2"
+	dns "github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/dns"
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
-	"github.com/stretchr/testify/assert"
 )
 
 func testRecordBodyData() *dns.RecordBody {
@@ -34,7 +34,7 @@ func testRecordBodyData() *dns.RecordBody {
 		Name:       "_acme-challenge.test.example.com",
 		RecordType: "TXT",
 		Target:     []string{`"` + "dns01-key" + `"`},
-		TTL:        300,
+		TTL:        new(300),
 	}
 }
 
@@ -44,18 +44,17 @@ func testRecordBodyDataExist() *dns.RecordBody {
 		Name:       "_acme-challenge.test.example.com",
 		RecordType: "TXT",
 		Target:     []string{`"` + "dns01-key" + `"`, `"` + "dns01-key-stub" + `"`},
-		TTL:        300,
+		TTL:        new(300),
 	}
 }
 
-// OpenEdggrid DNS Stub
+// OpenEdgegrid DNS Stub
 type StubOpenDNSConfig struct {
-	FuncOutput map[string]interface{}
+	FuncOutput map[string]any
 	FuncErrors map[string]error
 }
 
-func findStubHostedDomainByFqdn(fqdn string, ns []string) (string, error) {
-
+func findStubHostedDomainByFqdn(_ context.Context, fqdn string, ns []string) (string, error) {
 	return "test.example.com", nil
 
 }
@@ -75,234 +74,325 @@ func TestNewDNSProvider(t *testing.T) {
 
 	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
 	assert.NoError(t, err)
-	// samplee couple important fields
+	// sample couple important fields
 	assert.Equal(t, akamai.serviceConsumerDomain, "akamai.example.com")
-	assert.Equal(t, fmt.Sprintf("%T", akamai.dnsclient), "*akamai.OpenDNSConfig")
+	assert.Equal(t, fmt.Sprintf("%T", akamai.dnsclient), "*akamai.OpenDNSClient")
 
 }
 
-// TestPresentBasicFlow tests basic flow, e.g. no record exists.
+// TestPresentBasicFlow tests basic flow, e.g., no record exists.
 func TestPresentBasicFlow(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundTrue
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = nil
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordSave"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.NoError(t, akamai.Present("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.NoError(t, akamai.Present(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 // TestPresentExists tests flow with existing record.
 func TestPresentExists(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordUpdate"] = testRecordBodyDataExist()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.NoError(t, akamai.Present("test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
+	assert.NoError(t, akamai.Present(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
 
 }
 
 // TestPresentValueExists tests flow with existing record.
 func TestPresentValueExists(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.NoError(t, akamai.Present("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.NoError(t, akamai.Present(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 func TestPresentFailGetRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = nil
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["GetRecord"] = fmt.Errorf("Failed Get Test")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.Error(t, akamai.Present("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.Error(t, akamai.Present(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 func TestPresentFailSaveRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundTrue
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = nil
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save fail")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.Error(t, akamai.Present("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.Error(t, akamai.Present(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 func TestPresentFailUpdateRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordUpdate"] = testRecordBodyDataExist()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update failed")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.Error(t, akamai.Present("test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
+	assert.Error(t, akamai.Present(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
 
 }
 
 // TestCleanUpBasicFlow tests flow with existing record.
 func TestCleanUpBasicFlow(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordDelete"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 
-	assert.NoError(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.NoError(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 // TestPresentExists tests flow with existing record.
 func TestCleanUpExists(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordUpdate"] = testRecordBodyDataExist()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.NoError(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
+	assert.NoError(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
 
 }
 
 // TestCleanUpExistsNoValue tests flow with existing record.
 func TestCleanUpExistsNoValue(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.NoError(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
+	assert.NoError(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
 
 }
 
 // TestCleanUpNoRecord tests flow with no existing record.
 func TestCleanUpNoRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundTrue // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = nil
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.NoError(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01"))
+	assert.NoError(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01"))
 
 }
 
 func TestCleanUpFailGetRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = nil
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["GetRecord"] = fmt.Errorf("Failed Get Record")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.Error(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.Error(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 func TestCleanUpFailUpdateRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyDataExist()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordUpdate"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update failed")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete not expected")
 
-	assert.Error(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
+	assert.Error(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key-stub"))
 
 }
 
 func TestCleanUpFailDeleteRecord(t *testing.T) {
-	akamai, err := NewDNSProvider("akamai.example.com", "token", "secret", "access-token", util.RecursiveNameservers)
+	akamai, err := NewDNSProviderFromOptions(t.Context(),
+		ServiceConsumerDomain("akamai.example.com"),
+		ClientToken("token"),
+		ClientSecret("secret"),
+		AccessToken("access-token"),
+		Nameservers(util.RecursiveNameservers),
+		Resolver(util.NewCachingResolver()),
+	)
 	assert.NoError(t, err)
 
 	akamai.findHostedDomainByFqdn = findStubHostedDomainByFqdn
 	akamai.isNotFound = stubIsNotFoundFalse // ignored for this flow ...
-	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]interface{}{}, FuncErrors: map[string]error{}}
+	akamai.dnsclient = &StubOpenDNSConfig{FuncOutput: map[string]any{}, FuncErrors: map[string]error{}}
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["GetRecord"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncOutput["RecordDelete"] = testRecordBodyData()
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordSave"] = fmt.Errorf("Save not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordUpdate"] = fmt.Errorf("Update not expected")
 	akamai.dnsclient.(*StubOpenDNSConfig).FuncErrors["RecordDelete"] = fmt.Errorf("Delete failed")
 
-	assert.Error(t, akamai.CleanUp("test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
+	assert.Error(t, akamai.CleanUp(t.Context(), "test.example.com", "_acme-challenge.test.example.com.", "dns01-key"))
 
 }
 
 // Stub Get Record
-func (o StubOpenDNSConfig) GetRecord(zone string, name string, recordType string) (*dns.RecordBody, error) {
+func (o StubOpenDNSConfig) GetRecord(ctx context.Context, zone string, name string, recordType string) (*dns.RecordBody, error) {
 
 	var rec *dns.RecordBody
 
@@ -317,7 +407,7 @@ func (o StubOpenDNSConfig) GetRecord(zone string, name string, recordType string
 			return nil, fmt.Errorf("GetRecord: Unexpected nil")
 		}
 		rec = exp.(*dns.RecordBody)
-		// comare passed with expected
+		// compare passed with expected
 		if name != rec.Name {
 			return nil, fmt.Errorf("GetRecord: expected/actual Name don't match")
 		}
@@ -330,22 +420,14 @@ func (o StubOpenDNSConfig) GetRecord(zone string, name string, recordType string
 
 }
 
-func (o StubOpenDNSConfig) RecordSave(rec *dns.RecordBody, zone string) error {
+func (o StubOpenDNSConfig) RecordSave(ctx context.Context, rec *dns.RecordBody, zone string) error {
 
 	exp, ok := o.FuncOutput["RecordSave"]
 	if ok {
-		// comare passed with expected
-		if rec.Name != exp.(*dns.RecordBody).Name {
-			return fmt.Errorf("RecordSave: expected/actual Name don't match")
-		}
-		if rec.RecordType != exp.(*dns.RecordBody).RecordType {
-			return fmt.Errorf("RecordSave: expected/actual Record Type don't match")
-		}
-		if !reflect.DeepEqual(rec.Target, exp.(*dns.RecordBody).Target) {
-			return fmt.Errorf("RecordSave: expected/actual Target don't match")
-		}
-		if rec.TTL != exp.(*dns.RecordBody).TTL {
-			return fmt.Errorf("RecordSave: expected/actual TTL don't match")
+		expected := exp.(*dns.RecordBody)
+
+		if diff := cmp.Diff(expected, rec); diff != "" {
+			return fmt.Errorf("RecordSave: unexpected record (-want +got):\n%s", diff)
 		}
 	}
 	err, ok := o.FuncErrors["RecordSave"]
@@ -357,23 +439,16 @@ func (o StubOpenDNSConfig) RecordSave(rec *dns.RecordBody, zone string) error {
 
 }
 
-func (o StubOpenDNSConfig) RecordUpdate(rec *dns.RecordBody, zone string) error {
+func (o StubOpenDNSConfig) RecordUpdate(ctx context.Context, rec *dns.RecordBody, zone string) error {
 
 	exp, ok := o.FuncOutput["RecordUpdate"]
 	if ok {
-		// comare passed with expected
-		if rec.Name != exp.(*dns.RecordBody).Name {
-			return fmt.Errorf("RecordUpdate: expected/actual Name don't match")
+		expected := exp.(*dns.RecordBody)
+
+		if diff := cmp.Diff(expected, rec); diff != "" {
+			return fmt.Errorf("RecordUpdate: unexpected record (-want +got):\n%s", diff)
 		}
-		if rec.RecordType != exp.(*dns.RecordBody).RecordType {
-			return fmt.Errorf("RecordUpdate: expected/actual Record Type don't match")
-		}
-		if !reflect.DeepEqual(rec.Target, exp.(*dns.RecordBody).Target) {
-			return fmt.Errorf("RecordUpdate: expected/actual Target don't match")
-		}
-		if rec.TTL != exp.(*dns.RecordBody).TTL {
-			return fmt.Errorf("RecordUpdate: expected/actual TTL don't match")
-		}
+
 	}
 	err, ok := o.FuncErrors["RecordUpdate"]
 	if ok {
@@ -383,22 +458,14 @@ func (o StubOpenDNSConfig) RecordUpdate(rec *dns.RecordBody, zone string) error 
 	return nil
 }
 
-func (o StubOpenDNSConfig) RecordDelete(rec *dns.RecordBody, zone string) error {
+func (o StubOpenDNSConfig) RecordDelete(ctx context.Context, rec *dns.RecordBody, zone string) error {
 
 	exp, ok := o.FuncOutput["RecordDelete"]
 	if ok {
-		// comare passed with expected
-		if rec.Name != exp.(*dns.RecordBody).Name {
-			return fmt.Errorf("RecordDelete: expected/actual Name don't match")
-		}
-		if rec.RecordType != exp.(*dns.RecordBody).RecordType {
-			return fmt.Errorf("RecordDelete: expected/actual Record Type don't match")
-		}
-		if !reflect.DeepEqual(rec.Target, exp.(*dns.RecordBody).Target) {
-			return fmt.Errorf("RecordDelete: expected/actual Target don't match")
-		}
-		if rec.TTL != exp.(*dns.RecordBody).TTL {
-			return fmt.Errorf("RecordDelete: expected/actual TTL don't match")
+		expected := exp.(*dns.RecordBody)
+
+		if diff := cmp.Diff(expected, rec); diff != "" {
+			return fmt.Errorf("RecordDelete: unexpected record (-want +got):\n%s", diff)
 		}
 	}
 	err, ok := o.FuncErrors["RecordDelete"]
@@ -407,4 +474,91 @@ func (o StubOpenDNSConfig) RecordDelete(rec *dns.RecordBody, zone string) error 
 	}
 
 	return nil
+}
+
+func TestNewDNSProviderFromOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		options     []DNSProviderOption
+		wantErr     string
+		checkResult func(t *testing.T, p *DNSProvider)
+	}{
+		{
+			name: "valid configuration",
+			options: []DNSProviderOption{
+				ServiceConsumerDomain("akamai.example.com"),
+				ClientToken("token"),
+				ClientSecret("secret"),
+				AccessToken("access-token"),
+				Nameservers(util.RecursiveNameservers),
+				Resolver(util.NewCachingResolver()),
+			},
+			checkResult: func(t *testing.T, p *DNSProvider) {
+				assert.Equal(t, "akamai.example.com", p.serviceConsumerDomain)
+				assert.Equal(t, fmt.Sprintf("%T", p.dnsclient), "*akamai.OpenDNSClient")
+			},
+		},
+		{
+			name: "missing service consumer domain",
+			options: []DNSProviderOption{
+				ClientToken("token"), ClientSecret("secret"), AccessToken("access-token"),
+				Nameservers(util.RecursiveNameservers), Resolver(util.NewCachingResolver()),
+			},
+			wantErr: "service consumer domain is required",
+		},
+		{
+			name: "missing client token",
+			options: []DNSProviderOption{
+				ServiceConsumerDomain("akamai.example.com"), ClientSecret("secret"), AccessToken("access-token"),
+				Nameservers(util.RecursiveNameservers), Resolver(util.NewCachingResolver()),
+			},
+			wantErr: "client token is required",
+		},
+		{
+			name: "missing client secret",
+			options: []DNSProviderOption{
+				ServiceConsumerDomain("akamai.example.com"), ClientToken("token"), AccessToken("access-token"),
+				Nameservers(util.RecursiveNameservers), Resolver(util.NewCachingResolver()),
+			},
+			wantErr: "client secret is required",
+		},
+		{
+			name: "missing access token",
+			options: []DNSProviderOption{
+				ServiceConsumerDomain("akamai.example.com"), ClientToken("token"), ClientSecret("secret"),
+				Nameservers(util.RecursiveNameservers), Resolver(util.NewCachingResolver()),
+			},
+			wantErr: "access token is required",
+		},
+		{
+			name: "missing nameservers",
+			options: []DNSProviderOption{
+				ServiceConsumerDomain("akamai.example.com"), ClientToken("token"), ClientSecret("secret"), AccessToken("access-token"),
+				Resolver(util.NewCachingResolver()),
+			},
+			wantErr: "nameservers is required",
+		},
+		{
+			name: "missing resolver",
+			options: []DNSProviderOption{
+				ServiceConsumerDomain("akamai.example.com"), ClientToken("token"), ClientSecret("secret"), AccessToken("access-token"),
+				Nameservers(util.RecursiveNameservers),
+			},
+			wantErr: "resolver is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := NewDNSProviderFromOptions(t.Context(), tt.options...)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+			if tt.checkResult != nil {
+				tt.checkResult(t, p)
+			}
+		})
+	}
 }

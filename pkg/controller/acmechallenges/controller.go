@@ -18,16 +18,19 @@ package acmechallenges
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/clock"
 
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	"github.com/cert-manager/cert-manager/pkg/acme/accounts"
 	cmacmelisters "github.com/cert-manager/cert-manager/pkg/client/listers/acme/v1"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
@@ -50,7 +53,7 @@ type controller struct {
 	challengeLister     cmacmelisters.ChallengeLister
 	issuerLister        cmlisters.IssuerLister
 	clusterIssuerLister cmlisters.ClusterIssuerLister
-	secretLister        corelisters.SecretLister
+	secretLister        internalinformers.SecretLister
 
 	// ACME challenge solvers are instantiated once at the time of controller
 	// construction.
@@ -67,11 +70,12 @@ type controller struct {
 
 	// maintain a reference to the workqueue for this controller
 	// so the handleOwnedResource method can enqueue resources
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName]
 
 	// logger to be used by this controller
 	log logr.Logger
 
+	clock            clock.Clock
 	dns01Nameservers []string
 
 	DNS01CheckRetryPeriod time.Duration
@@ -81,22 +85,27 @@ type controller struct {
 	objectUpdater
 }
 
-func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// construct a new named logger to be reused throughout the controller
 	c.log = logf.FromContext(ctx.RootContext, ControllerName)
 
 	// create a queue used to queue up items to be processed
-	c.queue = workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(time.Second*5, time.Minute*30), ControllerName)
+	c.queue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultACMERateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
 	// obtain references to all the informers used by this controller
 	challengeInformer := ctx.SharedInformerFactory.Acme().V1().Challenges()
 	issuerInformer := ctx.SharedInformerFactory.Certmanager().V1().Issuers()
-	secretInformer := ctx.KubeSharedInformerFactory.Core().V1().Secrets()
+	secretInformer := ctx.KubeSharedInformerFactory.Secrets()
 	// we register these informers here so the HTTP01 solver has a synced
 	// cache when managing pod/service/ingress resources
-	podInformer := ctx.KubeSharedInformerFactory.Core().V1().Pods()
-	serviceInformer := ctx.KubeSharedInformerFactory.Core().V1().Services()
-	ingressInformer := ctx.KubeSharedInformerFactory.Networking().V1().Ingresses()
+	podInformer := ctx.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("pods"))
+	serviceInformer := ctx.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("services"))
+	ingressInformer := ctx.KubeSharedInformerFactory.Ingresses()
 
 	// build a list of InformerSynced functions that will be returned by the Register method.
 	// the controller will only begin processing items once all of these informers have synced.
@@ -110,7 +119,7 @@ func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	}
 
 	if ctx.GatewaySolverEnabled {
-		gwAPIHTTPRouteInformer := ctx.GWShared.Gateway().V1alpha2().HTTPRoutes()
+		gwAPIHTTPRouteInformer := ctx.GWShared.Gateway().V1().HTTPRoutes()
 		mustSync = append(mustSync, gwAPIHTTPRouteInformer.Informer().HasSynced)
 	}
 
@@ -128,12 +137,15 @@ func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	}
 
 	// register handler functions
-	challengeInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: c.queue})
+	if _, err := challengeInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(c.queue)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	c.helper = issuer.NewHelper(c.issuerLister, c.clusterIssuerLister)
 	c.scheduler = scheduler.New(logf.NewContext(ctx.RootContext, c.log), c.challengeLister, ctx.SchedulerOptions.MaxConcurrentChallenges)
 	c.recorder = ctx.Recorder
-	c.accountRegistry = ctx.ACMEOptions.AccountRegistry
+	c.accountRegistry = ctx.ACMEAccountRegistry
+	c.clock = ctx.Clock
 
 	var err error
 	c.httpSolver, err = http.NewSolver(ctx)
@@ -181,7 +193,7 @@ func (c *controller) runScheduler(ctx context.Context) {
 		log := logf.WithResource(log, chOriginal)
 		ch := chOriginal.DeepCopy()
 		ch.Status.Processing = true
-		if err := c.updateObject(ctx, chOriginal, ch); err != nil {
+		if err := c.updateStatus(ctx, chOriginal, ch); err != nil {
 			log.Error(err, "error scheduling challenge for processing")
 			return
 		}
@@ -193,23 +205,19 @@ func (c *controller) runScheduler(ctx context.Context) {
 	}
 }
 
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx)
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key")
-		return nil
-	}
+	namespace, name := key.Namespace, key.Name
 
 	ch, err := c.challengeLister.Challenges(namespace).Get(name)
-
-	if err != nil {
-		if k8sErrors.IsNotFound(err) {
-			log.Error(err, "challenge in work queue no longer exists")
-			return nil
-		}
-
+	if err != nil && !k8sErrors.IsNotFound(err) {
 		return err
+	}
+	// WARNING: we do want to call Sync when ch.DeletionTimestamp != nil, such that
+	// we can perform the required cleanup and remove the finalizer.
+	if ch == nil {
+		// Challenge object no longer exists
+		return nil
 	}
 
 	ctx = logf.NewContext(ctx, logf.WithResource(log, ch))

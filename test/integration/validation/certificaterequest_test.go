@@ -17,22 +17,18 @@ limitations under the License.
 package validation
 
 import (
-	"context"
-	"encoding/pem"
 	"strings"
 	"testing"
-	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/cert-manager/cert-manager/pkg/api"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/cert-manager/cert-manager/test/integration/framework"
+	"github.com/cert-manager/cert-manager/test/unit/gen"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/cert-manager/cert-manager/integration-tests/framework"
 )
 
 var certGVK = schema.GroupVersionKind{
@@ -49,10 +45,8 @@ func TestValidationCertificateRequests(t *testing.T) {
 	}{
 		"No errors on valid certificaterequest with no usages set": {
 			input: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "default",
-				},
+				Name:      "test",
+				Namespace: "default",
 				Spec: cmapi.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, &cmapi.Certificate{
 						Spec: cmapi.CertificateSpec{
@@ -60,17 +54,15 @@ func TestValidationCertificateRequests(t *testing.T) {
 						},
 					}),
 					Usages:    []cmapi.KeyUsage{},
-					IssuerRef: cmmeta.ObjectReference{Name: "test"},
+					IssuerRef: cmmeta.IssuerReference{Name: "test"},
 				},
 			},
 			expectError: false,
 		},
 		"No errors on valid certificaterequest with special usages set": {
 			input: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "default",
-				},
+				Name:      "test",
+				Namespace: "default",
 				Spec: cmapi.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, &cmapi.Certificate{
 						Spec: cmapi.CertificateSpec{
@@ -79,17 +71,15 @@ func TestValidationCertificateRequests(t *testing.T) {
 						},
 					}),
 					Usages:    []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageClientAuth},
-					IssuerRef: cmmeta.ObjectReference{Name: "test"},
+					IssuerRef: cmmeta.IssuerReference{Name: "test"},
 				},
 			},
 			expectError: false,
 		},
 		"No errors on valid certificaterequest with special usages set only in CSR": {
 			input: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "default",
-				},
+				Name:      "test",
+				Namespace: "default",
 				Spec: cmapi.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, &cmapi.Certificate{
 						Spec: cmapi.CertificateSpec{
@@ -97,36 +87,34 @@ func TestValidationCertificateRequests(t *testing.T) {
 							Usages:   []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageClientAuth},
 						},
 					}),
-					IssuerRef: cmmeta.ObjectReference{Name: "test"},
+					IssuerRef: cmmeta.IssuerReference{Name: "test"},
 				},
 			},
-			expectError: false,
+			expectError: true,
+			errorSuffix: "encoded CSR error: the ExtKeyUsages [ 'client auth' ] do not match the expected ExtKeyUsages []",
 		},
 		"No errors on valid certificaterequest with special usages only set in spec": {
 			input: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "default",
-				},
+				Name:      "test",
+				Namespace: "default",
 				Spec: cmapi.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, &cmapi.Certificate{
 						Spec: cmapi.CertificateSpec{
-							DNSNames: []string{"example.com"},
-							Usages:   []cmapi.KeyUsage{},
+							DNSNames:              []string{"example.com"},
+							Usages:                []cmapi.KeyUsage{},
+							EncodeUsagesInRequest: new(false),
 						},
 					}),
 					Usages:    []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageClientAuth},
-					IssuerRef: cmmeta.ObjectReference{Name: "test"},
+					IssuerRef: cmmeta.IssuerReference{Name: "test"},
 				},
 			},
 			expectError: false,
 		},
 		"Errors on certificaterequest with mismatch of usages": {
 			input: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "default",
-				},
+				Name:      "test",
+				Namespace: "default",
 				Spec: cmapi.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, &cmapi.Certificate{
 						Spec: cmapi.CertificateSpec{
@@ -135,27 +123,26 @@ func TestValidationCertificateRequests(t *testing.T) {
 						},
 					}),
 					Usages:    []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageCodeSigning},
-					IssuerRef: cmmeta.ObjectReference{Name: "test"},
+					IssuerRef: cmmeta.IssuerReference{Name: "test"},
 				},
 			},
 			expectError: true,
-			errorSuffix: "csr key usages do not match specified usages, these should match if both are set: [[2]: \"client auth\" != \"code signing\"]",
+			errorSuffix: "encoded CSR error: the ExtKeyUsages [ 'client auth' ] do not match the expected ExtKeyUsages [ 'code signing' ]",
 		},
 		"Shouldn't error when setting user info, since this will be overwritten by the mutating webhook": {
 			input: &cmapi.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "default",
-				},
+				Name:      "test",
+				Namespace: "default",
 				Spec: cmapi.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, &cmapi.Certificate{
 						Spec: cmapi.CertificateSpec{
-							DNSNames: []string{"example.com"},
-							Usages:   []cmapi.KeyUsage{},
+							DNSNames:              []string{"example.com"},
+							Usages:                []cmapi.KeyUsage{},
+							EncodeUsagesInRequest: new(false),
 						},
 					}),
 					Usages:    []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageClientAuth},
-					IssuerRef: cmmeta.ObjectReference{Name: "test"},
+					IssuerRef: cmmeta.IssuerReference{Name: "test"},
 					Username:  "user-1",
 					Groups:    []string{"group-1", "group-2"},
 				},
@@ -168,13 +155,10 @@ func TestValidationCertificateRequests(t *testing.T) {
 			cert := test.input.(*cmapi.CertificateRequest)
 			cert.SetGroupVersionKind(certGVK)
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*40)
-			defer cancel()
+			config, stopFn := framework.RunControlPlane(t)
+			t.Cleanup(stopFn)
 
-			config, stop := framework.RunControlPlane(t, ctx)
-			defer stop()
-
-			framework.WaitForOpenAPIResourcesToBeLoaded(t, ctx, config, certGVK)
+			framework.WaitForOpenAPIResourcesToBeLoaded(t, t.Context(), config, certGVK)
 
 			// create the object to get any errors back from the webhook
 			cl, err := client.New(config, client.Options{Scheme: api.Scheme})
@@ -182,7 +166,7 @@ func TestValidationCertificateRequests(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			err = cl.Create(ctx, cert)
+			err = cl.Create(t.Context(), cert)
 			if test.expectError != (err != nil) {
 				t.Errorf("unexpected error, exp=%t got=%v",
 					test.expectError, err)
@@ -196,22 +180,9 @@ func TestValidationCertificateRequests(t *testing.T) {
 }
 
 func mustGenerateCSR(t *testing.T, cert *cmapi.Certificate) []byte {
-	request, err := pki.GenerateCSR(cert)
+	csr, _, err := gen.CSRForCertificate(cert)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	sk, err := pki.GenerateRSAPrivateKey(2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	csrBytes, err := pki.EncodeCSR(request, sk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	csr := pem.EncodeToMemory(&pem.Block{
-		Type: "CERTIFICATE REQUEST", Bytes: csrBytes,
-	})
-
 	return csr
 }

@@ -19,89 +19,69 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
+	"os"
+	"slices"
+	"sync/atomic"
 	"time"
 
-	"github.com/go-logr/logr"
-	"golang.org/x/sync/errgroup"
-	admissionv1 "k8s.io/api/admission/v1"
-	apiextensionsinstall "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/install"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer/json"
-	runtimeutil "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/rest"
 	ciphers "k8s.io/component-base/cli/flag"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
+	servertls "github.com/cert-manager/cert-manager/pkg/server/tls"
 	"github.com/cert-manager/cert-manager/pkg/util/profiling"
-	"github.com/cert-manager/cert-manager/pkg/webhook/handlers"
-	servertls "github.com/cert-manager/cert-manager/pkg/webhook/server/tls"
+	cmadmission "github.com/cert-manager/cert-manager/pkg/webhook/admission"
+)
+
+const (
+	// This is intended to mitigate "slowloris" attacks by limiting the time a
+	// deliberately slow client can spend sending HTTP headers.
+	// This default value is copied from:
+	// * kubernetes api-server:
+	//   https://github.com/kubernetes/kubernetes/blob/9e028b40b9e970142191259effe796b3dab39828/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go#L165-L173
+	// * controller-runtime:
+	//   https://github.com/kubernetes-sigs/controller-runtime/blob/1ea2be573f7887a9fbd766e9a921c5af344da6eb/pkg/internal/httpserver/server.go#L14
+	defaultReadHeaderTimeout = 32 * time.Second
 )
 
 var (
-	// defaultScheme is used to encode and decode the AdmissionReview and
-	// ConversionReview resources submitted to the webhook server.
-	// It is not used for performing validation, mutation or conversion.
-	defaultScheme = runtime.NewScheme()
-
 	ErrNotListening = errors.New("Server is not listening yet")
 )
-
-func init() {
-	apiextensionsinstall.Install(defaultScheme)
-	runtimeutil.Must(admissionv1.AddToScheme(defaultScheme))
-
-	// we need to add the options to empty v1
-	// TODO fix the server code to avoid this
-	metav1.AddToGroupVersion(defaultScheme, schema.GroupVersion{Version: "v1"})
-
-	// TODO: keep the generic API server from wanting this
-	unversioned := schema.GroupVersion{Group: "", Version: "v1"}
-	defaultScheme.AddUnversionedTypes(unversioned,
-		&metav1.Status{},
-		&metav1.APIVersions{},
-		&metav1.APIGroupList{},
-		&metav1.APIGroup{},
-		&metav1.APIResourceList{},
-		&metav1.CreateOptions{},
-	)
-}
 
 type Server struct {
 	// ListenAddr is the address the HTTP server should listen on
 	// This must be specified.
-	ListenAddr string
+	ListenAddr int
 
 	// HealthzAddr is the address the healthz HTTP server should listen on
 	// If not specified, the healthz endpoint will not be exposed.
-	HealthzAddr string
+	HealthzAddr *int
 
-	// PprofAddr is the address the pprof endpoint should be served on if enabled.
-	PprofAddr string
+	// PprofAddress is the address the pprof endpoint should be served on if enabled.
+	PprofAddress string
 	// EnablePprof determines whether pprof is enabled.
 	EnablePprof bool
 
-	// Scheme is used to decode/encode request/response payloads.
-	// If not specified, a default scheme that registers the AdmissionReview
-	// and ConversionReview resource types will be used.
-	// It is not used for performing validation, mutation or conversion.
-	Scheme *runtime.Scheme
+	// ResourceScheme is used to decode resources and convert them to
+	// internal types when validating.
+	ResourceScheme *runtime.Scheme
 
 	// If specified, the server will listen with TLS using certificates
 	// provided by this CertificateSource.
 	CertificateSource servertls.CertificateSource
 
-	ValidationWebhook handlers.ValidatingAdmissionHook
-	MutationWebhook   handlers.MutatingAdmissionHook
-	ConversionWebhook handlers.ConversionHook
-
-	log logr.Logger
+	ValidationWebhook cmadmission.ValidationInterface
+	MutationWebhook   cmadmission.MutationInterface
 
 	// CipherSuites is the list of allowed cipher suites for the server.
 	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
@@ -111,18 +91,141 @@ type Server struct {
 	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
 	MinTLSVersion string
 
-	listener net.Listener
+	// The host and port that the metrics endpoint should listen on.
+	MetricsListenAddress string
+
+	// If specified, the metrics server will listen with TLS using certificates
+	// provided by this CertificateSource.
+	MetricsCertificateSource servertls.CertificateSource
+
+	// MetricsCipherSuites is the list of allowed cipher suites for the server.
+	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
+	MetricsCipherSuites []string
+
+	// MetricsMinTLSVersion is the minimum TLS version supported.
+	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
+	MetricsMinTLSVersion string
+
+	// EnableClientVerification turns on client verification of requests
+	// made to the webhook server
+	EnableClientVerification bool
+
+	// ClientCAPath is the CA certificate name which server used to verify remote(client)'s certificate.
+	// Defaults to "", which means server does not verify client's certificate.
+	ClientCAPath string
+
+	// ClientCertificateSubjects is a list of expected subject names for client
+	// certificates used by callers (for example, the apiserver). Each entry
+	// will be matched against the certificate CommonName and the DNS SANs. If
+	// empty, the server will only verify that the client certificate chains to
+	// the provided ClientCAPath and will not enforce specific subject names.
+	ClientCertificateSubjects []string
+
+	// listenPort is the port Run has chosen for the webhook listener. It is
+	// read by Port from other goroutines, so access must go through the
+	// atomic.
+	listenPort atomic.Int64
 }
 
-type handleFunc func(context.Context, runtime.Object) (runtime.Object, error)
-
 func (s *Server) Run(ctx context.Context) error {
-	s.log = logf.FromContext(ctx)
-	g, gctx := errgroup.WithContext(ctx)
+	if s.CertificateSource == nil {
+		return fmt.Errorf("no CertificateSource specified")
+	}
+
+	log := logf.FromContext(ctx)
+
+	cipherSuites, err := ciphers.TLSCipherSuites(s.CipherSuites)
+	if err != nil {
+		return err
+	}
+	minVersion, err := ciphers.TLSVersion(s.MinTLSVersion)
+	if err != nil {
+		return err
+	}
+
+	metricsCipherSuites, err := ciphers.TLSCipherSuites(s.MetricsCipherSuites)
+	if err != nil {
+		return err
+	}
+	metricsMinVersion, err := ciphers.TLSVersion(s.MetricsMinTLSVersion)
+	if err != nil {
+		return err
+	}
+
+	listenPort := s.ListenAddr
+	if listenPort == 0 {
+		webhookPort, err := freePort()
+		if err != nil {
+			return err
+		}
+
+		listenPort = webhookPort
+	}
+	s.listenPort.Store(int64(listenPort))
+
+	webhookOpts := webhook.Options{
+		Port: listenPort,
+		TLSOpts: []func(*tls.Config){
+			func(cfg *tls.Config) {
+				cfg.CipherSuites = cipherSuites
+				cfg.MinVersion = minVersion
+				cfg.GetCertificate = s.CertificateSource.GetCertificate
+			},
+		},
+	}
+
+	if s.EnableClientVerification {
+		if s.ClientCAPath == "" {
+			return fmt.Errorf("error: when --enable-client-verification is true, you must also provide --client-ca-path")
+		}
+		caCert, err := loadClientCA(s.ClientCAPath)
+		if err != nil {
+			return err
+		}
+		webhookOpts.TLSOpts = append(webhookOpts.TLSOpts, func(cfg *tls.Config) {
+			cfg.ClientCAs = caCert
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		})
+		webhookOpts.TLSOpts = append(webhookOpts.TLSOpts, s.setVerifyPeerCertificate)
+	}
+
+	mgr, err := ctrl.NewManager(
+		&rest.Config{}, // controller-runtime does not need to talk to the API server
+		ctrl.Options{
+			Scheme:         s.ResourceScheme,
+			Logger:         log,
+			LeaderElection: false, // The webhook component does not need to perform leader election
+			Metrics: metricsserver.Options{
+				BindAddress:   s.MetricsListenAddress,
+				SecureServing: s.MetricsCertificateSource != nil,
+				TLSOpts: []func(*tls.Config){
+					func(cfg *tls.Config) {
+						cfg.CipherSuites = metricsCipherSuites
+						cfg.MinVersion = metricsMinVersion
+						cfg.GetCertificate = s.MetricsCertificateSource.GetCertificate
+					},
+				},
+			},
+			WebhookServer: webhook.NewServer(webhookOpts),
+		})
+	if err != nil {
+		return fmt.Errorf("error creating manager: %v", err)
+	}
+
+	if err := mgr.Add(s.CertificateSource); err != nil {
+		return err
+	}
+
+	if s.MetricsCertificateSource != nil {
+		if err := mgr.Add(s.MetricsCertificateSource); err != nil {
+			return err
+		}
+	}
 
 	// if a HealthzAddr is provided, start the healthz listener
-	if s.HealthzAddr != "" {
-		healthzListener, err := net.Listen("tcp", s.HealthzAddr)
+	if s.HealthzAddr != nil {
+		lc := net.ListenConfig{}
+		healthzListener, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", *s.HealthzAddr))
 		if err != nil {
 			return err
 		}
@@ -130,32 +233,42 @@ func (s *Server) Run(ctx context.Context) error {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/healthz", s.handleHealthz)
 		healthMux.HandleFunc("/livez", s.handleLivez)
-		s.log.V(logf.InfoLevel).Info("listening for insecure healthz connections", "address", s.HealthzAddr)
+		log.V(logf.InfoLevel).Info("listening for insecure healthz connections", "address", s.HealthzAddr)
 		server := &http.Server{
-			Handler: healthMux,
+			Handler:           healthMux,
+			ReadHeaderTimeout: defaultReadHeaderTimeout, // Mitigation for G112: Potential slowloris attack
 		}
-		g.Go(func() error {
-			<-gctx.Done()
+
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			<-ctx.Done()
+
 			// allow a timeout for graceful shutdown
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			if err := server.Shutdown(ctx); err != nil {
+			//nolint: contextcheck
+			if err := server.Shutdown(shutdownCtx); err != nil {
 				return err
 			}
 			return nil
-		})
-		g.Go(func() error {
+		})); err != nil {
+			return err
+		}
+
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 			if err := server.Serve(healthzListener); err != http.ErrServerClosed {
 				return err
 			}
 			return nil
-		})
+		})); err != nil {
+			return err
+		}
 	}
 
 	// if a PprofAddr is provided, start the pprof listener
 	if s.EnablePprof {
-		pprofListener, err := net.Listen("tcp", s.PprofAddr)
+		lc := net.ListenConfig{}
+		pprofListener, err := lc.Listen(ctx, "tcp", s.PprofAddress)
 		if err != nil {
 			return err
 		}
@@ -163,181 +276,84 @@ func (s *Server) Run(ctx context.Context) error {
 		profilerMux := http.NewServeMux()
 		// Add pprof endpoints to this mux
 		profiling.Install(profilerMux)
-		s.log.V(logf.InfoLevel).Info("running go profiler on", "address", s.PprofAddr)
+		log.V(logf.InfoLevel).Info("running go profiler on", "address", s.PprofAddress)
 		server := &http.Server{
-			Handler: profilerMux,
+			Handler:           profilerMux,
+			ReadHeaderTimeout: defaultReadHeaderTimeout, // Mitigation for G112: Potential slowloris attack
 		}
-		g.Go(func() error {
-			<-gctx.Done()
+
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			<-ctx.Done()
+
 			// allow a timeout for graceful shutdown
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			if err := server.Shutdown(ctx); err != nil {
+			//nolint: contextcheck
+			if err := server.Shutdown(shutdownCtx); err != nil {
 				return err
 			}
 			return nil
-		})
-		g.Go(func() error {
+		})); err != nil {
+			return err
+		}
+
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 			if err := server.Serve(pprofListener); err != http.ErrServerClosed {
 				return err
 			}
 			return nil
-		})
-	}
-
-	// create a listener for actual webhook requests
-	listener, err := net.Listen("tcp", s.ListenAddr)
-	if err != nil {
-		return err
-	}
-
-	// wrap the listener with TLS if a CertificateSource is provided
-	if s.CertificateSource != nil {
-		s.log.V(logf.InfoLevel).Info("listening for secure connections", "address", s.ListenAddr)
-		g.Go(func() error {
-			if err := s.CertificateSource.Run(gctx); (err != nil) && !errors.Is(err, context.Canceled) {
-				return err
-			}
-			return nil
-		})
-		cipherSuites, err := ciphers.TLSCipherSuites(s.CipherSuites)
-		if err != nil {
+		})); err != nil {
 			return err
 		}
-		minVersion, err := ciphers.TLSVersion(s.MinTLSVersion)
-		if err != nil {
-			return err
-		}
-		listener = tls.NewListener(listener, &tls.Config{
-			GetCertificate:           s.CertificateSource.GetCertificate,
-			CipherSuites:             cipherSuites,
-			MinVersion:               minVersion,
-			PreferServerCipherSuites: true,
-		})
-	} else {
-		s.log.V(logf.InfoLevel).Info("listening for insecure connections", "address", s.ListenAddr)
 	}
 
-	s.listener = listener
-	serverMux := http.NewServeMux()
-	serverMux.HandleFunc("/validate", s.handle(s.validate))
-	serverMux.HandleFunc("/mutate", s.handle(s.mutate))
-	serverMux.HandleFunc("/convert", s.handle(s.convert))
-	server := &http.Server{
-		Handler: serverMux,
-	}
-	g.Go(func() error {
-		<-gctx.Done()
-		// allow a timeout for graceful shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	mgr.GetWebhookServer().Register("/mutate", cmadmission.NewCustomMutationWebhook(s.MutationWebhook))
 
-		if err := server.Shutdown(ctx); err != nil {
-			return err
-		}
-		return nil
-	})
-	g.Go(func() error {
-		if err := server.Serve(s.listener); err != http.ErrServerClosed {
-			return err
-		}
-		return nil
-	})
+	mgr.GetWebhookServer().Register("/validate", cmadmission.NewCustomValidationWebhook(mgr.GetScheme(), s.ValidationWebhook))
 
-	return g.Wait()
+	return mgr.Start(ctx)
 }
 
-// Port returns the port number that the webhook listener is listening on
+// freePort asks the kernel for a free port by binding to port 0, then closes the
+// listener and returns the port number. Anything on the machine can claim the
+// port before the caller binds it, so the caller must be prepared for the bind
+// to fail with EADDRINUSE. Reachable with --secure-port=0, which validation
+// accepts for any deployment, not just tests. Only the test framework retries
+// a lost race (see startAttempts in test/webhook); elsewhere it is a hard
+// startup failure.
+func freePort() (int, error) {
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 0,
+	})
+	if err != nil {
+		return -1, err
+	}
+	defer l.Close()
+
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// Port returns the port number the webhook listener has been assigned. It
+// reports the number as soon as Run has chosen it, which is before Run has
+// created the listener, so a port coming back here does not mean the server is
+// accepting connections yet — or that it ever will, since the bind may still
+// fail. ErrNotListening means only that no port has been chosen.
 func (s *Server) Port() (int, error) {
-	if s.listener == nil {
+	port := s.listenPort.Load()
+	if port == 0 {
 		return 0, ErrNotListening
 	}
-	tcpAddr, ok := s.listener.Addr().(*net.TCPAddr)
-	if !ok {
-		return 0, errors.New("unexpected listen address type (expected tcp)")
-	}
-	return tcpAddr.Port, nil
-}
 
-func (s *Server) scheme() *runtime.Scheme {
-	if s.Scheme == nil {
-		return defaultScheme
-	}
-	return s.Scheme
-}
-
-func (s *Server) validate(ctx context.Context, obj runtime.Object) (runtime.Object, error) {
-	review, isV1 := obj.(*admissionv1.AdmissionReview)
-	if !isV1 {
-		return nil, errors.New("request is not of type apiextensions v1")
-	}
-	review.Response = s.ValidationWebhook.Validate(ctx, review.Request)
-	return review, nil
-}
-
-func (s *Server) mutate(ctx context.Context, obj runtime.Object) (runtime.Object, error) {
-	review, isV1 := obj.(*admissionv1.AdmissionReview)
-	if !isV1 {
-		return nil, errors.New("request is not of type apiextensions v1")
-	}
-	review.Response = s.MutationWebhook.Mutate(ctx, review.Request)
-	return review, nil
-}
-
-func (s *Server) convert(_ context.Context, obj runtime.Object) (runtime.Object, error) {
-	switch review := obj.(type) {
-	case *apiextensionsv1.ConversionReview:
-		if review.Request == nil {
-			return nil, errors.New("review.request was nil")
-		}
-		review.Response = s.ConversionWebhook.Convert(review.Request)
-		return review, nil
-	default:
-		return nil, fmt.Errorf("unsupported conversion review type: %T", review)
-	}
-}
-
-func (s *Server) handle(inner handleFunc) func(w http.ResponseWriter, req *http.Request) {
-	return func(w http.ResponseWriter, req *http.Request) {
-		defer req.Body.Close()
-
-		data, err := io.ReadAll(req.Body)
-		if err != nil {
-			s.log.Error(err, "failed to read request body")
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		codec := json.NewSerializerWithOptions(json.DefaultMetaFactory, s.scheme(), s.scheme(), json.SerializerOptions{
-			Pretty: true,
-		})
-		obj, _, err := codec.Decode(data, nil, nil)
-		if err != nil {
-			s.log.Error(err, "failed to decode request body")
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		result, err := inner(req.Context(), obj)
-		if err != nil {
-			s.log.Error(err, "failed to process webhook request")
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if err := codec.Encode(result, w); err != nil {
-			s.log.Error(err, "failed to encode response body")
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-	}
+	return int(port), nil
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 
 	if s.CertificateSource != nil && !s.CertificateSource.Healthy() {
-		s.log.V(logf.WarnLevel).Info("Health check failed as CertificateSource is unhealthy")
+		logf.FromContext(req.Context()).V(logf.WarnLevel).Info("Health check failed as CertificateSource is unhealthy")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -349,4 +365,50 @@ func (s *Server) handleLivez(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) setVerifyPeerCertificate(cfg *tls.Config) {
+	// Disable session ticket resumption to ensure VerifyPeerCertificate is called for
+	// every connection, not just full TLS handshakes.
+	cfg.SessionTicketsDisabled = true
+	cfg.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		// avoid impersonation of apiserver client by verifying the CN name if provided
+		if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
+			return fmt.Errorf("no verified chains")
+		}
+		// if no specific names are configured, skip subject matching and accept
+		// any client certificate that verifies against the configured ClientCAs.
+		if len(s.ClientCertificateSubjects) == 0 {
+			return nil
+		}
+
+		cert := verifiedChains[0][0]
+		// match against CommonName
+		if slices.Contains(s.ClientCertificateSubjects, cert.Subject.CommonName) {
+			return nil
+		}
+
+		// match against DNS SANs
+		for _, dns := range cert.DNSNames {
+			if slices.Contains(s.ClientCertificateSubjects, dns) {
+				return nil
+			}
+		}
+		return fmt.Errorf("unauthorized client certificate: CN=%s DNS=%v", cert.Subject.CommonName, cert.DNSNames)
+	}
+}
+
+// loadClientCA loads the client CA from given path
+func loadClientCA(path string) (*x509.CertPool, error) {
+	caPem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read client CA cert: %w", err)
+	}
+
+	certPool := x509.NewCertPool()
+	if !certPool.AppendCertsFromPEM(caPem) {
+		return nil, fmt.Errorf("failed to append cert from caPem")
+	}
+
+	return certPool, nil
 }

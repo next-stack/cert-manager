@@ -19,11 +19,15 @@ limitations under the License.
 package base
 
 import (
-	"k8s.io/client-go/kubernetes"
+	"context"
 
-	"github.com/cert-manager/cert-manager/test/e2e/framework/config"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/util"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/addon/internal"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/config"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/util"
 )
 
 type Base struct {
@@ -33,11 +37,16 @@ type Base struct {
 	details *Details
 }
 
+var _ internal.Addon = &Base{}
+
 // Details return the details about the certmanager instance deployed
 type Details struct {
 	// Config is exposed here to make it easier for upstream consumers to access
 	// the global configuration.
 	Config *config.Config
+
+	// KubeConfig is the loaded Kubernetes configuration for addons to use.
+	KubeConfig *rest.Config
 
 	// KubeClient is a configured Kubernetes clientset for addons to use.
 	KubeClient kubernetes.Interface
@@ -49,30 +58,35 @@ func (d *Details) Helper() *helper.Helper {
 	}
 }
 
-func (b *Base) Setup(c *config.Config) error {
-	kubeConfig, err := util.LoadConfig(c.KubeConfig, c.KubeContext)
+func (b *Base) Setup(_ context.Context, cfg *config.Config, _ ...internal.AddonTransferableData) (internal.AddonTransferableData, error) {
+	kubeConfig, err := util.LoadConfig(cfg.KubeConfig, cfg.KubeContext)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	kubeConfig.Burst = 9000
+	kubeConfig.QPS = 9000
 
 	kubeClientset, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	b.details = &Details{
-		Config:     c,
+		Config: cfg,
+
+		KubeConfig: kubeConfig,
 		KubeClient: kubeClientset,
 	}
 
+	return nil, nil
+}
+
+func (b *Base) Provision(_ context.Context) error {
 	return nil
 }
 
-func (b *Base) Provision() error {
-	return nil
-}
-
-func (b *Base) Deprovision() error {
+func (b *Base) Deprovision(_ context.Context) error {
 	return nil
 }
 

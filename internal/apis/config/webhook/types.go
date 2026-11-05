@@ -18,6 +18,9 @@ package webhook
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logsapi "k8s.io/component-base/logs/api/v1"
+
+	shared "github.com/cert-manager/cert-manager/internal/apis/config/shared"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -26,21 +29,24 @@ type WebhookConfiguration struct {
 	metav1.TypeMeta
 
 	// securePort is the port number to listen on for secure TLS connections from the kube-apiserver.
+	// If 0, a random available port will be chosen.
 	// Defaults to 6443.
-	SecurePort *int
+	SecurePort int32
 
 	// healthzPort is the port number to listen on (using plaintext HTTP) for healthz connections.
+	// If 0, a random available port will be chosen.
 	// Defaults to 6080.
-	HealthzPort *int
+	HealthzPort int32
 
 	// tlsConfig is used to configure the secure listener's TLS settings.
-	TLSConfig TLSConfig
+	TLSConfig shared.TLSConfig
 
 	// kubeConfig is the kubeconfig file used to connect to the Kubernetes apiserver.
 	// If not specified, the webhook will attempt to load the in-cluster-config.
 	KubeConfig string
 
 	// apiServerHost is used to override the API server connection address.
+	//
 	// Deprecated: use `kubeConfig` instead.
 	APIServerHost string
 
@@ -51,74 +57,53 @@ type WebhookConfiguration struct {
 	// Defaults to 'localhost:6060'.
 	PprofAddress string
 
+	// https://pkg.go.dev/k8s.io/component-base@v0.27.3/logs/api/v1#LoggingConfiguration
+	Logging logsapi.LoggingConfiguration
+
 	// featureGates is a map of feature names to bools that enable or disable experimental
 	// features.
-	// Default: nil
-	// +optional
 	FeatureGates map[string]bool
+
+	// The host and port that the metrics endpoint should listen on.
+	// The value "0" disables the metrics server.
+	// Defaults to '0.0.0.0:9402'.
+	MetricsListenAddress string
+
+	// Metrics endpoint TLS config
+	MetricsTLSConfig shared.TLSConfig
+
+	// EnableClientVerification turns on client verification of requests
+	// made to the webhook server
+	EnableClientVerification bool
+
+	// ClientCAPath is the CA certificate name which server used to verify remote(client)'s certificate.
+	// Defaults to "", which means server does not verify client's certificate.
+	ClientCAPath string
+
+	// ClientCertificateSubjects is a list of acceptable subject names for client
+	// certificates used by the apiserver to contact webhooks. Each entry will
+	// be matched against the certificate's CommonName and DNS SubjectAltNames.
+	// Multiple values allow zero-downtime rotations.
+	ClientCertificateSubjects []string
+
+	// PEMSizeLimitsConfig configures the maximum sizes for PEM-encoded data
+	PEMSizeLimitsConfig PEMSizeLimitsConfig
 }
 
-// TLSConfig configures how TLS certificates are sourced for serving.
-// Only one of 'filesystem' or 'dynamic' may be specified.
-type TLSConfig struct {
-	// cipherSuites is the list of allowed cipher suites for the server.
-	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
-	// If not specified, the default for the Go version will be used and may change over time.
-	CipherSuites []string
+type PEMSizeLimitsConfig struct {
+	// Maximum size for a single PEM-encoded certificate (in bytes).
+	// Defaults to 36500 bytes.
+	MaxCertificateSize int
 
-	// minTLSVersion is the minimum TLS version supported.
-	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
-	// If not specified, the default for the Go version will be used and may change over time.
-	MinTLSVersion string
+	// Maximum size for a single PEM-encoded private key (in bytes).
+	// Defaults to 13000 bytes.
+	MaxPrivateKeySize int
 
-	// Filesystem enables using a certificate and private key found on the local filesystem.
-	// These files will be periodically polled in case they have changed, and dynamically reloaded.
-	Filesystem FilesystemServingConfig
+	// Maximum size for a PEM-encoded certificate chain (in bytes).
+	// Defaults to 95000 bytes.
+	MaxChainLength int
 
-	// When Dynamic serving is enabled, the webhook will generate a CA used to sign webhook
-	// certificates and persist it into a Kubernetes Secret resource (for other replicas of the
-	// webhook to consume).
-	// It will then generate a certificate in-memory for itself using this CA to serve with.
-	// The CAs certificate can then be copied into the appropriate Validating, Mutating and Conversion
-	// webhook configuration objects (typically by cainjector).
-	Dynamic DynamicServingConfig
-}
-
-func (c *TLSConfig) FilesystemConfigProvided() bool {
-	if c.Filesystem.KeyFile != "" || c.Filesystem.CertFile != "" {
-		return true
-	}
-	return false
-}
-
-func (c *TLSConfig) DynamicConfigProvided() bool {
-	if c.Dynamic.SecretNamespace != "" || c.Dynamic.SecretName != "" || len(c.Dynamic.DNSNames) > 0 {
-		return true
-	}
-	return false
-}
-
-// DynamicServingConfig makes the webhook generate a CA and persist it into Secret resources.
-// This CA will be used by all instances of the webhook for signing serving certificates.
-type DynamicServingConfig struct {
-	// Namespace of the Kubernetes Secret resource containing the TLS certificate
-	// used as a CA to sign dynamic serving certificates.
-	SecretNamespace string
-
-	// Namespace of the Kubernetes Secret resource containing the TLS certificate
-	// used as a CA to sign dynamic serving certificates.
-	SecretName string
-
-	// DNSNames that must be present on serving certificates signed by the CA.
-	DNSNames []string
-}
-
-// FilesystemServingConfig enables using a certificate and private key found on the local filesystem.
-// These files will be periodically polled in case they have changed, and dynamically reloaded.
-type FilesystemServingConfig struct {
-	// Path to a file containing TLS certificate & chain to serve with
-	CertFile string
-
-	// Path to a file containing a TLS private key to server with
-	KeyFile string
+	// Maximum size for PEM-encoded certificate bundles (in bytes).
+	// Defaults to 330000 bytes.
+	MaxBundleSize int
 }

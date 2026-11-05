@@ -18,15 +18,9 @@ package certificates
 
 import (
 	"context"
-	"encoding/pem"
 	"strconv"
 	"testing"
 	"time"
-
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/utils/clock"
 
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -35,28 +29,37 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates/revisionmanager"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/metrics"
-	utilpki "github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/cert-manager/cert-manager/test/integration/framework"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/clock"
+
+	"github.com/cert-manager/cert-manager/integration-tests/framework"
 )
 
 // TestRevisionManagerController will ensure that the revision manager
-// controller will delete old CertificateRequests occording to the
+// controller will delete old CertificateRequests according to the
 // spec.revisionHistoryLimit value
 func TestRevisionManagerController(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*40)
-	defer cancel()
-
-	config, stopFn := framework.RunControlPlane(t, ctx)
-	defer stopFn()
+	config, stopFn := framework.RunControlPlane(t)
+	t.Cleanup(stopFn)
 
 	// Build, instantiate and run the revision manager controller.
-	kubeClient, factory, cmCl, cmFactory := framework.NewClients(t, config)
+	kubeClient, factory, cmCl, cmFactory, scheme := framework.NewClients(t, config)
 
-	ctrl, queue, mustSync := revisionmanager.NewController(logf.Log, cmCl, cmFactory)
+	controllerContext := controllerpkg.Context{
+		Scheme:                scheme,
+		CMClient:              cmCl,
+		SharedInformerFactory: cmFactory,
+	}
+
+	ctrl, queue, mustSync, err := revisionmanager.NewController(logf.Log, &controllerContext)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	c := controllerpkg.NewController(
-		ctx,
 		"revisionmanager_controller_test",
 		metrics.New(logf.Log, clock.RealClock{}),
 		ctrl.ProcessItem,
@@ -74,9 +77,8 @@ func TestRevisionManagerController(t *testing.T) {
 	)
 
 	// Create Namespace
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-	_, err := kubeClient.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
-	if err != nil {
+	ns := &corev1.Namespace{Name: namespace}
+	if _, err := kubeClient.CoreV1().Namespaces().Create(t.Context(), ns, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -86,10 +88,10 @@ func TestRevisionManagerController(t *testing.T) {
 		gen.SetCertificateCommonName("my-common-name"),
 		gen.SetCertificateSecretName(secretName),
 		gen.SetCertificateRevisionHistoryLimit(3),
-		gen.SetCertificateIssuer(cmmeta.ObjectReference{Name: "testissuer", Group: "foo.io", Kind: "Issuer"}),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{Name: "testissuer", Group: "foo.io", Kind: "Issuer"}),
 	)
 
-	crt, err = cmCl.CertmanagerV1().Certificates(namespace).Create(ctx, crt, metav1.CreateOptions{})
+	crt, err = cmCl.CertmanagerV1().Certificates(namespace).Create(t.Context(), crt, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,48 +99,30 @@ func TestRevisionManagerController(t *testing.T) {
 	// Set Certificate to Ready
 	apiutil.SetCertificateCondition(crt, crt.Generation,
 		cmapi.CertificateConditionReady, cmmeta.ConditionTrue, "Issued", "integration test")
-	crt, err = cmCl.CertmanagerV1().Certificates(namespace).UpdateStatus(ctx, crt, metav1.UpdateOptions{})
+	crt, err = cmCl.CertmanagerV1().Certificates(namespace).UpdateStatus(t.Context(), crt, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Create a new private key
-	sk, err := utilpki.GenerateRSAPrivateKey(2048)
+	csrPEM, _, err := gen.CSRForCertificate(crt)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	csr, err := utilpki.GenerateCSR(crt)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Encode CSR
-	csrDER, err := utilpki.EncodeCSR(csr, sk)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	csrPEM := pem.EncodeToMemory(&pem.Block{
-		Type: "CERTIFICATE REQUEST", Bytes: csrDER,
-	})
 
 	// Create 6 CertificateRequests which are owned by this Certificate
-	for i := 0; i < 6; i++ {
-		_, err = cmCl.CertmanagerV1().CertificateRequests(namespace).Create(ctx, &cmapi.CertificateRequest{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: crtName + "-",
-				Namespace:    namespace,
-				Annotations: map[string]string{
-					cmapi.CertificateRequestRevisionAnnotationKey: strconv.Itoa(i),
-				},
-				OwnerReferences: []metav1.OwnerReference{
-					*metav1.NewControllerRef(crt, cmapi.SchemeGroupVersion.WithKind("Certificate")),
-				},
+	for i := range 6 {
+		_, err = cmCl.CertmanagerV1().CertificateRequests(namespace).Create(t.Context(), &cmapi.CertificateRequest{
+			GenerateName: crtName + "-",
+			Namespace:    namespace,
+			Annotations: map[string]string{
+				cmapi.CertificateRequestRevisionAnnotationKey: strconv.Itoa(i),
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(crt, cmapi.SchemeGroupVersion.WithKind("Certificate")),
 			},
 			Spec: cmapi.CertificateRequestSpec{
 				Request:   csrPEM,
-				IssuerRef: cmmeta.ObjectReference{Name: "testissuer", Group: "foo.io", Kind: "Issuer"},
+				IssuerRef: cmmeta.IssuerReference{Name: "testissuer", Group: "foo.io", Kind: "Issuer"},
 			},
 		}, metav1.CreateOptions{})
 		if err != nil {
@@ -149,7 +133,7 @@ func TestRevisionManagerController(t *testing.T) {
 	var crs []cmapi.CertificateRequest
 
 	// Wait for 3 CertificateRequests to be deleted, and that they have the correct revisions
-	err = wait.PollImmediateUntil(time.Millisecond*100, func() (done bool, err error) {
+	err = wait.PollUntilContextCancel(t.Context(), time.Millisecond*100, true, func(ctx context.Context) (done bool, err error) {
 		requests, err := cmCl.CertmanagerV1().CertificateRequests(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return false, err
@@ -163,7 +147,7 @@ func TestRevisionManagerController(t *testing.T) {
 		crs = requests.Items
 
 		return true, nil
-	}, ctx.Done())
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

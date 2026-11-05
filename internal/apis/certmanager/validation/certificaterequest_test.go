@@ -17,18 +17,22 @@ limitations under the License.
 package validation
 
 import (
-	"bytes"
-	"encoding/pem"
-	"reflect"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	cminternal "github.com/cert-manager/cert-manager/internal/apis/certmanager"
 	cminternalmeta "github.com/cert-manager/cert-manager/internal/apis/meta"
+	"github.com/cert-manager/cert-manager/internal/webhook/feature"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	utilpki "github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
@@ -39,12 +43,10 @@ func TestValidateCertificateRequestUpdate(t *testing.T) {
 	baseRequest := mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com")))
 
 	baseCR := &cminternal.CertificateRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{
-				"abc":                      "123",
-				"cert-manager.io/foo":      "abc",
-				"acme.cert-manager.io/bar": "123",
-			},
+		Annotations: map[string]string{
+			"abc":                      "123",
+			"cert-manager.io/foo":      "abc",
+			"acme.cert-manager.io/bar": "123",
 		},
 		Spec: cminternal.CertificateRequestSpec{
 			Request:   baseRequest,
@@ -76,11 +78,9 @@ func TestValidateCertificateRequestUpdate(t *testing.T) {
 		"if CertificateRequest spec and cert-manager.io annotations change, error": {
 			oldCR: baseCR.DeepCopy(),
 			newCR: &cminternal.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						"acme.cert-manager.io/bar": "123",
-						"123":                      "abc",
-					},
+				Annotations: map[string]string{
+					"acme.cert-manager.io/bar": "123",
+					"123":                      "abc",
 				},
 				Spec: cminternal.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com"))),
@@ -95,11 +95,9 @@ func TestValidateCertificateRequestUpdate(t *testing.T) {
 		"if CertificateRequest spec and acme.cert-manager.io annotations change, error": {
 			oldCR: baseCR.DeepCopy(),
 			newCR: &cminternal.CertificateRequest{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						"cert-manager.io/foo": "abc",
-						"123":                 "abc",
-					},
+				Annotations: map[string]string{
+					"cert-manager.io/foo": "abc",
+					"123":                 "abc",
 				},
 				Spec: cminternal.CertificateRequestSpec{
 					Request: mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com"))),
@@ -445,19 +443,8 @@ func TestValidateCertificateRequestUpdate(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			gotE, gotW := ValidateUpdateCertificateRequest(test.a, test.oldCR, test.newCR)
-			for i := range gotE {
-				if gotE[i].Type != field.ErrorTypeForbidden {
-					// filter out the value so it does not print the full CSR in tests
-					gotE[i].BadValue = nil
-				}
-			}
-
-			if !reflect.DeepEqual(gotE, test.wantE) {
-				t.Errorf("errors from ValidateUpdateCertificateRequest() = %v, want %v", gotE, test.wantE)
-			}
-			if !reflect.DeepEqual(gotW, test.wantW) {
-				t.Errorf("warnings from ValidateUpdateCertificateRequest() = %#+v, want %#+v", gotW, test.wantW)
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, test.wantE, gotE)
+			assert.Equal(t, test.wantW, gotW)
 		})
 	}
 }
@@ -540,6 +527,81 @@ func TestValidateCertificateRequest(t *testing.T) {
 			a:     someAdmissionRequest,
 			wantE: []*field.Error{},
 		},
+		"Test csr with default usages and isCA": {
+			cr: &cminternal.CertificateRequest{
+				Spec: cminternal.CertificateRequestSpec{
+					Request:   mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com"), gen.SetCertificateKeyUsages(cmapi.UsageDigitalSignature, cmapi.UsageCertSign, cmapi.UsageKeyEncipherment), gen.SetCertificateIsCA(true))),
+					IssuerRef: validIssuerRef,
+					IsCA:      true,
+					Usages:    nil,
+				},
+			},
+			a:     someAdmissionRequest,
+			wantE: []*field.Error{},
+		},
+		"Test cr with default usages": {
+			cr: &cminternal.CertificateRequest{
+				Spec: cminternal.CertificateRequestSpec{
+					// mustGenerateCSR will set the default usages for us
+					Request:   mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com"))),
+					IssuerRef: validIssuerRef,
+					Usages:    []cminternal.KeyUsage{cminternal.UsageKeyEncipherment, cminternal.UsageDigitalSignature},
+				},
+			},
+			a:     someAdmissionRequest,
+			wantE: []*field.Error{},
+		},
+		"Test cr with default usages, without any encoded in csr": {
+			cr: &cminternal.CertificateRequest{
+				Spec: cminternal.CertificateRequestSpec{
+					// mustGenerateCSR will set the default usages for us
+					Request: mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com")), func(cr *x509.CertificateRequest) error {
+						// manually remove extensions that encode default usages
+						cr.Extensions = nil
+						cr.ExtraExtensions = nil
+
+						return nil
+					}),
+					IssuerRef: validIssuerRef,
+					Usages:    []cminternal.KeyUsage{cminternal.UsageKeyEncipherment, cminternal.UsageDigitalSignature},
+				},
+			},
+			a:     someAdmissionRequest,
+			wantE: []*field.Error{},
+		},
+		"Test cr with default usages, with empty set encoded in csr": {
+			cr: &cminternal.CertificateRequest{
+				Spec: cminternal.CertificateRequestSpec{
+					// mustGenerateCSR will set the default usages for us
+					Request: mustGenerateCSR(t, gen.Certificate("test", gen.SetCertificateDNSNames("example.com")), func(cr *x509.CertificateRequest) error {
+						// manually remove extensions that encode default usages
+						cr.Extensions = nil
+						cr.ExtraExtensions = []pkix.Extension{
+							{
+								Id:       utilpki.OIDExtensionKeyUsage,
+								Critical: false,
+								Value: func(t *testing.T) []byte {
+									asn1KeyUsage, err := asn1.Marshal(asn1.BitString{Bytes: []byte{}, BitLength: 0})
+									if err != nil {
+										t.Fatal(err)
+									}
+
+									return asn1KeyUsage
+								}(t),
+							},
+						}
+
+						return nil
+					}),
+					IssuerRef: validIssuerRef,
+					Usages:    []cminternal.KeyUsage{cminternal.UsageKeyEncipherment, cminternal.UsageDigitalSignature},
+				},
+			},
+			a: someAdmissionRequest,
+			wantE: []*field.Error{
+				field.Invalid(fldPath.Child("request"), nil, "encoded CSR error: the KeyUsages [] do not match the expected KeyUsages [ 'digital signature', 'key encipherment' ]"),
+			},
+		},
 		"Error on csr not having all usages": {
 			cr: &cminternal.CertificateRequest{
 				Spec: cminternal.CertificateRequestSpec{
@@ -550,7 +612,7 @@ func TestValidateCertificateRequest(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			wantE: []*field.Error{
-				field.Invalid(fldPath.Child("request"), nil, "csr key usages do not match specified usages, these should match if both are set: [[]certmanager.KeyUsage[3] != []certmanager.KeyUsage[4]]"),
+				field.Invalid(fldPath.Child("request"), nil, "encoded CSR error: the ExtKeyUsages [ 'server auth' ] do not match the expected ExtKeyUsages [ 'server auth', 'client auth' ]"),
 			},
 		},
 		"Error on cr not having all usages": {
@@ -563,7 +625,7 @@ func TestValidateCertificateRequest(t *testing.T) {
 			},
 			a: someAdmissionRequest,
 			wantE: []*field.Error{
-				field.Invalid(fldPath.Child("request"), nil, "csr key usages do not match specified usages, these should match if both are set: [[]certmanager.KeyUsage[4] != []certmanager.KeyUsage[2]]"),
+				field.Invalid(fldPath.Child("request"), nil, "encoded CSR error: the ExtKeyUsages [ 'server auth', 'client auth' ] do not match the expected ExtKeyUsages []"),
 			},
 		},
 		"Test csr with any, signing, digital signature, key encipherment, server and client auth": {
@@ -786,79 +848,94 @@ func TestValidateCertificateRequest(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			gotE, gotW := ValidateCertificateRequest(test.a, test.cr)
-			for i := range gotE {
-				if gotE[i].Type != field.ErrorTypeForbidden {
-					// filter out the value so it does not print the full CSR in tests
-					gotE[i].BadValue = nil
-				}
-			}
-			if !reflect.DeepEqual(gotE, test.wantE) {
-				t.Errorf("errors from ValidateCertificateRequest() = %v, want %v", gotE, test.wantE)
-			}
-			if !reflect.DeepEqual(test.wantW, gotW) {
-				t.Errorf("warnings from ValidateCertificateRequest() = %v, want  %v", gotW, test.wantW)
-			}
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, test.wantE, gotE)
+			assert.Equal(t, test.wantW, gotW)
 		})
 	}
 }
 
-func mustGenerateCSR(t *testing.T, crt *cmapi.Certificate) []byte {
-	// Create a new private key
-	pk, err := utilpki.GenerateRSAPrivateKey(2048)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestValidateCertificateRequestMLDSA(t *testing.T) {
+	fldPath := field.NewPath("spec")
+	mldsaCSR := mustGenerateCSR(t, gen.Certificate("test",
+		gen.SetCertificateDNSNames("example.com"),
+		gen.SetCertificateKeyAlgorithm(cmapi.MLDSAKeyAlgorithm),
+	))
+	mldsaCACSR := mustGenerateCSR(t, gen.Certificate("test",
+		gen.SetCertificateDNSNames("example.com"),
+		gen.SetCertificateKeyAlgorithm(cmapi.MLDSAKeyAlgorithm),
+		gen.SetCertificateIsCA(true),
+	))
+	rsaCSR := mustGenerateCSR(t, gen.Certificate("test",
+		gen.SetCertificateDNSNames("example.com"),
+		gen.SetCertificateKeyUsages(cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment),
+	))
 
-	x509CSR, err := utilpki.GenerateCSR(crt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	csrDER, err := utilpki.EncodeCSR(x509CSR, pk)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	csrPEM := bytes.NewBuffer([]byte{})
-	err = pem.Encode(csrPEM, &pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return csrPEM.Bytes()
-}
-
-func Test_patchDuplicateKeyUsage(t *testing.T) {
-	tests := []struct {
-		name   string
-		usages []cminternal.KeyUsage
-		want   []cminternal.KeyUsage
+	tests := map[string]struct {
+		spec           cminternal.CertificateRequestSpec
+		featureEnabled bool
+		wantE          field.ErrorList
 	}{
-		{
-			name:   "Test single KU",
-			usages: []cminternal.KeyUsage{cminternal.UsageKeyEncipherment},
-			want:   []cminternal.KeyUsage{cminternal.UsageKeyEncipherment},
+		"ML-DSA CSR with no usages": {
+			spec: cminternal.CertificateRequestSpec{
+				Request:   mldsaCSR,
+				IssuerRef: validIssuerRef,
+			},
+			featureEnabled: true,
+			wantE:          []*field.Error{},
 		},
-		{
-			name:   "Test UsageSigning",
-			usages: []cminternal.KeyUsage{cminternal.UsageSigning},
-			want:   []cminternal.KeyUsage{cminternal.UsageDigitalSignature},
+		"ML-DSA CA CSR with no usages": {
+			spec: cminternal.CertificateRequestSpec{
+				Request:   mldsaCACSR,
+				IssuerRef: validIssuerRef,
+				IsCA:      true,
+			},
+			featureEnabled: true,
+			wantE:          []*field.Error{},
 		},
-		{
-			name:   "Test multiple KU",
-			usages: []cminternal.KeyUsage{cminternal.UsageDigitalSignature, cminternal.UsageServerAuth, cminternal.UsageClientAuth},
-			want:   []cminternal.KeyUsage{cminternal.UsageDigitalSignature, cminternal.UsageServerAuth, cminternal.UsageClientAuth},
+		"ML-DSA CSR with feature gate disabled": {
+			spec: cminternal.CertificateRequestSpec{
+				Request:   mldsaCSR,
+				IssuerRef: validIssuerRef,
+			},
+			wantE: []*field.Error{
+				field.Forbidden(fldPath.Child("request"), "CSRs with an ML-DSA public key require the MLDSAPrivateKeys feature gate to be enabled"),
+			},
 		},
-		{
-			name:   "Test double signing",
-			usages: []cminternal.KeyUsage{cminternal.UsageSigning, cminternal.UsageDigitalSignature},
-			want:   []cminternal.KeyUsage{cminternal.UsageDigitalSignature},
+		"ML-DSA CSR with forbidden usages": {
+			spec: cminternal.CertificateRequestSpec{
+				Request:   mldsaCSR,
+				IssuerRef: validIssuerRef,
+				Usages:    []cminternal.KeyUsage{cminternal.UsageDigitalSignature, cminternal.UsageKeyEncipherment},
+			},
+			featureEnabled: true,
+			wantE: []*field.Error{
+				field.Invalid(fldPath.Child("usages").Index(1), cminternal.UsageKeyEncipherment, "not allowed for ML-DSA keys (RFC 9881)"),
+			},
+		},
+		"RSA CSR with key encipherment usage and feature gate enabled": {
+			spec: cminternal.CertificateRequestSpec{
+				Request:   rsaCSR,
+				IssuerRef: validIssuerRef,
+				Usages:    []cminternal.KeyUsage{cminternal.UsageDigitalSignature, cminternal.UsageKeyEncipherment},
+			},
+			featureEnabled: true,
+			wantE:          []*field.Error{},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := patchDuplicateKeyUsage(tt.usages); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("patchDuplicateKeyUsage() = %v, want %v", got, tt.want)
-			}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.MLDSAPrivateKeys, test.featureEnabled)
+			gotE, gotW := ValidateCertificateRequest(someAdmissionRequest, &cminternal.CertificateRequest{Spec: test.spec})
+			field.ErrorMatcher{}.ByType().ByField().ByDetailExact().Test(t, test.wantE, gotE)
+			assert.Empty(t, gotW)
 		})
 	}
+}
+
+func mustGenerateCSR(t *testing.T, crt *cmapi.Certificate, modifiers ...gen.CSRModifier) []byte {
+	csrPEM, _, err := gen.CSRForCertificate(crt, modifiers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return csrPEM
 }

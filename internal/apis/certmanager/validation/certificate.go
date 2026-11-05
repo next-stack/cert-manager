@@ -17,10 +17,15 @@ limitations under the License.
 package validation
 
 import (
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/mail"
+	"reflect"
+	"slices"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
@@ -34,28 +39,68 @@ import (
 	"github.com/cert-manager/cert-manager/internal/webhook/feature"
 	"github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	utilpkg "github.com/cert-manager/cert-manager/pkg/util"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 )
 
+// mapping for key algorithm to allowed signature algorithms
+var keyAlgToAllowedSigAlgs = map[internalcmapi.PrivateKeyAlgorithm][]internalcmapi.SignatureAlgorithm{
+	internalcmapi.RSAKeyAlgorithm: {
+		internalcmapi.SHA256WithRSA,
+		internalcmapi.SHA384WithRSA,
+		internalcmapi.SHA512WithRSA,
+	},
+	internalcmapi.ECDSAKeyAlgorithm: {
+		internalcmapi.ECDSAWithSHA256,
+		internalcmapi.ECDSAWithSHA384,
+		internalcmapi.ECDSAWithSHA512,
+	},
+	internalcmapi.Ed25519KeyAlgorithm: {
+		internalcmapi.PureEd25519,
+	},
+}
+
 // Validation functions for cert-manager Certificate types
 
 func ValidateCertificateSpec(crt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
+	return validateCertificateSpec(crt, nil, fldPath)
+}
+
+func validateCertificateSpec(crt, oldCrt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 	if crt.SecretName == "" {
 		el = append(el, field.Required(fldPath.Child("secretName"), "must be specified"))
+	} else {
+		for _, msg := range apivalidation.NameIsDNSSubdomain(crt.SecretName, false) {
+			el = append(el, field.Invalid(fldPath.Child("secretName"), crt.SecretName, msg))
+		}
 	}
 
 	el = append(el, validateIssuerRef(crt.IssuerRef, fldPath)...)
 
-	var commonName = crt.CommonName
+	commonName := crt.CommonName
 	if crt.LiteralSubject != "" {
-
 		if !utilfeature.DefaultFeatureGate.Enabled(feature.LiteralCertificateSubject) {
 			el = append(el, field.Forbidden(fldPath.Child("literalSubject"), "Feature gate LiteralCertificateSubject must be enabled on both webhook and controller to use the alpha `literalSubject` field"))
 		}
 
-		sequence, err := pki.ParseSubjectStringToRdnSequence(crt.LiteralSubject)
+		if len(commonName) != 0 {
+			el = append(el, field.Invalid(fldPath.Child("commonName"), commonName, "When providing a `LiteralSubject` no `commonName` may be provided."))
+		}
+
+		if crt.Subject != nil && (len(crt.Subject.Organizations) > 0 ||
+			len(crt.Subject.Countries) > 0 ||
+			len(crt.Subject.OrganizationalUnits) > 0 ||
+			len(crt.Subject.Localities) > 0 ||
+			len(crt.Subject.Provinces) > 0 ||
+			len(crt.Subject.StreetAddresses) > 0 ||
+			len(crt.Subject.PostalCodes) > 0 ||
+			len(crt.Subject.SerialNumber) > 0) {
+			el = append(el, field.Invalid(fldPath.Child("subject"), crt.Subject, "When providing a `LiteralSubject` no `Subject` properties may be provided."))
+		}
+
+		sequence, err := pki.UnmarshalSubjectStringToRDNSequence(crt.LiteralSubject)
 		if err != nil {
 			el = append(el, field.Invalid(fldPath.Child("literalSubject"), crt.LiteralSubject, err.Error()))
 		}
@@ -81,39 +126,55 @@ func ValidateCertificateSpec(crt *internalcmapi.CertificateSpec, fldPath *field.
 				}
 			}
 		}
-
-		if len(crt.CommonName) != 0 {
-			el = append(el, field.Invalid(fldPath.Child("commonName"), crt.CommonName, "When providing a `LiteralSubject` no `commonName` may be provided."))
-		}
-
-		if crt.Subject != nil && len(crt.Subject.Organizations)+len(crt.Subject.Countries)+len(crt.Subject.OrganizationalUnits)+len(crt.Subject.Localities)+len(crt.Subject.Provinces)+len(crt.Subject.StreetAddresses)+len(crt.Subject.PostalCodes) != 0 {
-			el = append(el, field.Invalid(fldPath.Child("subject"), crt.Subject, "When providing a `LiteralSubject` no `Subject` properties may be provided with the exception of `Subject.serialNumber`"))
-		}
-
 	}
 
-	if len(commonName) == 0 && len(crt.DNSNames) == 0 && len(crt.URISANs) == 0 && len(crt.EmailSANs) == 0 && len(crt.IPAddresses) == 0 {
-		el = append(el, field.Invalid(fldPath, "", "at least one of commonName, dnsNames, uris ipAddresses, or emailAddresses must be set"))
+	if len(commonName) == 0 &&
+		len(crt.DNSNames) == 0 &&
+		len(crt.URIs) == 0 &&
+		len(crt.EmailAddresses) == 0 &&
+		len(crt.IPAddresses) == 0 &&
+		len(crt.OtherNames) == 0 {
+		el = append(el, field.Invalid(fldPath, "", "at least one of commonName (from the commonName field or from a literalSubject), dnsNames, emailSANs, ipAddresses, otherNames, or uriSANs must be set"))
 	}
 
 	// if a common name has been specified, ensure it is no longer than 64 chars
 	if len(commonName) > 64 {
-		el = append(el, field.TooLong(fldPath.Child("commonName"), crt.CommonName, 64))
+		el = append(el, field.TooLong(fldPath.Child("commonName"), commonName, 64))
 	}
 
 	if len(crt.IPAddresses) > 0 {
 		el = append(el, validateIPAddresses(crt, fldPath)...)
 	}
 
-	if len(crt.EmailSANs) > 0 {
+	if len(crt.EmailAddresses) > 0 {
 		el = append(el, validateEmailAddresses(crt, fldPath)...)
+	}
+
+	if len(crt.OtherNames) > 0 {
+		if !utilfeature.DefaultFeatureGate.Enabled(feature.OtherNames) {
+			el = append(el, field.Forbidden(fldPath.Child("OtherNames"), "Feature gate OtherNames must be enabled on both webhook and controller to use the alpha `otherNames` field"))
+		} else {
+			for i, otherName := range crt.OtherNames {
+				if otherName.OID == "" {
+					el = append(el, field.Required(fldPath.Child("otherNames").Index(i).Child("oid"), "must be specified"))
+				}
+
+				if _, err := pki.ParseObjectIdentifier(otherName.OID); err != nil {
+					el = append(el, field.Invalid(fldPath.Child("otherNames").Index(i).Child("oid"), otherName.OID, "invalid oid syntax"))
+				}
+
+				if otherName.UTF8Value == "" || !utf8.ValidString(otherName.UTF8Value) {
+					el = append(el, field.Required(fldPath.Child("otherNames").Index(i).Child("utf8Value"), "must be set to a valid non-empty UTF8 string"))
+				}
+			}
+		}
 	}
 
 	if crt.PrivateKey != nil {
 		switch crt.PrivateKey.Algorithm {
 		case "", internalcmapi.RSAKeyAlgorithm:
-			if crt.PrivateKey.Size > 0 && (crt.PrivateKey.Size < 2048 || crt.PrivateKey.Size > 8192) {
-				el = append(el, field.Invalid(fldPath.Child("privateKey", "size"), crt.PrivateKey.Size, "must be between 2048 & 8192 for rsa keyAlgorithm"))
+			if crt.PrivateKey.Size > 0 && (crt.PrivateKey.Size < pki.MinRSAKeySize || crt.PrivateKey.Size > pki.MaxRSAKeySize) {
+				el = append(el, field.Invalid(fldPath.Child("privateKey", "size"), crt.PrivateKey.Size, fmt.Sprintf("must be between %d and %d for rsa keyAlgorithm", pki.MinRSAKeySize, pki.MaxRSAKeySize)))
 			}
 		case internalcmapi.ECDSAKeyAlgorithm:
 			if crt.PrivateKey.Size > 0 && crt.PrivateKey.Size != 256 && crt.PrivateKey.Size != 384 && crt.PrivateKey.Size != 521 {
@@ -121,13 +182,40 @@ func ValidateCertificateSpec(crt *internalcmapi.CertificateSpec, fldPath *field.
 			}
 		case internalcmapi.Ed25519KeyAlgorithm:
 			break
+		case internalcmapi.MLDSAKeyAlgorithm:
+			// Objects which were created while the feature gate was enabled
+			// can still be updated (e.g. by the controller to update their
+			// status) and deleted, as long as the algorithm isn't changed.
+			if !utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) && !isMLDSACertificateSpec(oldCrt) {
+				el = append(el, field.Forbidden(fldPath.Child("privateKey", "algorithm"), "MLDSA requires the MLDSAPrivateKeys feature gate to be enabled"))
+			}
+			if crt.PrivateKey.Size != 0 && crt.PrivateKey.Size != pki.MLDSA44 && crt.PrivateKey.Size != pki.MLDSA65 && crt.PrivateKey.Size != pki.MLDSA87 {
+				el = append(el, field.NotSupported(fldPath.Child("privateKey", "size"), crt.PrivateKey.Size, []string{"44", "65", "87"}))
+			}
 		default:
-			el = append(el, field.Invalid(fldPath.Child("privateKey", "algorithm"), crt.PrivateKey.Algorithm, "must be either empty or one of rsa or ecdsa"))
+			el = append(el, field.Invalid(fldPath.Child("privateKey", "algorithm"), crt.PrivateKey.Algorithm, "must be either empty or one of rsa, ecdsa, ed25519 or mldsa"))
 		}
 	}
 
-	if crt.Duration != nil || crt.RenewBefore != nil {
-		el = append(el, ValidateDuration(crt, fldPath)...)
+	if crt.SignatureAlgorithm != "" {
+		actualKeyAlg := internalcmapi.RSAKeyAlgorithm
+		if crt.PrivateKey != nil && crt.PrivateKey.Algorithm != "" {
+			actualKeyAlg = crt.PrivateKey.Algorithm
+		}
+		allowed, ok := keyAlgToAllowedSigAlgs[actualKeyAlg]
+		if actualKeyAlg == internalcmapi.MLDSAKeyAlgorithm {
+			// ML-DSA has no entry in keyAlgToAllowedSigAlgs, which would
+			// otherwise allow any signature algorithm.
+			el = append(el, field.Invalid(fldPath.Child("signatureAlgorithm"), crt.SignatureAlgorithm,
+				"must not be set for key algorithm MLDSA: the signature algorithm follows from the key's parameter set"))
+		} else if ok && !slices.Contains(allowed, crt.SignatureAlgorithm) {
+			el = append(el, field.Invalid(fldPath.Child("signatureAlgorithm"), crt.SignatureAlgorithm,
+				fmt.Sprintf("for key algorithm %s the allowed signature algorithms are %v", actualKeyAlg, allowed)))
+		}
+	}
+
+	if crt.Duration != nil || crt.RenewBefore != nil || crt.RenewBeforePercentage != nil {
+		el = append(el, validateDuration(crt, oldCrt, fldPath)...)
 	}
 	if len(crt.Usages) > 0 {
 		el = append(el, validateUsages(crt, fldPath)...)
@@ -145,43 +233,80 @@ func ValidateCertificateSpec(crt *internalcmapi.CertificateSpec, fldPath *field.
 		}
 	}
 
+	if crt.NameConstraints != nil {
+		el = append(el, validateNameConstraints(crt, fldPath)...)
+	}
+
 	el = append(el, validateAdditionalOutputFormats(crt, fldPath)...)
+
+	if crt.Keystores != nil {
+		el = append(el, validateKeystores(crt, fldPath)...)
+	}
+
+	if crt.Renewal != nil {
+		el = append(el, validateCertificateRenewal(crt, fldPath)...)
+	}
 
 	return el
 }
 
-func ValidateCertificate(a *admissionv1.AdmissionRequest, obj runtime.Object) (field.ErrorList, []string) {
+func ValidateCertificate(a *admissionv1.AdmissionRequest, obj runtime.Object) (allErrs field.ErrorList, warnings []string) {
 	crt := obj.(*internalcmapi.Certificate)
-	allErrs := ValidateCertificateSpec(&crt.Spec, field.NewPath("spec"))
-	return allErrs, nil
+	allErrs = ValidateCertificateSpec(&crt.Spec, field.NewPath("spec"))
+	return allErrs, warnings
 }
 
 func ValidateUpdateCertificate(a *admissionv1.AdmissionRequest, oldObj, obj runtime.Object) (field.ErrorList, []string) {
+	oldCrt := oldObj.(*internalcmapi.Certificate)
 	crt := obj.(*internalcmapi.Certificate)
-	allErrs := ValidateCertificateSpec(&crt.Spec, field.NewPath("spec"))
+	allErrs := validateCertificateSpec(&crt.Spec, &oldCrt.Spec, field.NewPath("spec"))
 	return allErrs, nil
 }
 
-func validateIssuerRef(issuerRef cmmeta.ObjectReference, fldPath *field.Path) field.ErrorList {
+func validateIssuerRef(issuerRef cmmeta.IssuerReference, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 
 	issuerRefPath := fldPath.Child("issuerRef")
 	if issuerRef.Name == "" {
+		// all issuerRefs must specify a name
 		el = append(el, field.Required(issuerRefPath.Child("name"), "must be specified"))
 	}
+
 	if issuerRef.Group == "" || issuerRef.Group == internalcmapi.SchemeGroupVersion.Group {
+		// if the user leaves the group blank, it's effectively defaulted to the built-in issuers (i.e. cert-manager.io)
+		// if the cert-manager.io group is used, we can do extra validation on the Kind
+		// if an external group is used, we don't have a mechanism currently to determine which Kinds are valid for those groups
+		// so we don't check
 		switch issuerRef.Kind {
 		case "":
+			// do nothing
+
 		case "Issuer", "ClusterIssuer":
+			// do nothing
+
 		default:
-			el = append(el, field.Invalid(issuerRefPath.Child("kind"), issuerRef.Kind, "must be one of Issuer or ClusterIssuer"))
+			kindPath := issuerRefPath.Child("kind")
+			errMsg := "must be one of Issuer or ClusterIssuer"
+
+			if issuerRef.Group == "" {
+				// Sometimes the user sets a kind for an external issuer (e.g., "AWSPCAClusterIssuer" or "VenafiIssuer") but forgets
+				// to set the group (an easy mistake to make - see https://github.com/cert-manager/csi-driver/issues/197).
+				// If the users forgets the group but otherwise has a correct Kind set for an external issuer, we can give a hint
+				// as to what they need to do to fix.
+
+				// If the user explicitly set the group to the cert-manager group though, we don't give the hint
+				errMsg += fmt.Sprintf(" (did you forget to set %s?)", kindPath.Child("group").String())
+			}
+
+			el = append(el, field.Invalid(kindPath, issuerRef.Kind, errMsg))
 		}
 	}
+
 	return el
 }
 
 func validateIPAddresses(a *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
-	if len(a.IPAddresses) <= 0 {
+	if len(a.IPAddresses) == 0 {
 		return nil
 	}
 	el := field.ErrorList{}
@@ -195,11 +320,11 @@ func validateIPAddresses(a *internalcmapi.CertificateSpec, fldPath *field.Path) 
 }
 
 func validateEmailAddresses(a *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
-	if len(a.EmailSANs) <= 0 {
+	if len(a.EmailAddresses) == 0 {
 		return nil
 	}
 	el := field.ErrorList{}
-	for i, d := range a.EmailSANs {
+	for i, d := range a.EmailAddresses {
 		e, err := mail.ParseAddress(d)
 		if err != nil {
 			el = append(el, field.Invalid(fldPath.Child("emailAddresses").Index(i), d, fmt.Sprintf("invalid email address: %s", err)))
@@ -221,6 +346,27 @@ func validateUsages(a *internalcmapi.CertificateSpec, fldPath *field.Path) field
 			el = append(el, field.Invalid(fldPath.Child("usages").Index(i), u, "unknown keyusage"))
 		}
 	}
+	if isMLDSACertificateSpec(a) {
+		el = append(el, validateMLDSAUsages(a.Usages, fldPath.Child("usages"))...)
+	}
+	return el
+}
+
+// isMLDSACertificateSpec returns true if the given (possibly nil) Certificate
+// spec has an ML-DSA private key algorithm.
+func isMLDSACertificateSpec(crt *internalcmapi.CertificateSpec) bool {
+	return crt != nil && crt.PrivateKey != nil && crt.PrivateKey.Algorithm == internalcmapi.MLDSAKeyAlgorithm
+}
+
+// validateMLDSAUsages returns an error for each usage which RFC 9881 forbids
+// for ML-DSA keys.
+func validateMLDSAUsages(usages []internalcmapi.KeyUsage, fldPath *field.Path) field.ErrorList {
+	el := field.ErrorList{}
+	for i, u := range usages {
+		if !pki.KeyUsageAllowedForPublicKeyAlgorithm(cmapi.KeyUsage(u), x509.MLDSA) {
+			el = append(el, field.Invalid(fldPath.Index(i), u, "not allowed for ML-DSA keys (RFC 9881)"))
+		}
+	}
 	return el
 }
 
@@ -233,7 +379,7 @@ func validateSecretTemplateAnnotations(crt *internalcmapi.CertificateSpec, fldPa
 
 	secretTemplateAnnotationsPath := fldPath.Child("secretTemplate", "annotations")
 	for a := range crt.SecretTemplate.Annotations {
-		if strings.HasPrefix(a, "cert-manager.io/") {
+		if strings.HasPrefix(a, "cert-manager.io/") && a != "cert-manager.io/allow-direct-injection" {
 			el = append(el, field.Invalid(secretTemplateAnnotationsPath, a, "cert-manager.io/* annotations are not allowed"))
 		}
 	}
@@ -243,12 +389,23 @@ func validateSecretTemplateAnnotations(crt *internalcmapi.CertificateSpec, fldPa
 }
 
 func ValidateDuration(crt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
+	return validateDuration(crt, nil, fldPath)
+}
+
+func validateDuration(crt, oldCrt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 
 	duration := util.DefaultCertDuration(crt.Duration)
 	if duration < cmapi.MinimumCertificateDuration {
 		el = append(el, field.Invalid(fldPath.Child("duration"), duration, fmt.Sprintf("certificate duration must be greater than %s", cmapi.MinimumCertificateDuration)))
 	}
+
+	// Must set at most one of spec.renewBefore or spec.renewBeforePercentage.
+	if crt.RenewBefore != nil && crt.RenewBeforePercentage != nil {
+		el = append(el, field.Invalid(fldPath.Child("renewBefore"), crt.RenewBefore.Duration, "renewBefore and renewBeforePercentage are mutually exclusive and cannot both be set"))
+		el = append(el, field.Invalid(fldPath.Child("renewBeforePercentage"), *crt.RenewBeforePercentage, "renewBefore and renewBeforePercentage are mutually exclusive and cannot both be set"))
+	}
+
 	// If spec.renewBefore is set, check that it is not less than the minimum.
 	if crt.RenewBefore != nil && crt.RenewBefore.Duration < cmapi.MinimumRenewBefore {
 		el = append(el, field.Invalid(fldPath.Child("renewBefore"), crt.RenewBefore.Duration, fmt.Sprintf("certificate renewBefore must be greater than %s", cmapi.MinimumRenewBefore)))
@@ -257,18 +414,82 @@ func ValidateDuration(crt *internalcmapi.CertificateSpec, fldPath *field.Path) f
 	if crt.RenewBefore != nil && crt.RenewBefore.Duration >= duration {
 		el = append(el, field.Invalid(fldPath.Child("renewBefore"), crt.RenewBefore.Duration, fmt.Sprintf("certificate duration %s must be greater than renewBefore %s", duration, crt.RenewBefore.Duration)))
 	}
+
+	// If spec.renewBeforePercentage is set, check that it's within the allowed
+	// range.
+	if crt.RenewBeforePercentage != nil {
+		if *crt.RenewBeforePercentage <= 0 || *crt.RenewBeforePercentage >= 100 {
+			el = append(el, field.Invalid(fldPath.Child("renewBeforePercentage"), *crt.RenewBeforePercentage, "must be an integer in the range (0,100)"))
+			return el
+		}
+
+		renewBefore := pki.RenewBeforeFromPercentage(duration, *crt.RenewBeforePercentage)
+		if renewBefore < cmapi.MinimumRenewBefore && !allowLegacyRenewBeforePercentageOnUpdate(crt, oldCrt) {
+			el = append(el, field.Invalid(fldPath.Child("renewBeforePercentage"), *crt.RenewBeforePercentage, fmt.Sprintf("certificate renewBeforePercentage must result in a renewBefore of at least %s; %d%% of %s is %s", cmapi.MinimumRenewBefore, *crt.RenewBeforePercentage, duration, renewBefore)))
+		}
+		if renewBefore >= duration {
+			el = append(el, field.Invalid(fldPath.Child("renewBeforePercentage"), *crt.RenewBeforePercentage, "certificate renewBeforePercentage must result in a renewBefore less than duration"))
+		}
+	}
+
+	return el
+}
+
+func allowLegacyRenewBeforePercentageOnUpdate(crt, oldCrt *internalcmapi.CertificateSpec) bool {
+	if oldCrt == nil ||
+		!reflect.DeepEqual(oldCrt.Duration, crt.Duration) ||
+		!reflect.DeepEqual(oldCrt.RenewBeforePercentage, crt.RenewBeforePercentage) {
+		return false
+	}
+	if crt.RenewBeforePercentage == nil || *crt.RenewBeforePercentage <= 0 || *crt.RenewBeforePercentage >= 100 {
+		return false
+	}
+
+	duration := util.DefaultCertDuration(crt.Duration)
+	// Before this validation was fixed, the webhook checked the complement of
+	// the effective renewBefore. Keep those unchanged specs updateable.
+	oldRenewBefore := duration - pki.RenewBeforeFromPercentage(duration, *crt.RenewBeforePercentage)
+	return oldRenewBefore >= cmapi.MinimumRenewBefore && oldRenewBefore < duration
+}
+
+func validateNameConstraints(crt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
+	nameConstraintsPath := fldPath.Child("nameConstraints")
+	if !utilfeature.DefaultFeatureGate.Enabled(feature.NameConstraints) {
+		return field.ErrorList{field.Forbidden(nameConstraintsPath, "feature gate NameConstraints must be enabled")}
+	}
+
+	el := field.ErrorList{}
+
+	if !crt.IsCA {
+		el = append(el, field.Invalid(nameConstraintsPath, crt.NameConstraints, "isCA should be true when nameConstraints is set"))
+	}
+
+	if crt.NameConstraints.Permitted == nil && crt.NameConstraints.Excluded == nil {
+		el = append(el, field.Invalid(nameConstraintsPath, crt.NameConstraints, "either permitted or excluded must be set"))
+	}
+
+	el = append(el, validateNameConstraintItem(crt.NameConstraints.Permitted, nameConstraintsPath.Child("permitted"))...)
+	el = append(el, validateNameConstraintItem(crt.NameConstraints.Excluded, nameConstraintsPath.Child("excluded"))...)
+
+	return el
+}
+
+func validateNameConstraintItem(item *internalcmapi.NameConstraintItem, fldPath *field.Path) field.ErrorList {
+	if item == nil {
+		return nil
+	}
+
+	el := field.ErrorList{}
+	for i, cidr := range item.IPRanges {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			el = append(el, field.Invalid(fldPath.Child("ipRanges").Index(i), cidr, "invalid CIDR address"))
+		}
+	}
 	return el
 }
 
 func validateAdditionalOutputFormats(crt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
 	var el field.ErrorList
-
-	if !utilfeature.DefaultFeatureGate.Enabled(feature.AdditionalCertificateOutputFormats) {
-		if len(crt.AdditionalOutputFormats) > 0 {
-			el = append(el, field.Forbidden(fldPath.Child("additionalOutputFormats"), "feature gate AdditionalCertificateOutputFormats must be enabled"))
-		}
-		return el
-	}
 
 	// Ensure the set of output formats is unique, keyed on "Type".
 	aofSet := sets.NewString()
@@ -278,6 +499,88 @@ func validateAdditionalOutputFormats(crt *internalcmapi.CertificateSpec, fldPath
 			continue
 		}
 		aofSet.Insert(string(val.Type))
+	}
+
+	return el
+}
+
+const (
+	keystoresMutuallyExclusivePasswordsFmt = "exactly one of passwordSecretRef and password must be provided for %s keystores; cannot set both"
+
+	keystoresPasswordRequiredFmt = "must set exactly one of passwordSecretRef and password must for %s keystores"
+
+	keystoresLiteralPasswordMustNotBeEmptyFmt = "literal password cannot be empty if set on %s keystores"
+)
+
+func validateKeystores(crt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
+	var el field.ErrorList
+
+	if crt.Keystores.JKS != nil {
+		if crt.Keystores.JKS.Password != nil && crt.Keystores.JKS.PasswordSecretRef.Name != "" {
+			el = append(el, field.Forbidden(fldPath.Child("keystores", "jks"), fmt.Sprintf(keystoresMutuallyExclusivePasswordsFmt, "JKS")))
+		}
+
+		if crt.Keystores.JKS.Password == nil && crt.Keystores.JKS.PasswordSecretRef.Name == "" {
+			el = append(el, field.Forbidden(fldPath.Child("keystores", "jks"), fmt.Sprintf(keystoresPasswordRequiredFmt, "JKS")))
+		}
+
+		if crt.Keystores.JKS.Password != nil && len(*crt.Keystores.JKS.Password) == 0 {
+			el = append(el, field.Forbidden(fldPath.Child("keystores", "jks", "password"), fmt.Sprintf(keystoresLiteralPasswordMustNotBeEmptyFmt, "JKS")))
+		}
+	}
+
+	if crt.Keystores.PKCS12 != nil {
+		if crt.Keystores.PKCS12.Password != nil && crt.Keystores.PKCS12.PasswordSecretRef.Name != "" {
+			el = append(el, field.Forbidden(fldPath.Child("keystores", "pkcs12"), fmt.Sprintf(keystoresMutuallyExclusivePasswordsFmt, "PKCS#12")))
+		}
+
+		if crt.Keystores.PKCS12.Password == nil && crt.Keystores.PKCS12.PasswordSecretRef.Name == "" {
+			el = append(el, field.Forbidden(fldPath.Child("keystores", "pkcs12"), fmt.Sprintf(keystoresPasswordRequiredFmt, "PKCS#12")))
+		}
+
+		if crt.Keystores.PKCS12.Password != nil && len(*crt.Keystores.PKCS12.Password) == 0 {
+			el = append(el, field.Forbidden(fldPath.Child("keystores", "pkcs12", "password"), fmt.Sprintf(keystoresLiteralPasswordMustNotBeEmptyFmt, "PKCS#12")))
+		}
+	}
+
+	return el
+}
+
+func validateCertificateRenewal(crt *internalcmapi.CertificateSpec, fldPath *field.Path) field.ErrorList {
+	var el field.ErrorList
+	switch crt.Renewal.Policy {
+	case internalcmapi.RenewBefore:
+	case internalcmapi.Disabled:
+		if len(crt.Renewal.Windows) > 0 {
+			el = append(el, field.Forbidden(fldPath.Child("renewal", "windows"), "windows cannot be set when `renewal.policy` is set to Disabled"))
+		}
+		return el
+	default:
+		el = append(el, field.NotSupported(fldPath.Child("renewal", "policy"), crt.Renewal.Policy, []string{string(internalcmapi.Disabled), string(internalcmapi.RenewBefore)}))
+	}
+
+	if crt.Renewal.Windows != nil {
+		for i, window := range crt.Renewal.Windows {
+			el = append(el, validateCertificateRenewalWindows(window, fldPath.Child("renewal", "windows").Index(i))...)
+		}
+	}
+
+	return el
+}
+
+func validateCertificateRenewalWindows(window internalcmapi.CertificateRenewalWindows, fldPath *field.Path) field.ErrorList {
+	var el field.ErrorList
+
+	if window.WindowDuration == nil {
+		el = append(el, field.Required(fldPath.Child("windowDuration"), "windowDuration must be specified and should be greater than 0"))
+	}
+
+	if _, err := time.LoadLocation(window.Timezone); err != nil && window.Timezone != "" {
+		el = append(el, field.Invalid(fldPath.Child("timezone"), window.Timezone, "invalid value for timezone. timezone must be IANA compliant"))
+	}
+
+	if _, err := utilpkg.CronParse(window.Cron, window.Timezone); err != nil {
+		el = append(el, field.Invalid(fldPath.Child("cron"), window.Cron, fmt.Sprintf("invalid cron syntax: %s. cron needs to follow: cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow", err.Error())))
 	}
 
 	return el

@@ -18,18 +18,17 @@ package internal
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/x509"
 	"fmt"
 	"testing"
 
-	fuzz "github.com/google/gofuzz"
 	jks "github.com/pavlo-v-chernykh/keystore-go/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
+	"sigs.k8s.io/randfill"
 	"software.sslmate.com/src/go-pkcs12"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -48,15 +47,13 @@ func mustGeneratePrivateKey(t *testing.T, encoding cmapi.PrivateKeyEncoding) []b
 	return pkBytes
 }
 
-func mustSelfSignCertificate(t *testing.T, pkBytes []byte) []byte {
-	if pkBytes == nil {
-		pkBytes = mustGeneratePrivateKey(t, cmapi.PKCS8)
-	}
+func mustSelfSignCertificate(t *testing.T) []byte {
+	pkBytes := mustGeneratePrivateKey(t, cmapi.PKCS8)
 	pk, err := pki.DecodePrivateKeyBytes(pkBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	x509Crt, err := pki.GenerateTemplate(&cmapi.Certificate{
+	x509Crt, err := pki.CertificateTemplateFromCertificate(&cmapi.Certificate{
 		Spec: cmapi.CertificateSpec{
 			DNSNames: []string{"example.com"},
 		},
@@ -69,6 +66,14 @@ func mustSelfSignCertificate(t *testing.T, pkBytes []byte) []byte {
 		t.Fatal(err)
 	}
 	return certBytes
+}
+
+func mustSelfSignCertificates(t *testing.T, count int) []byte {
+	var buf bytes.Buffer
+	for range count {
+		buf.Write(mustSelfSignCertificate(t))
+	}
+	return buf.Bytes()
 }
 
 type keyAndCert struct {
@@ -84,7 +89,7 @@ func mustCert(t *testing.T, commonName string, isCA bool) *keyAndCert {
 	keyPEM, err := pki.EncodePrivateKey(key, cmapi.PKCS8)
 	require.NoError(t, err)
 
-	cert, err := pki.GenerateTemplate(&cmapi.Certificate{
+	cert, err := pki.CertificateTemplateFromCertificate(&cmapi.Certificate{
 		Spec: cmapi.CertificateSpec{
 			CommonName: commonName,
 			IsCA:       isCA,
@@ -149,13 +154,15 @@ func mustLeafWithChain(t *testing.T) leafWithChain {
 func TestEncodeJKSKeystore(t *testing.T) {
 	tests := map[string]struct {
 		password               string
+		alias                  string
 		rawKey, certPEM, caPEM []byte
 		verify                 func(t *testing.T, out []byte, err error)
 	}{
 		"encode a JKS bundle for a PKCS1 key and certificate only": {
 			password: "password",
+			alias:    "alias",
 			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS1),
-			certPEM:  mustSelfSignCertificate(t, nil),
+			certPEM:  mustSelfSignCertificate(t),
 			verify: func(t *testing.T, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -169,7 +176,7 @@ func TestEncodeJKSKeystore(t *testing.T) {
 					return
 				}
 
-				if !ks.IsPrivateKeyEntry("certificate") {
+				if !ks.IsPrivateKeyEntry("alias") {
 					t.Errorf("no certificate data found in keystore")
 				}
 
@@ -180,8 +187,9 @@ func TestEncodeJKSKeystore(t *testing.T) {
 		},
 		"encode a JKS bundle for a PKCS8 key and certificate only": {
 			password: "password",
+			alias:    "alias",
 			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS8),
-			certPEM:  mustSelfSignCertificate(t, nil),
+			certPEM:  mustSelfSignCertificate(t),
 			verify: func(t *testing.T, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -193,7 +201,7 @@ func TestEncodeJKSKeystore(t *testing.T) {
 					t.Errorf("error decoding keystore: %v", err)
 					return
 				}
-				if !ks.IsPrivateKeyEntry("certificate") {
+				if !ks.IsPrivateKeyEntry("alias") {
 					t.Errorf("no certificate data found in keystore")
 				}
 
@@ -204,9 +212,10 @@ func TestEncodeJKSKeystore(t *testing.T) {
 		},
 		"encode a JKS bundle for a key, certificate and ca": {
 			password: "password",
+			alias:    "alias",
 			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS8),
-			certPEM:  mustSelfSignCertificate(t, nil),
-			caPEM:    mustSelfSignCertificate(t, nil),
+			certPEM:  mustSelfSignCertificate(t),
+			caPEM:    mustSelfSignCertificate(t),
 			verify: func(t *testing.T, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -218,7 +227,7 @@ func TestEncodeJKSKeystore(t *testing.T) {
 					t.Errorf("error decoding keystore: %v", err)
 					return
 				}
-				if !ks.IsPrivateKeyEntry("certificate") {
+				if !ks.IsPrivateKeyEntry("alias") {
 					t.Errorf("no certificate data found in keystore")
 				}
 				if !ks.IsTrustedCertificateEntry("ca") {
@@ -226,10 +235,109 @@ func TestEncodeJKSKeystore(t *testing.T) {
 				}
 			},
 		},
+		"encode a JKS bundle for a key, certificate and multiple cas": {
+			password: "password",
+			alias:    "alias",
+			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS8),
+			certPEM:  mustSelfSignCertificate(t),
+			caPEM:    mustSelfSignCertificates(t, 3),
+			verify: func(t *testing.T, out []byte, err error) {
+				if err != nil {
+					t.Errorf("expected no error but got: %v", err)
+				}
+				buf := bytes.NewBuffer(out)
+				ks := jks.New()
+				err = ks.Load(buf, []byte("password"))
+				if err != nil {
+					t.Errorf("error decoding keystore: %v", err)
+					return
+				}
+				if !ks.IsPrivateKeyEntry("alias") {
+					t.Errorf("no certificate data found in keystore")
+				}
+				if !ks.IsTrustedCertificateEntry("ca") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if !ks.IsTrustedCertificateEntry("ca-1") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if !ks.IsTrustedCertificateEntry("ca-2") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if len(ks.Aliases()) != 4 {
+					t.Errorf("expected 4 aliases in keystore, got %d", len(ks.Aliases()))
+				}
+			},
+		},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			out, err := encodeJKSKeystore([]byte(test.password), test.rawKey, test.certPEM, test.caPEM)
+			out, err := encodeJKSKeystore([]byte(test.password), test.alias, test.rawKey, test.certPEM, test.caPEM)
+			test.verify(t, out, err)
+		})
+	}
+}
+
+func TestEncodeJKSTruststore(t *testing.T) {
+	tests := map[string]struct {
+		password string
+		caCount  int
+		verify   func(t *testing.T, out []byte, err error)
+	}{
+		"encode a JKS truststore for a single ca": {
+			password: "password",
+			caCount:  1,
+			verify: func(t *testing.T, out []byte, err error) {
+				if err != nil {
+					t.Errorf("expected no error but got: %v", err)
+				}
+				buf := bytes.NewBuffer(out)
+				ks := jks.New()
+				err = ks.Load(buf, []byte("password"))
+				if err != nil {
+					t.Errorf("error decoding keystore: %v", err)
+					return
+				}
+				if !ks.IsTrustedCertificateEntry("ca") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if len(ks.Aliases()) != 1 {
+					t.Errorf("expected 1 alias in keystore, got %d", len(ks.Aliases()))
+				}
+			},
+		},
+		"encode a JKS truststore for multiple cas": {
+			password: "password",
+			caCount:  3,
+			verify: func(t *testing.T, out []byte, err error) {
+				if err != nil {
+					t.Errorf("expected no error but got: %v", err)
+				}
+				buf := bytes.NewBuffer(out)
+				ks := jks.New()
+				err = ks.Load(buf, []byte("password"))
+				if err != nil {
+					t.Errorf("error decoding keystore: %v", err)
+					return
+				}
+				if !ks.IsTrustedCertificateEntry("ca") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if !ks.IsTrustedCertificateEntry("ca-1") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if !ks.IsTrustedCertificateEntry("ca-2") {
+					t.Errorf("no ca data found in truststore")
+				}
+				if len(ks.Aliases()) != 3 {
+					t.Errorf("expected 3 aliases in keystore, got %d", len(ks.Aliases()))
+				}
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			out, err := encodeJKSTruststore([]byte(test.password), mustSelfSignCertificates(t, test.caCount))
 			test.verify(t, out, err)
 		})
 	}
@@ -245,7 +353,7 @@ func TestEncodePKCS12Keystore(t *testing.T) {
 		"encode a JKS bundle for a PKCS1 key and certificate only": {
 			password: "password",
 			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS1),
-			certPEM:  mustSelfSignCertificate(t, nil),
+			certPEM:  mustSelfSignCertificate(t),
 			verify: func(t *testing.T, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -266,7 +374,7 @@ func TestEncodePKCS12Keystore(t *testing.T) {
 		"encode a JKS bundle for a PKCS8 key and certificate only": {
 			password: "password",
 			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS8),
-			certPEM:  mustSelfSignCertificate(t, nil),
+			certPEM:  mustSelfSignCertificate(t),
 			verify: func(t *testing.T, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -287,8 +395,8 @@ func TestEncodePKCS12Keystore(t *testing.T) {
 		"encode a JKS bundle for a key, certificate and ca": {
 			password: "password",
 			rawKey:   mustGeneratePrivateKey(t, cmapi.PKCS8),
-			certPEM:  mustSelfSignCertificate(t, nil),
-			caPEM:    mustSelfSignCertificate(t, nil),
+			certPEM:  mustSelfSignCertificate(t),
+			caPEM:    mustSelfSignCertificate(t),
 			verify: func(t *testing.T, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -312,8 +420,10 @@ func TestEncodePKCS12Keystore(t *testing.T) {
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			out, err := encodePKCS12Keystore(test.password, test.rawKey, test.certPEM, test.caPEM)
-			test.verify(t, out, err)
+			for _, profile := range []cmapi.PKCS12Profile{"", cmapi.LegacyRC2PKCS12Profile, cmapi.LegacyDESPKCS12Profile, cmapi.Modern2023PKCS12Profile, cmapi.Modern2026PKCS12Profile} {
+				out, err := encodePKCS12Keystore(profile, test.password, test.rawKey, test.certPEM, test.caPEM)
+				test.verify(t, out, err)
+			}
 		})
 	}
 	t.Run("encodePKCS12Keystore encodes non-leaf certificates to the CA certificate chain, even when the supplied CA chain is empty", func(t *testing.T) {
@@ -321,36 +431,40 @@ func TestEncodePKCS12Keystore(t *testing.T) {
 		var emptyCAChain []byte = nil
 
 		chain := mustLeafWithChain(t)
-		out, err := encodePKCS12Keystore(password, chain.leaf.keyPEM, chain.all.certsToPEM(), emptyCAChain)
-		require.NoError(t, err)
+		for _, profile := range []cmapi.PKCS12Profile{"", cmapi.LegacyRC2PKCS12Profile, cmapi.LegacyDESPKCS12Profile, cmapi.Modern2023PKCS12Profile, cmapi.Modern2026PKCS12Profile} {
+			out, err := encodePKCS12Keystore(profile, password, chain.leaf.keyPEM, chain.all.certsToPEM(), emptyCAChain)
+			require.NoError(t, err)
 
-		pkOut, certOut, caChain, err := pkcs12.DecodeChain(out, password)
-		require.NoError(t, err)
-		assert.NotNil(t, pkOut)
-		assert.Equal(t, chain.leaf.cert.Signature, certOut.Signature, "leaf certificate signature does not match")
-		if assert.Len(t, caChain, 2, "caChain should contain 2 items: intermediate certificate and top-level certificate") {
-			assert.Equal(t, chain.cas[0].cert.Signature, caChain[0].Signature, "intermediate certificate signature does not match")
-			assert.Equal(t, chain.cas[1].cert.Signature, caChain[1].Signature, "top-level certificate signature does not match")
+			pkOut, certOut, caChain, err := pkcs12.DecodeChain(out, password)
+			require.NoError(t, err)
+			assert.NotNil(t, pkOut)
+			assert.Equal(t, chain.leaf.cert.Signature, certOut.Signature, "leaf certificate signature does not match")
+			if assert.Len(t, caChain, 2, "caChain should contain 2 items: intermediate certificate and top-level certificate") {
+				assert.Equal(t, chain.cas[0].cert.Signature, caChain[0].Signature, "intermediate certificate signature does not match")
+				assert.Equal(t, chain.cas[1].cert.Signature, caChain[1].Signature, "top-level certificate signature does not match")
+			}
 		}
 	})
 	t.Run("encodePKCS12Keystore *prepends* non-leaf certificates to the supplied CA certificate chain", func(t *testing.T) {
 		const password = "password"
-		var caChainInPEM []byte = mustSelfSignCertificate(t, nil)
+		caChainInPEM := mustSelfSignCertificate(t)
 		caChainIn, err := pki.DecodeX509CertificateChainBytes(caChainInPEM)
 		require.NoError(t, err)
 
 		chain := mustLeafWithChain(t)
-		out, err := encodePKCS12Keystore(password, chain.leaf.keyPEM, chain.all.certsToPEM(), caChainInPEM)
-		require.NoError(t, err)
+		for _, profile := range []cmapi.PKCS12Profile{"", cmapi.LegacyRC2PKCS12Profile, cmapi.LegacyDESPKCS12Profile, cmapi.Modern2023PKCS12Profile, cmapi.Modern2026PKCS12Profile} {
+			out, err := encodePKCS12Keystore(profile, password, chain.leaf.keyPEM, chain.all.certsToPEM(), caChainInPEM)
+			require.NoError(t, err)
 
-		pkOut, certOut, caChainOut, err := pkcs12.DecodeChain(out, password)
-		require.NoError(t, err)
-		assert.NotNil(t, pkOut)
-		assert.Equal(t, chain.leaf.cert.Signature, certOut.Signature, "leaf certificate signature does not match")
-		if assert.Len(t, caChainOut, 3, "caChain should contain 3 items: intermediate certificate and top-level certificate and supplied CA") {
-			assert.Equal(t, chain.cas[0].cert.Signature, caChainOut[0].Signature, "intermediate certificate signature does not match")
-			assert.Equal(t, chain.cas[1].cert.Signature, caChainOut[1].Signature, "top-level certificate signature does not match")
-			assert.Equal(t, caChainIn, caChainOut[2:], "supplied certificate chain is not at the end of the chain")
+			pkOut, certOut, caChainOut, err := pkcs12.DecodeChain(out, password)
+			require.NoError(t, err)
+			assert.NotNil(t, pkOut)
+			assert.Equal(t, chain.leaf.cert.Signature, certOut.Signature, "leaf certificate signature does not match")
+			if assert.Len(t, caChainOut, 3, "caChain should contain 3 items: intermediate certificate and top-level certificate and supplied CA") {
+				assert.Equal(t, chain.cas[0].cert.Signature, caChainOut[0].Signature, "intermediate certificate signature does not match")
+				assert.Equal(t, chain.cas[1].cert.Signature, caChainOut[1].Signature, "top-level certificate signature does not match")
+				assert.Equal(t, caChainIn, caChainOut[2:], "supplied certificate chain is not at the end of the chain")
+			}
 		}
 	})
 }
@@ -364,7 +478,7 @@ func TestEncodePKCS12Truststore(t *testing.T) {
 	}{
 		"encode a PKCS12 bundle for a CA": {
 			password: "password",
-			caPEM:    mustSelfSignCertificate(t, nil),
+			caPEM:    mustSelfSignCertificates(t, 1),
 			verify: func(t *testing.T, caPEM []byte, out []byte, err error) {
 				if err != nil {
 					t.Errorf("expected no error but got: %v", err)
@@ -384,37 +498,56 @@ func TestEncodePKCS12Truststore(t *testing.T) {
 				}
 			},
 		},
+		"encode a PKCS12 bundle for multiple CAs": {
+			password: "password",
+			caPEM:    mustSelfSignCertificates(t, 3),
+			verify: func(t *testing.T, caPEM []byte, out []byte, err error) {
+				if err != nil {
+					t.Errorf("expected no error but got: %v", err)
+				}
+				certs, err := pkcs12.DecodeTrustStore(out, "password")
+				if err != nil {
+					t.Errorf("error decoding truststore: %v", err)
+					return
+				}
+				if certs == nil {
+					t.Errorf("no certificates found in truststore")
+				}
+				if len(certs) != 3 {
+					t.Errorf("Trusted CA certificates should include 3 entries, got %d", len(certs))
+				}
+			},
+		},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			out, err := encodePKCS12Truststore(test.password, test.caPEM)
-			test.verify(t, test.caPEM, out, err)
+			for _, profile := range []cmapi.PKCS12Profile{"", cmapi.LegacyRC2PKCS12Profile, cmapi.LegacyDESPKCS12Profile, cmapi.Modern2023PKCS12Profile, cmapi.Modern2026PKCS12Profile} {
+				out, err := encodePKCS12Truststore(profile, test.password, test.caPEM)
+				test.verify(t, test.caPEM, out, err)
+			}
 		})
 	}
 }
 
 func TestManyPasswordLengths(t *testing.T) {
 	rawKey := mustGeneratePrivateKey(t, cmapi.PKCS8)
-	certPEM := mustSelfSignCertificate(t, nil)
-	caPEM := mustSelfSignCertificate(t, nil)
-
-	const testN = 10000
+	certPEM := mustSelfSignCertificate(t)
+	caPEM := mustSelfSignCertificate(t)
 
 	// We will test random password lengths between 0 and 128 character lengths
-	f := fuzz.New().NilChance(0).NumElements(0, 128)
+	f := randfill.New().NilChance(0).NumElements(0, 128)
 	// Pre-create password test cases. This cannot be done during the test itself
 	// since the fuzzer cannot be used concurrently.
-	var passwords [testN]string
-	for testi := 0; testi < testN; testi++ {
+	var passwords [10000]string
+	for testi := range passwords {
 		// fill the password with random characters
-		f.Fuzz(&passwords[testi])
+		f.Fill(&passwords[testi]) // #nosec G602 -- indexing is safe: testi is always within [0, len(passwords))
 	}
 
 	// Run these tests in parallel
 	s := semaphore.NewWeighted(32)
-	g, ctx := errgroup.WithContext(context.Background())
-	for tests := 0; tests < testN; tests++ {
-		testi := tests
+	g, ctx := errgroup.WithContext(t.Context())
+	for _, password := range passwords {
 		if ctx.Err() != nil {
 			t.Errorf("internal error while testing JKS Keystore password lengths: %s", ctx.Err())
 			return
@@ -425,20 +558,20 @@ func TestManyPasswordLengths(t *testing.T) {
 		}
 		g.Go(func() error {
 			defer s.Release(1)
-			keystore, err := encodeJKSKeystore([]byte(passwords[testi]), rawKey, certPEM, caPEM)
+			keystore, err := encodeJKSKeystore([]byte(password), "alias", rawKey, certPEM, caPEM)
 			if err != nil {
-				t.Errorf("couldn't encode JKS Keystore with password %s (length %d): %s", passwords[testi], len(passwords[testi]), err.Error())
+				t.Errorf("couldn't encode JKS Keystore with password %s (length %d): %s", password, len(password), err.Error())
 				return err
 			}
 
 			buf := bytes.NewBuffer(keystore)
 			ks := jks.New()
-			err = ks.Load(buf, []byte(passwords[testi]))
+			err = ks.Load(buf, []byte(password))
 			if err != nil {
-				t.Errorf("error decoding keystore with password %s (length %d): %v", passwords[testi], len(passwords[testi]), err)
+				t.Errorf("error decoding keystore with password %s (length %d): %v", password, len(password), err)
 				return err
 			}
-			if !ks.IsPrivateKeyEntry("certificate") {
+			if !ks.IsPrivateKeyEntry("alias") {
 				t.Errorf("no certificate data found in keystore")
 			}
 			if !ks.IsTrustedCertificateEntry("ca") {

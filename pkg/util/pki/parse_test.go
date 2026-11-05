@@ -17,21 +17,18 @@ limitations under the License.
 package pki
 
 import (
-	"crypto"
 	"crypto/ecdsa"
-	"crypto/rand"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
-	"reflect"
+	"os"
 	"strings"
 	"testing"
-	"time"
 
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	"github.com/stretchr/testify/assert"
 )
 
 func generatePrivateKeyBytes(keyAlgo v1.PrivateKeyAlgorithm, keySize int) ([]byte, error) {
@@ -50,6 +47,69 @@ func generatePKCS8PrivateKey(keyAlgo v1.PrivateKeyAlgorithm, keySize int) ([]byt
 		return nil, err
 	}
 	return EncodePKCS8PrivateKey(privateKey)
+}
+
+func TestDecodeX509CertificateSetBytes(t *testing.T) {
+	certBytes := mustCreateBundle(t, nil, "test").pem
+
+	keyBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("dummy")})
+
+	// A bundle containing a valid certificate followed by a non-certificate
+	// PEM block, e.g. a combined cert+key file.
+	certAndKeyBytes := append(append([]byte{}, certBytes...), keyBytes...)
+
+	_, err := DecodeX509CertificateSetBytes(certAndKeyBytes)
+	if err == nil {
+		t.Fatal("expected an error decoding a bundle containing a non-certificate PEM block, got none")
+	}
+
+	expectErrStr := `expected a "CERTIFICATE" block, found "RSA PRIVATE KEY"`
+	if !strings.Contains(err.Error(), expectErrStr) {
+		t.Errorf("expected err string to match: '%s', got: '%s'", expectErrStr, err.Error())
+	}
+
+	certs, err := DecodeX509CertificateSetBytes(certBytes)
+	if err != nil {
+		t.Fatalf("unexpected error decoding a valid certificate: %s", err)
+	}
+	if len(certs) != 1 {
+		t.Errorf("expected 1 certificate, got %d", len(certs))
+	}
+}
+
+func TestDecodeX509CertificateRequestBytes(t *testing.T) {
+	pk, err := GenerateECPrivateKey(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	csrDER, err := EncodeCSR(&x509.CertificateRequest{Subject: pkix.Name{CommonName: "test"}}, pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+	csr, err := DecodeX509CertificateRequestBytes(csrBytes)
+	if err != nil {
+		t.Fatalf("unexpected error decoding a valid CSR: %s", err)
+	}
+	if csr.Subject.CommonName != "test" {
+		t.Errorf("expected common name %q, got %q", "test", csr.Subject.CommonName)
+	}
+
+	// A PEM block that isn't labelled as a certificate request, e.g. a
+	// certificate mistakenly passed as spec.request.
+	nonCSRBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("dummy")})
+
+	_, err = DecodeX509CertificateRequestBytes(nonCSRBytes)
+	if err == nil {
+		t.Fatal("expected an error decoding a non-CSR PEM block, got none")
+	}
+
+	expectErrStr := `expected a "CERTIFICATE REQUEST" block, found "CERTIFICATE"`
+	if !strings.Contains(err.Error(), expectErrStr) {
+		t.Errorf("expected err string to match: '%s', got: '%s'", expectErrStr, err.Error())
+	}
 }
 
 func TestDecodePrivateKeyBytes(t *testing.T) {
@@ -85,7 +145,17 @@ func TestDecodePrivateKeyBytes(t *testing.T) {
 		return
 	}
 
-	block := &pem.Block{Type: "BLAH BLAH BLAH", Bytes: []byte("blahblahblah")}
+	// openssl ecparams option writes a leading "EC PARAMETERS" block holding the OID for curve prime256v1 (OID is 1.2.840.10045.3.1.7)
+	ecParamsDER, err := asn1.Marshal(asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7})
+	if err != nil {
+		t.Errorf("error marshalling EC parameters: %s", err)
+		return
+	}
+	ecParamsBytes := pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: ecParamsDER})
+	// This will generate a copy of private key with EC PARAMS
+	ecdsaKeyWithParamsBytes := append(append([]byte{}, ecParamsBytes...), ecdsaKeyBytes...)
+
+	block := &pem.Block{Type: "BLAHBLAHBLAH", Bytes: []byte("blahblahblah")}
 	blahKeyBytes := pem.EncodeToMemory(block)
 
 	privateKeyBlock := &pem.Block{Type: "PRIVATE KEY", Bytes: []byte("blahblahblah")}
@@ -136,6 +206,18 @@ func TestDecodePrivateKeyBytes(t *testing.T) {
 			expectErr:    true,
 			expectErrStr: "error decoding private key PEM block",
 		},
+		{
+			name:      "decode ecdsa private key preceded by an EC PARAMETERS block",
+			keyBytes:  ecdsaKeyWithParamsBytes,
+			keyAlgo:   v1.ECDSAKeyAlgorithm,
+			expectErr: false,
+		},
+		{
+			name:         "fail to decode an EC PARAMETERS block with no key following it",
+			keyBytes:     ecParamsBytes,
+			expectErr:    true,
+			expectErrStr: "error decoding private key PEM block",
+		},
 	}
 
 	testFn := func(test testT) func(*testing.T) {
@@ -183,274 +265,82 @@ func TestDecodePrivateKeyBytes(t *testing.T) {
 	}
 }
 
-type testBundle struct {
-	cert *x509.Certificate
-	pem  []byte
-	pk   crypto.PrivateKey
-}
-
-func mustCreateBundle(t *testing.T, issuer *testBundle, name string) *testBundle {
-	pk, err := GenerateECPrivateKey(256)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	template := &x509.Certificate{
-		Version:               3,
-		BasicConstraintsValid: true,
-		SerialNumber:          serialNumber,
-		PublicKeyAlgorithm:    x509.ECDSA,
-		PublicKey:             pk.Public(),
-		IsCA:                  true,
-		Subject: pkix.Name{
-			CommonName: name,
-		},
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(time.Minute),
-		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-	}
-
-	var (
-		issuerKey  crypto.PrivateKey
-		issuerCert *x509.Certificate
-	)
-
-	if issuer == nil {
-		// No issuer implies the cert should be self signed
-		issuerKey = pk
-		issuerCert = template
-	} else {
-		issuerKey = issuer.pk
-		issuerCert = issuer.cert
-	}
-
-	certPEM, cert, err := SignCertificate(template, issuerCert, pk.Public(), issuerKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return &testBundle{pem: certPEM, cert: cert, pk: pk}
-}
-
-func joinPEM(first []byte, rest ...[]byte) []byte {
-	for _, b := range rest {
-		first = append(first, b...)
-	}
-
-	return first
-}
-
-func TestParseSingleCertificateChain(t *testing.T) {
-	root := mustCreateBundle(t, nil, "root")
-	intA1 := mustCreateBundle(t, root, "intA-1")
-	intA2 := mustCreateBundle(t, intA1, "intA-2")
-	intB1 := mustCreateBundle(t, root, "intB-1")
-	intB2 := mustCreateBundle(t, intB1, "intB-2")
-	leaf := mustCreateBundle(t, intA2, "leaf")
-	leafInterCN := mustCreateBundle(t, intA2, intA2.cert.Subject.CommonName)
-	random := mustCreateBundle(t, nil, "random")
-
-	tests := map[string]struct {
-		inputBundle  []byte
-		expPEMBundle PEMBundle
-		expErr       bool
+func TestDecodeMLDSAPrivateKeyPEM(t *testing.T) {
+	tests := []struct {
+		name   string
+		params mldsa.Parameters
 	}{
-		"if two certificate chain passed in order, should return single ca and certificate": {
-			inputBundle:  joinPEM(intA1.pem, root.pem),
-			expPEMBundle: PEMBundle{ChainPEM: intA1.pem, CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if two certificate chain passed with leaf and intermediate, should return both certs in chain with intermediate as CA": {
-			inputBundle:  joinPEM(leaf.pem, intA2.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem, intA2.pem), CAPEM: intA2.pem},
-			expErr:       false,
-		},
-		"if two certificate chain passed out of order, should return single ca and certificate": {
-			inputBundle:  joinPEM(root.pem, intA1.pem),
-			expPEMBundle: PEMBundle{ChainPEM: intA1.pem, CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if 3 certificate chain passed out of order, should return single ca and chain in order": {
-			inputBundle:  joinPEM(root.pem, intA2.pem, intA1.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"empty entries should be ignored, and return ca and certificate": {
-			inputBundle:  joinPEM(root.pem, intA2.pem, []byte("\n#foo\n  \n"), intA1.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if 4 certificate chain passed in order, should return single ca and chain in order": {
-			inputBundle:  joinPEM(leaf.pem, intA1.pem, intA2.pem, root.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem, intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if certificate chain has two certs with the same CN, shouldn't affect output": {
-			// see https://github.com/cert-manager/cert-manager/issues/4142
-			inputBundle:  joinPEM(leafInterCN.pem, intA1.pem, intA2.pem, root.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leafInterCN.pem, intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if 4 certificate chain passed out of order, should return single ca and chain in order": {
-			inputBundle:  joinPEM(root.pem, intA1.pem, leaf.pem, intA2.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem, intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if 3 certificate chain but has break in the chain, should return error": {
-			inputBundle:  joinPEM(root.pem, intA1.pem, leaf.pem),
-			expPEMBundle: PEMBundle{},
-			expErr:       true,
-		},
-		"if 4 certificate chain but also random certificate, should return error": {
-			inputBundle:  joinPEM(root.pem, intA1.pem, leaf.pem, intA2.pem, random.pem),
-			expPEMBundle: PEMBundle{},
-			expErr:       true,
-		},
-		"if 6 certificate chain but some are duplicates, duplicates should be removed and return single ca with chain": {
-			inputBundle:  joinPEM(intA2.pem, intA1.pem, root.pem, leaf.pem, intA1.pem, root.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem, intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if 6 certificate chain in different configuration but some are duplicates, duplicates should be removed and return single ca with chain": {
-			inputBundle:  joinPEM(root.pem, intA1.pem, intA2.pem, leaf.pem, root.pem, intA1.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem, intA2.pem, intA1.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
-		"if certificate chain contains branches, then should error": {
-			inputBundle:  joinPEM(root.pem, intA1.pem, intA2.pem, intB1.pem, intB2.pem),
-			expPEMBundle: PEMBundle{},
-			expErr:       true,
-		},
-		"if certificate chain does not have a root ca, should append all intermediates to ChainPEM and use the root-most cert as CAPEM": {
-			inputBundle:  joinPEM(intA1.pem, intA2.pem, leaf.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem, intA2.pem, intA1.pem), CAPEM: intA1.pem},
-			expErr:       false,
-		},
-		"if only a single leaf certificate was parsed, ChainPEM should contain a single leaf certificate and CAPEM should remain empty": {
-			inputBundle:  joinPEM(leaf.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(leaf.pem), CAPEM: nil},
-			expErr:       false,
-		},
-		"if only a single intermediate certificate was parsed, ChainPEM should contain a single intermediate certificate and CAPEM should remain empty": {
-			inputBundle:  joinPEM(intA1.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(intA1.pem), CAPEM: nil},
-			expErr:       false,
-		},
-		"if only a single root certificate was parsed, ChainPEM should contain a single root certificate and CAPEM should also contain that root": {
-			inputBundle:  joinPEM(root.pem),
-			expPEMBundle: PEMBundle{ChainPEM: joinPEM(root.pem), CAPEM: root.pem},
-			expErr:       false,
-		},
+		{name: "MLDSA44", params: mldsa.MLDSA44()},
+		{name: "MLDSA65", params: mldsa.MLDSA65()},
+		{name: "MLDSA87", params: mldsa.MLDSA87()},
 	}
 
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			bundle, err := ParseSingleCertificateChainPEM(test.inputBundle)
-			if (err != nil) != test.expErr {
-				t.Errorf("unexpected error, exp=%t got=%v",
-					test.expErr, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sk, err := mldsa.GenerateKey(tt.params)
+			if err != nil {
+				t.Fatalf("failed to generate %s key: %v", tt.name, err)
 			}
 
-			if !reflect.DeepEqual(bundle, test.expPEMBundle) {
-				t.Errorf("unexpected pem bundle, exp=%+s got=%+s",
-					test.expPEMBundle, bundle)
+			pemBytes, err := EncodePKCS8PrivateKey(sk)
+			if err != nil {
+				t.Fatalf("failed to encode %s key: %v", tt.name, err)
+			}
+
+			decoded, err := DecodePrivateKeyBytes(pemBytes)
+			if err != nil {
+				t.Fatalf("failed to decode %s key: %v", tt.name, err)
+			}
+
+			mldsaKey, ok := decoded.(*mldsa.PrivateKey)
+			if !ok {
+				t.Fatalf("decoded key is not *mldsa.PrivateKey, got %T", decoded)
+			}
+
+			if mldsaKey.PublicKey().Parameters() != tt.params {
+				t.Fatalf("decoded key parameters mismatch: got %s, want %s", mldsaKey.PublicKey().Parameters(), tt.params)
 			}
 		})
 	}
 }
 
-func TestMustParseRDN(t *testing.T) {
-	subject := "SERIALNUMBER=42, L=some-locality, ST=some-state-or-province, STREET=some-street, CN=foo-long.com, OU=FooLong, OU=Barq, OU=Baz, OU=Dept., O=Corp., C=US"
-	rdnSeq, err := ParseSubjectStringToRdnSequence(subject)
-	if err != nil {
-		t.Fatal(err)
+// TestDecodeOpenSSLMLDSAPrivateKeyPEM checks the errors returned for ML-DSA
+// private keys in formats that Go doesn't support. OpenSSL 3.5+ writes the
+// "both" (seed and expanded key) format by default. The expected messages come
+// from the standard library; if this test fails, Go's behaviour has changed and
+// the documentation for these formats needs updating.
+func TestDecodeOpenSSLMLDSAPrivateKeyPEM(t *testing.T) {
+	tests := []struct {
+		file   string
+		errStr string
+	}{
+		{
+			// Generated with: openssl genpkey -algorithm ML-DSA-44
+			file:   "testdata/mldsa44-openssl-both.pem",
+			errStr: `x509: ML-DSA private keys with both seed and expanded key are not supported, use e.g. "openssl pkey -provparam ml-dsa.output_formats=seed-only" to convert to a seed-only key`,
+		},
+		{
+			// Generated with: openssl pkey -provparam ml-dsa.output_formats=priv-only
+			file:   "testdata/mldsa44-openssl-expanded.pem",
+			errStr: "x509: semi-expanded ML-DSA private keys without seed are not supported",
+		},
 	}
 
-	expectedRdnSeq :=
-		pkix.RDNSequence{
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.Country, Value: "US"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.Organization, Value: "Corp."},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "Dept."},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "Baz"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "Barq"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "FooLong"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.CommonName, Value: "foo-long.com"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.StreetAddress, Value: "some-street"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.Province, Value: "some-state-or-province"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.Locality, Value: "some-locality"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.SerialNumber, Value: "42"},
-			},
-		}
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			keyPEM, err := os.ReadFile(tt.file)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	assert.Equal(t, expectedRdnSeq, rdnSeq)
-}
+			_, err = DecodePrivateKeyBytes(keyPEM)
+			if err == nil {
+				t.Fatal("expected an error, but got none")
+			}
 
-func TestMustKeepOrderInRawDerBytes(t *testing.T) {
-	subject := "CN=foo-long.com,OU=FooLong,OU=Barq,OU=Baz,OU=Dept.,O=Corp.,C=US"
-	bytes, err := ParseSubjectStringToRawDerBytes(subject)
-	if err != nil {
-		t.Fatal(err)
+			if !strings.Contains(err.Error(), tt.errStr) {
+				t.Errorf("expected error to contain %q, got %q", tt.errStr, err.Error())
+			}
+		})
 	}
-
-	var rdnSeq pkix.RDNSequence
-	_, err2 := asn1.Unmarshal(bytes, &rdnSeq)
-	if err2 != nil {
-		t.Fatal(err2)
-	}
-
-	t.Log(bytes)
-
-	expectedRdnSeq :=
-		pkix.RDNSequence{
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.Country, Value: "US"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.Organization, Value: "Corp."},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "Dept."},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "Baz"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "Barq"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.OrganizationalUnit, Value: "FooLong"},
-			},
-			[]pkix.AttributeTypeAndValue{
-				{Type: OIDConstants.CommonName, Value: "foo-long.com"},
-			},
-		}
-
-	assert.Equal(t, expectedRdnSeq, rdnSeq)
-	assert.Equal(t, subject, rdnSeq.String())
 }

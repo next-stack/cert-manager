@@ -40,21 +40,21 @@ type solverFixture struct {
 	// This is useful if you want to load the clientset with some resources *after* the
 	// fixture has been created.
 	PreFn func(*testing.T, *solverFixture)
-	// CheckFn should performs checks to ensure the output of the test is as expected.
+	// CheckFn should perform checks to ensure the output of the test is as expected.
 	// Optional additional values may be provided, which represent the output of the
 	// function under test.
-	CheckFn func(*testing.T, *solverFixture, ...interface{})
+	CheckFn func(*testing.T, *solverFixture, ...any)
 	// Err should be true if an error is expected from the function under test
 	Err bool
 
 	// testResources is used to store references to resources used or created during
 	// the test.
-	testResources map[string]interface{}
+	testResources map[string]any
 }
 
 func (s *solverFixture) Setup(t *testing.T) {
 	if s.testResources == nil {
-		s.testResources = map[string]interface{}{}
+		s.testResources = map[string]any{}
 	}
 	if s.Builder == nil {
 		s.Builder = &test.Builder{}
@@ -74,7 +74,7 @@ func (s *solverFixture) Setup(t *testing.T) {
 	}
 }
 
-func (s *solverFixture) Finish(t *testing.T, args ...interface{}) {
+func (s *solverFixture) Finish(t *testing.T, args ...any) {
 	defer s.Builder.Stop()
 	// resync listers before running checks
 	s.Builder.Sync()
@@ -92,8 +92,4 @@ func buildFakeSolver(b *test.Builder) (*Solver, error) {
 	}
 	b.Start()
 	return s, nil
-}
-
-func strPtr(s string) *string {
-	return &s
 }

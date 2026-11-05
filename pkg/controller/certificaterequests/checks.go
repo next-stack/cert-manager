@@ -20,19 +20,14 @@ import (
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
 
-func (c *Controller) handleGenericIssuer(obj interface{}) {
+func (c *Controller) handleGenericIssuer(iss cmapi.GenericIssuer) {
 	log := c.log.WithName("handleGenericIssuer")
-
-	iss, ok := obj.(cmapi.GenericIssuer)
-	if !ok {
-		log.Error(nil, "object does not implement GenericIssuer")
-		return
-	}
 
 	log = logf.WithResource(log, iss)
 	crs, err := c.certificatesRequestsForGenericIssuer(iss)
@@ -41,13 +36,10 @@ func (c *Controller) handleGenericIssuer(obj interface{}) {
 		return
 	}
 	for _, cr := range crs {
-		log := logf.WithRelatedResource(log, cr)
-		key, err := keyFunc(cr)
-		if err != nil {
-			log.Error(err, "error computing key for resource")
-			continue
-		}
-		c.queue.Add(key)
+		c.queue.Add(types.NamespacedName{
+			Name:      cr.Name,
+			Namespace: cr.Namespace,
+		})
 	}
 }
 
@@ -55,7 +47,7 @@ func (c *Controller) certificatesRequestsForGenericIssuer(iss cmapi.GenericIssue
 	crts, err := c.certificateRequestLister.List(labels.NewSelector())
 
 	if err != nil {
-		return nil, fmt.Errorf("error listing certificates: %s", err.Error())
+		return nil, fmt.Errorf("error listing certificate requests: %w", err)
 	}
 
 	_, isClusterIssuer := iss.(*cmapi.ClusterIssuer)
@@ -66,11 +58,11 @@ func (c *Controller) certificatesRequestsForGenericIssuer(iss cmapi.GenericIssue
 			continue
 		}
 		if !isClusterIssuer {
-			if crt.Namespace != iss.GetObjectMeta().Namespace {
+			if crt.Namespace != iss.GetNamespace() {
 				continue
 			}
 		}
-		if crt.Spec.IssuerRef.Name != iss.GetObjectMeta().Name {
+		if crt.Spec.IssuerRef.Name != iss.GetName() {
 			continue
 		}
 		affected = append(affected, crt)

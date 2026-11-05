@@ -17,31 +17,29 @@ limitations under the License.
 package scheduler
 
 import (
-	"context"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/util/rand"
 
+	"github.com/cert-manager/cert-manager/internal/test/testutil"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	"github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/fake"
 	cminformers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
-	"github.com/cert-manager/cert-manager/pkg/util"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
 
 const maxConcurrentChallenges = 60
 
-func randomChallenge(rand int) *cmacme.Challenge {
-	if rand == 0 {
-		rand = 10
+func randomChallenge(dnsNamelength int) *cmacme.Challenge {
+	if dnsNamelength == 0 {
+		dnsNamelength = 10
 	}
-	return gen.Challenge("test-"+util.RandStringRunes(10),
-		gen.SetChallengeDNSName(util.RandStringRunes(rand)),
+	return gen.Challenge("test-"+rand.String(10),
+		gen.SetChallengeDNSName(rand.String(dnsNamelength)),
 		gen.SetChallengeType(cmacme.ACMEChallengeTypeHTTP01))
 }
 
@@ -81,9 +79,8 @@ func BenchmarkScheduleAscending(b *testing.B) {
 			chs := ascendingChallengeN(c)
 			s := &Scheduler{}
 			b.ResetTimer()
-			for n := 0; n < b.N; n++ {
-				_, err := s.scheduleN(30, chs)
-				require.NoError(b, err)
+			for range b.N {
+				_ = s.scheduleN(30, chs)
 			}
 		})
 	}
@@ -96,9 +93,8 @@ func BenchmarkScheduleRandom(b *testing.B) {
 			chs := randomChallengeN(c, 0)
 			s := &Scheduler{}
 			b.ResetTimer()
-			for n := 0; n < b.N; n++ {
-				_, err := s.scheduleN(30, chs)
-				require.NoError(b, err)
+			for range b.N {
+				_ = s.scheduleN(30, chs)
 			}
 		})
 	}
@@ -111,9 +107,8 @@ func BenchmarkScheduleDuplicates(b *testing.B) {
 			chs := randomChallengeN(c, 3)
 			s := &Scheduler{}
 			b.ResetTimer()
-			for n := 0; n < b.N; n++ {
-				_, err := s.scheduleN(30, chs)
-				require.NoError(b, err)
+			for range b.N {
+				_ = s.scheduleN(30, chs)
 			}
 		})
 	}
@@ -146,7 +141,7 @@ func TestScheduleN(t *testing.T) {
 			expected:   ascendingChallengeN(maxConcurrentChallenges),
 		},
 		{
-			name:       "schedule no new if current number is higher than MaxConcurrentChallenges",
+			name:       "schedule no new if current number is greater than MaxConcurrentChallenges",
 			n:          maxConcurrentChallenges,
 			challenges: ascendingChallengeN(maxConcurrentChallenges * 4),
 			expected:   ascendingChallengeN(maxConcurrentChallenges),
@@ -311,7 +306,7 @@ func TestScheduleN(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cl := fake.NewSimpleClientset()
+			cl := fake.NewClientset()
 			factory := cminformers.NewSharedInformerFactory(cl, 0)
 			challengesInformer := factory.Acme().V1().Challenges()
 			for _, ch := range test.challenges {
@@ -319,7 +314,7 @@ func TestScheduleN(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			s := New(context.Background(), challengesInformer.Lister(), maxConcurrentChallenges)
+			s := New(t.Context(), challengesInformer.Lister(), maxConcurrentChallenges)
 
 			if test.expected == nil {
 				test.expected = []*cmacme.Challenge{}
@@ -331,9 +326,7 @@ func TestScheduleN(t *testing.T) {
 			if err == nil && test.err {
 				t.Errorf("expected to get an error, but got none")
 			}
-			if !reflect.DeepEqual(chs, test.expected) {
-				t.Errorf("expected did not match actual: %v", diff.ObjectDiff(test.expected, chs))
-			}
+			testutil.AssertEqual(t, test.expected, chs)
 		})
 	}
 }

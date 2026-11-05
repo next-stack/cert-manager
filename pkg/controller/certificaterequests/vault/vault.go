@@ -20,8 +20,8 @@ import (
 	"context"
 
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
-	corelisters "k8s.io/client-go/listers/core/v1"
 
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	vaultinternal "github.com/cert-manager/cert-manager/internal/vault"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -30,6 +30,7 @@ import (
 	crutil "github.com/cert-manager/cert-manager/pkg/controller/certificaterequests/util"
 	"github.com/cert-manager/cert-manager/pkg/issuer"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
+	cmerrors "github.com/cert-manager/cert-manager/pkg/util/errors"
 )
 
 const (
@@ -41,7 +42,8 @@ const (
 // pkg/controller/certificaterequests.Issuer interface.
 type Vault struct {
 	issuerOptions controllerpkg.IssuerOptions
-	secretsLister corelisters.SecretLister
+	createTokenFn func(ns string) vaultinternal.CreateToken
+	secretsLister internalinformers.SecretLister
 	reporter      *crutil.Reporter
 
 	vaultClientBuilder vaultinternal.ClientBuilder
@@ -59,8 +61,11 @@ func init() {
 // NewVault returns a new Vault instance with the given controller context.
 func NewVault(ctx *controllerpkg.Context) certificaterequests.Issuer {
 	return &Vault{
-		issuerOptions:      ctx.IssuerOptions,
-		secretsLister:      ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
+		issuerOptions: ctx.IssuerOptions,
+		createTokenFn: func(ns string) vaultinternal.CreateToken {
+			return ctx.Client.CoreV1().ServiceAccounts(ns).CreateToken
+		},
+		secretsLister:      ctx.KubeSharedInformerFactory.Secrets().Lister(),
 		reporter:           crutil.NewReporter(ctx.Clock, ctx.Recorder),
 		vaultClientBuilder: vaultinternal.New,
 	}
@@ -74,7 +79,7 @@ func (v *Vault) Sign(ctx context.Context, cr *v1.CertificateRequest, issuerObj v
 
 	resourceNamespace := v.issuerOptions.ResourceNamespace(issuerObj)
 
-	client, err := v.vaultClientBuilder(resourceNamespace, v.secretsLister, issuerObj)
+	client, err := v.vaultClientBuilder(ctx, resourceNamespace, v.createTokenFn, v.secretsLister, issuerObj, v.issuerOptions.CanUseAmbientCredentials(issuerObj))
 	if k8sErrors.IsNotFound(err) {
 		message := "Required secret resource not found"
 
@@ -83,12 +88,16 @@ func (v *Vault) Sign(ctx context.Context, cr *v1.CertificateRequest, issuerObj v
 		return nil, nil
 	}
 
-	// TODO: distinguish between network errors and other which might warrant a failure.
 	if err != nil {
 		message := "Failed to initialise vault client for signing"
 		v.reporter.Pending(cr, err, "VaultInitError", message)
 		log.Error(err, message)
-		return nil, nil
+
+		if cmerrors.IsInvalidData(err) {
+			return nil, nil // Don't retry, wait for the issuer to be updated
+		}
+
+		return nil, err // Return error to requeue and retry
 	}
 
 	certDuration := apiutil.DefaultCertDuration(cr.Spec.Duration)

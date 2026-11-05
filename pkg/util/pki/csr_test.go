@@ -19,34 +19,30 @@ package pki
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/mldsa"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/pem"
+	"fmt"
 	"math/big"
-	"reflect"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
-	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/cert-manager/cert-manager/pkg/util"
-	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 )
 
-func buildCertificate(cn string, dnsNames ...string) *cmapi.Certificate {
-	return &cmapi.Certificate{
-		Spec: cmapi.CertificateSpec{
-			CommonName: cn,
-			DNSNames:   dnsNames,
-		},
-	}
-}
-
-func TestBuildUsages(t *testing.T) {
+func TestKeyUsagesForCertificate(t *testing.T) {
 	type testT struct {
 		name                string
 		usages              []cmapi.KeyUsage
@@ -101,19 +97,13 @@ func TestBuildUsages(t *testing.T) {
 	}
 	testFn := func(test testT) func(*testing.T) {
 		return func(t *testing.T) {
-			ku, eku, err := BuildKeyUsages(test.usages, test.isCa)
+			ku, eku, err := KeyUsagesForCertificateOrCertificateRequest(test.usages, test.isCa)
 			if err != nil && !test.expectedError {
 				t.Errorf("got unexpected error generating cert: %q", err)
 				return
 			}
-			if !reflect.DeepEqual(ku, test.expectedKeyUsage) {
-				t.Errorf("keyUsages don't match, got %q, expected %q", ku, test.expectedKeyUsage)
-				return
-			}
-			if !reflect.DeepEqual(eku, test.expectedExtKeyUsage) {
-				t.Errorf("extKeyUsages don't match, got %q, expected %q", eku, test.expectedExtKeyUsage)
-				return
-			}
+			assert.Equal(t, test.expectedKeyUsage, ku, "keyUsages don't match")
+			assert.Equal(t, test.expectedExtKeyUsage, eku, "extKeyUsages don't match")
 		}
 	}
 	for _, test := range tests {
@@ -121,109 +111,95 @@ func TestBuildUsages(t *testing.T) {
 	}
 }
 
-func TestCommonNameForCertificate(t *testing.T) {
-	type testT struct {
-		name        string
-		crtCN       string
-		crtDNSNames []string
-		expectedCN  string
+func TestKeyUsagesForPublicKeyAlgorithm(t *testing.T) {
+	tests := []struct {
+		name                string
+		usages              []cmapi.KeyUsage
+		isCA                bool
+		pubKeyAlgo          x509.PublicKeyAlgorithm
+		expectedKeyUsage    x509.KeyUsage
+		expectedExtKeyUsage []x509.ExtKeyUsage
+	}{
+		{
+			name:             "ML-DSA default",
+			pubKeyAlgo:       x509.MLDSA,
+			expectedKeyUsage: x509.KeyUsageDigitalSignature,
+		},
+		{
+			name:             "ML-DSA default with isCA",
+			isCA:             true,
+			pubKeyAlgo:       x509.MLDSA,
+			expectedKeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		},
+		{
+			name:                "ML-DSA with explicit usages",
+			usages:              []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageServerAuth},
+			pubKeyAlgo:          x509.MLDSA,
+			expectedKeyUsage:    x509.KeyUsageDigitalSignature,
+			expectedExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		},
+		{
+			name:             "RSA default is unchanged",
+			pubKeyAlgo:       x509.RSA,
+			expectedKeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		},
+		{
+			name:             "ECDSA default is unchanged",
+			pubKeyAlgo:       x509.ECDSA,
+			expectedKeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		},
+		{
+			name:             "Ed25519 default is unchanged",
+			pubKeyAlgo:       x509.Ed25519,
+			expectedKeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		},
+		{
+			name:             "unknown public key algorithm default is unchanged",
+			isCA:             true,
+			pubKeyAlgo:       x509.UnknownPublicKeyAlgorithm,
+			expectedKeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		},
 	}
-	tests := []testT{
-		{
-			name:       "certificate with CommonName set",
-			crtCN:      "test",
-			expectedCN: "test",
-		},
-		{
-			name:        "certificate with one DNS name set",
-			crtDNSNames: []string{"dnsname"},
-			expectedCN:  "",
-		},
-		{
-			name:        "certificate with both common name and dnsName set",
-			crtCN:       "cn",
-			crtDNSNames: []string{"dnsname"},
-			expectedCN:  "cn",
-		},
-		{
-			name:        "certificate with multiple dns names set",
-			crtDNSNames: []string{"dnsname1", "dnsname2"},
-			expectedCN:  "",
-		},
-	}
-	testFn := func(test testT) func(*testing.T) {
-		return func(t *testing.T) {
-			actualCN := buildCertificate(test.crtCN, test.crtDNSNames...).Spec.CommonName
-			if actualCN != test.expectedCN {
-				t.Errorf("expected %q but got %q", test.expectedCN, actualCN)
-				return
-			}
-		}
-	}
+
 	for _, test := range tests {
-		t.Run(test.name, testFn(test))
+		t.Run(test.name, func(t *testing.T) {
+			ku, eku, err := KeyUsagesForPublicKeyAlgorithm(test.usages, test.isCA, test.pubKeyAlgo)
+			require.NoError(t, err)
+			assert.Equal(t, test.expectedKeyUsage, ku, "keyUsages don't match")
+			assert.Equal(t, test.expectedExtKeyUsage, eku, "extKeyUsages don't match")
+		})
 	}
 }
 
-func TestDNSNamesForCertificate(t *testing.T) {
-	type testT struct {
-		name           string
-		crtCN          string
-		crtDNSNames    []string
-		expectDNSNames []string
+func TestKeyUsageAllowedForPublicKeyAlgorithm(t *testing.T) {
+	allowed := []cmapi.KeyUsage{
+		cmapi.UsageSigning,
+		cmapi.UsageDigitalSignature,
+		cmapi.UsageContentCommitment,
+		cmapi.UsageCertSign,
+		cmapi.UsageCRLSign,
+		cmapi.UsageServerAuth,
+		cmapi.UsageClientAuth,
 	}
-	tests := []testT{
-		{
-			name:           "certificate with CommonName set",
-			crtCN:          "test",
-			expectDNSNames: []string{},
-		},
-		{
-			name:           "certificate with one DNS name set",
-			crtDNSNames:    []string{"dnsname"},
-			expectDNSNames: []string{"dnsname"},
-		},
-		{
-			name:           "certificate with both common name and dnsName set",
-			crtCN:          "cn",
-			crtDNSNames:    []string{"dnsname"},
-			expectDNSNames: []string{"dnsname"},
-		},
-		{
-			name:           "certificate with multiple dns names set",
-			crtDNSNames:    []string{"dnsname1", "dnsname2"},
-			expectDNSNames: []string{"dnsname1", "dnsname2"},
-		},
-		{
-			name:           "certificate with dnsName[0] set to equal common name",
-			crtCN:          "cn",
-			crtDNSNames:    []string{"cn", "dnsname"},
-			expectDNSNames: []string{"cn", "dnsname"},
-		},
-		{
-			name:           "certificate with a dnsName equal to cn",
-			crtCN:          "cn",
-			crtDNSNames:    []string{"dnsname", "cn"},
-			expectDNSNames: []string{"dnsname", "cn"},
-		},
+	forbidden := []cmapi.KeyUsage{
+		cmapi.UsageKeyEncipherment,
+		cmapi.UsageDataEncipherment,
+		cmapi.UsageKeyAgreement,
+		cmapi.UsageEncipherOnly,
+		cmapi.UsageDecipherOnly,
 	}
-	testFn := func(test testT) func(*testing.T) {
-		return func(t *testing.T) {
-			actualDNSNames := buildCertificate(test.crtCN, test.crtDNSNames...).Spec.DNSNames
-			if len(actualDNSNames) != len(test.expectDNSNames) {
-				t.Errorf("expected %q but got %q", test.expectDNSNames, actualDNSNames)
-				return
-			}
-			for i, actual := range actualDNSNames {
-				if test.expectDNSNames[i] != actual {
-					t.Errorf("expected %q but got %q", test.expectDNSNames, actualDNSNames)
-					return
-				}
-			}
+
+	for _, u := range allowed {
+		assert.True(t, KeyUsageAllowedForPublicKeyAlgorithm(u, x509.MLDSA), u)
+	}
+	for _, u := range forbidden {
+		assert.False(t, KeyUsageAllowedForPublicKeyAlgorithm(u, x509.MLDSA), u)
+	}
+
+	for _, pubKeyAlgo := range []x509.PublicKeyAlgorithm{x509.RSA, x509.ECDSA, x509.Ed25519} {
+		for _, u := range forbidden {
+			assert.True(t, KeyUsageAllowedForPublicKeyAlgorithm(u, pubKeyAlgo), "%s %s", pubKeyAlgo, u)
 		}
-	}
-	for _, test := range tests {
-		t.Run(test.name, testFn(test))
 	}
 }
 
@@ -232,6 +208,7 @@ func TestSignatureAlgorithmForCertificate(t *testing.T) {
 		name            string
 		keyAlgo         cmapi.PrivateKeyAlgorithm
 		keySize         int
+		sigAlg          cmapi.SignatureAlgorithm
 		expectErr       bool
 		expectedSigAlgo x509.SignatureAlgorithm
 		expectedKeyType x509.PublicKeyAlgorithm
@@ -317,15 +294,79 @@ func TestSignatureAlgorithmForCertificate(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name:            "certificate no key and custom signature",
+			sigAlg:          cmapi.SHA384WithRSA,
+			expectedSigAlgo: x509.SHA384WithRSA,
+			expectedKeyType: x509.RSA,
+		},
+		{
+			name:            "certificate explicit key and custom signature",
+			keyAlgo:         cmapi.RSAKeyAlgorithm,
+			sigAlg:          cmapi.SHA384WithRSA,
+			expectedSigAlgo: x509.SHA384WithRSA,
+			expectedKeyType: x509.RSA,
+		},
+		{
 			name:      "certificate with KeyAlgorithm set to unknown key algo",
 			keyAlgo:   cmapi.PrivateKeyAlgorithm("blah"),
+			expectErr: true,
+		},
+		{
+			name:            "certificate with KeyAlgorithm mldsa and no size set should default to ML-DSA-44",
+			keyAlgo:         cmapi.MLDSAKeyAlgorithm,
+			expectedSigAlgo: x509.MLDSA44,
+			expectedKeyType: x509.MLDSA,
+		},
+		{
+			name:            "certificate with KeyAlgorithm mldsa and size 44",
+			keyAlgo:         cmapi.MLDSAKeyAlgorithm,
+			keySize:         44,
+			expectedSigAlgo: x509.MLDSA44,
+			expectedKeyType: x509.MLDSA,
+		},
+		{
+			name:            "certificate with KeyAlgorithm mldsa and size 65",
+			keyAlgo:         cmapi.MLDSAKeyAlgorithm,
+			keySize:         65,
+			expectedSigAlgo: x509.MLDSA65,
+			expectedKeyType: x509.MLDSA,
+		},
+		{
+			name:            "certificate with KeyAlgorithm mldsa and size 87",
+			keyAlgo:         cmapi.MLDSAKeyAlgorithm,
+			keySize:         87,
+			expectedSigAlgo: x509.MLDSA87,
+			expectedKeyType: x509.MLDSA,
+		},
+		{
+			name:      "certificate with KeyAlgorithm mldsa and size 2048",
+			keyAlgo:   cmapi.MLDSAKeyAlgorithm,
+			keySize:   2048,
+			expectErr: true,
+		},
+		{
+			name:      "certificate with KeyAlgorithm mldsa and a negative size",
+			keyAlgo:   cmapi.MLDSAKeyAlgorithm,
+			keySize:   -1,
+			expectErr: true,
+		},
+		{
+			name:      "certificate with KeyAlgorithm mldsa and an RSA signature algorithm",
+			keyAlgo:   cmapi.MLDSAKeyAlgorithm,
+			sigAlg:    cmapi.SHA256WithRSA,
+			expectErr: true,
+		},
+		{
+			name:      "certificate with KeyAlgorithm mldsa and the Ed25519 signature algorithm",
+			keyAlgo:   cmapi.MLDSAKeyAlgorithm,
+			sigAlg:    cmapi.PureEd25519,
 			expectErr: true,
 		},
 	}
 
 	testFn := func(test testT) func(*testing.T) {
 		return func(t *testing.T) {
-			actualPKAlgo, actualSigAlgo, err := SignatureAlgorithm(buildCertificateWithKeyParams(test.keyAlgo, test.keySize))
+			actualPKAlgo, actualSigAlgo, err := SignatureAlgorithm(buildCertificateWithKeyAndSigParams(test.keyAlgo, test.keySize, test.sigAlg))
 			if test.expectErr && err == nil {
 				t.Error("expected err, but got no error")
 				return
@@ -388,151 +429,71 @@ func TestRemoveDuplicates(t *testing.T) {
 	}
 }
 
-func TestGenerateCSR(t *testing.T) {
-	// 0xa0 = DigitalSignature and Encipherment usage
-	asn1KeyUsage, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0xa0}, BitLength: asn1BitLength([]byte{0xa0})})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defaultExtraExtensions := []pkix.Extension{
-		{
-			Id:    OIDExtensionKeyUsage,
-			Value: asn1KeyUsage,
-		},
-	}
-
-	asn1ExtKeyUsage, err := asn1.Marshal([]asn1.ObjectIdentifier{oidExtKeyUsageIPSECEndSystem})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ipsecExtraExtensions := []pkix.Extension{
-		{
-			Id:    OIDExtensionKeyUsage,
-			Value: asn1KeyUsage,
-		},
-		{
-			Id:    OIDExtensionExtendedKeyUsage,
-			Value: asn1ExtKeyUsage,
-		},
-	}
-
-	exampleLiteralSubject := "CN=actual-cn, OU=FooLong, OU=Bar, O=example.org"
-	rawExampleLiteralSubject, err := ParseSubjectStringToRawDerBytes(exampleLiteralSubject)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	exampleMultiValueRDNLiteralSubject := "CN=actual-cn, OU=FooLong+OU=Bar, O=example.org"
-	rawExampleMultiValueRDNLiteralSubject, err := ParseSubjectStringToRawDerBytes(exampleMultiValueRDNLiteralSubject)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name                                    string
-		crt                                     *cmapi.Certificate
-		want                                    *x509.CertificateRequest
-		wantErr                                 bool
-		literalCertificateSubjectFeatureEnabled bool
-	}{
-		{
-			name: "Generate CSR from certificate with only DNS",
-			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{DNSNames: []string{"example.org"}}},
-			want: &x509.CertificateRequest{
-				Version:            0,
-				SignatureAlgorithm: x509.SHA256WithRSA,
-				PublicKeyAlgorithm: x509.RSA,
-				DNSNames:           []string{"example.org"},
-				ExtraExtensions:    defaultExtraExtensions,
-			},
-		},
-		{
-			name: "Generate CSR from certificate with only CN",
-			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org"}},
-			want: &x509.CertificateRequest{
-				Version:            0,
-				SignatureAlgorithm: x509.SHA256WithRSA,
-				PublicKeyAlgorithm: x509.RSA,
-				Subject:            pkix.Name{CommonName: "example.org"},
-				ExtraExtensions:    defaultExtraExtensions,
-			},
-		},
-		{
-			name: "Generate CSR from certificate with extended key usages",
-			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org", Usages: []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageIPsecEndSystem}}},
-			want: &x509.CertificateRequest{
-				Version:            0,
-				SignatureAlgorithm: x509.SHA256WithRSA,
-				PublicKeyAlgorithm: x509.RSA,
-				Subject:            pkix.Name{CommonName: "example.org"},
-				ExtraExtensions:    ipsecExtraExtensions,
-			},
-		},
-		{
-			name: "Generate CSR from certificate with double signing key usages",
-			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org", Usages: []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageSigning}}},
-			want: &x509.CertificateRequest{
-				Version:            0,
-				SignatureAlgorithm: x509.SHA256WithRSA,
-				PublicKeyAlgorithm: x509.RSA,
-				Subject:            pkix.Name{CommonName: "example.org"},
-				ExtraExtensions:    defaultExtraExtensions,
-			},
-		},
-		{
-			name:    "Error on generating CSR from certificate with no subject",
-			crt:     &cmapi.Certificate{Spec: cmapi.CertificateSpec{}},
-			wantErr: true,
-		},
-		{
-			name: "Generate CSR from certficate with literal subject honouring the exact order",
-			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{LiteralSubject: exampleLiteralSubject}},
-			want: &x509.CertificateRequest{
-				Version:            0,
-				SignatureAlgorithm: x509.SHA256WithRSA,
-				PublicKeyAlgorithm: x509.RSA,
-				RawSubject:         rawExampleLiteralSubject,
-				ExtraExtensions:    defaultExtraExtensions,
-			},
-			literalCertificateSubjectFeatureEnabled: true,
-		},
-		{
-			name: "Generate CSR from certficate with literal multi value subject honouring the exact order",
-			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{LiteralSubject: exampleMultiValueRDNLiteralSubject}},
-			want: &x509.CertificateRequest{
-				Version:            0,
-				SignatureAlgorithm: x509.SHA256WithRSA,
-				PublicKeyAlgorithm: x509.RSA,
-				RawSubject:         rawExampleMultiValueRDNLiteralSubject,
-				ExtraExtensions:    defaultExtraExtensions,
-			},
-			literalCertificateSubjectFeatureEnabled: true,
-		},
-		{
-			name:                                    "Error on generating CSR from certificate without CommonName in LiteralSubject, uri names, email address, or ip addresses",
-			crt:                                     &cmapi.Certificate{Spec: cmapi.CertificateSpec{LiteralSubject: "O=EmptyOrg"}},
-			wantErr:                                 true,
-			literalCertificateSubjectFeatureEnabled: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.LiteralCertificateSubject, tt.literalCertificateSubjectFeatureEnabled)()
-			got, err := GenerateCSR(tt.crt)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("GenerateCSR() error = %v, wantErr %v", err, tt.wantErr)
-				return
+func removeDuplicates(in []string) []string {
+	var found []string
+Outer:
+	for _, i := range in {
+		for _, i2 := range found {
+			if i2 == i {
+				continue Outer
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("GenerateCSR() got = %v, want %v", got, tt.want)
-			}
-		})
+		}
+		found = append(found, i)
 	}
+	return found
 }
 
-func Test_buildKeyUsagesExtensionsForCertificate(t *testing.T) {
+func OtherNameSANRawVal(expectedOID asn1.ObjectIdentifier) (asn1.RawValue, error) {
+	var otherNameParam = fmt.Sprintf("tag:%d", nameTypeOtherName)
+
+	value, err := MarshalUniversalValue(UniversalValue{
+		UTF8String: "user@example.org",
+	})
+	if err != nil {
+		return asn1.NullRawValue, err
+	}
+
+	otherNameDer, err := asn1.MarshalWithParams(OtherName{
+		TypeID: expectedOID, // UPN OID
+		Value: asn1.RawValue{
+			Tag:        0,
+			Class:      asn1.ClassContextSpecific,
+			IsCompound: true,
+			Bytes:      value,
+		},
+	}, otherNameParam)
+
+	if err != nil {
+		return asn1.NullRawValue, err
+	}
+	rawVal := asn1.RawValue{
+		FullBytes: otherNameDer,
+	}
+	return rawVal, nil
+}
+
+func TestGenerateCSR(t *testing.T) {
+	exampleLiteralSubject := "CN=actual-cn, OU=FooLong, OU=Bar, O=example.org"
+	exampleMultiValueRDNLiteralSubject := "CN=actual-cn, OU=FooLong+OU=Bar, O=example.org"
+
+	asn1otherNameUpnSANRawVal, err := OtherNameSANRawVal(asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 20, 2, 3}) // UPN OID
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	asn1otherNamesAMAAccountNameRawVal, err := OtherNameSANRawVal(asn1.ObjectIdentifier{1, 2, 840, 113556, 1, 4, 221}) // sAMAccountName OID
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// 0xa0 = DigitalSignature and Encipherment usage
 	asn1DefaultKeyUsage, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0xa0}, BitLength: asn1BitLength([]byte{0xa0})})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 0xa4 = DigitalSignature, Encipherment and KeyCertSign usage
+	asn1KeyUsageWithCa, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0xa4}, BitLength: asn1BitLength([]byte{0xa4})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,71 +508,523 @@ func Test_buildKeyUsagesExtensionsForCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	asn1ExtKeyUsage, err := asn1.Marshal([]asn1.ObjectIdentifier{oidExtKeyUsageIPSECEndSystem})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	basicConstraintsGenerator := func(t *testing.T, isCA bool) []byte {
+		data, err := asn1.Marshal(struct {
+			IsCA bool `asn1:"optional"`
+		}{
+			IsCA: isCA,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	subjectGenerator := func(t *testing.T, name pkix.Name) []byte {
+		data, err := MarshalRDNSequenceToRawDERBytes(name.ToRDNSequence())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	sansGenerator := func(t *testing.T, generalNames []asn1.RawValue, critical bool) pkix.Extension {
+		val, err := asn1.Marshal(generalNames)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return pkix.Extension{
+			Id:       oidExtensionSubjectAltName,
+			Critical: critical,
+			Value:    val,
+		}
+	}
+
+	literalSubjectGenerator := func(t *testing.T, literal string) []byte {
+		rawSubject, err := UnmarshalSubjectStringToRDNSequence(literal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		asn1Subject, err := MarshalRDNSequenceToRawDERBytes(rawSubject)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return asn1Subject
+	}
+
 	tests := []struct {
-		name    string
-		crt     *cmapi.Certificate
-		want    []pkix.Extension
-		wantErr bool
+		name                                    string
+		crt                                     *cmapi.Certificate
+		want                                    *x509.CertificateRequest
+		wantErr                                 bool
+		literalCertificateSubjectFeatureEnabled bool
+		basicConstraintsFeatureEnabled          bool
+		nameConstraintsFeatureEnabled           bool
+		otherNamesFeatureEnabled                bool
 	}{
 		{
-			name: "Test no usages set",
-			crt:  &cmapi.Certificate{},
-			want: []pkix.Extension{
-				{
-					Id:    OIDExtensionKeyUsage,
-					Value: asn1DefaultKeyUsage,
+			name: "Generate CSR from certificate with only DNS",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{DNSNames: []string{"example.org"}}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{
+							{Tag: nameTypeDNSName, Class: 2, Bytes: []byte("example.org")},
+						},
+						true, // SAN is critical as the Subject is empty
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
 				},
+				RawSubject: subjectGenerator(t, pkix.Name{}),
+			},
+		},
+		{
+			name: "Generate CSR from certificate with subject and DNS",
+			crt: &cmapi.Certificate{Spec: cmapi.CertificateSpec{
+				Subject:  &cmapi.X509Subject{Organizations: []string{"example inc."}},
+				DNSNames: []string{"example.org"},
+			}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{
+							{Tag: nameTypeDNSName, Class: 2, Bytes: []byte("example.org")},
+						},
+						false, // SAN is NOT critical as the Subject is not empty
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{Organization: []string{"example inc."}}),
+			},
+		},
+		{
+			name: "Generate CSR from certificate with only CN",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org"}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+		},
+		{
+			name: "Generate CSR from certificate with isCA set",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org", IsCA: true}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1KeyUsageWithCa,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+		},
+		{
+			name: "Generate CSR from certificate with isCA not set and with UseCertificateRequestBasicConstraints flag enabled",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org"}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+					{
+						Id:       OIDExtensionBasicConstraints,
+						Value:    basicConstraintsGenerator(t, false),
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+			basicConstraintsFeatureEnabled: true,
+		},
+		{
+			name: "Generate CSR from certificate with isCA set and with UseCertificateRequestBasicConstraints flag enabled",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org", IsCA: true}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1KeyUsageWithCa,
+						Critical: true,
+					},
+					{
+						Id:       OIDExtensionBasicConstraints,
+						Value:    basicConstraintsGenerator(t, true),
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+			basicConstraintsFeatureEnabled: true,
+		},
+		{
+			name: "Generate CSR from certificate with extended key usages",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org", Usages: []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageIPsecEndSystem}}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+					{
+						Id:    OIDExtensionExtendedKeyUsage,
+						Value: asn1ExtKeyUsage,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+		},
+		{
+			name: "Generate CSR from certificate with a single otherNameSAN set to an oid (UPN)", // only a shallow validation is expected
+			crt: &cmapi.Certificate{Spec: cmapi.CertificateSpec{OtherNames: []cmapi.OtherName{
+				{
+					OID:       "1.3.6.1.4.1.311.20.2.3",
+					UTF8Value: "user@example.org",
+				},
+			}}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{asn1otherNameUpnSANRawVal},
+						true,
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{}),
+			},
+			otherNamesFeatureEnabled: true,
+		},
+		{
+			name: "Generate CSR from certificate with multiple valid otherName oids and emailSANs set",
+			crt: &cmapi.Certificate{Spec: cmapi.CertificateSpec{
+				EmailAddresses: []string{"user@example.org", "alt-email@example.org"},
+				OtherNames: []cmapi.OtherName{
+					{
+						OID:       "1.3.6.1.4.1.311.20.2.3",
+						UTF8Value: "user@example.org",
+					},
+					{
+						OID:       "1.2.840.113556.1.4.221",
+						UTF8Value: "user@example.org",
+					},
+				}}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{
+							{Tag: nameTypeRFC822Name, Class: 2, Bytes: []byte("user@example.org")},
+							{Tag: nameTypeRFC822Name, Class: 2, Bytes: []byte("alt-email@example.org")},
+							asn1otherNameUpnSANRawVal,
+							asn1otherNamesAMAAccountNameRawVal,
+						},
+						true,
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{}),
+			},
+			otherNamesFeatureEnabled: true,
+		},
+		{
+			name: "Generate CSR from certificate with malformed otherName oid type",
+			crt: &cmapi.Certificate{Spec: cmapi.CertificateSpec{OtherNames: []cmapi.OtherName{
+				{
+					OID:       "NOTANOID@garbage",
+					UTF8Value: "user@example.org",
+				},
+			}}},
+			wantErr: true,
+		},
+		{
+			name: "Generate CSR from certificate with double signing key usages",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{CommonName: "example.org", Usages: []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageSigning}}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+		},
+		{
+			name:    "Error on generating CSR from certificate with no subject",
+			crt:     &cmapi.Certificate{Spec: cmapi.CertificateSpec{}},
+			wantErr: true,
+		},
+		{
+			name: "Generate CSR from certificate with literal subject honouring the exact order",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{LiteralSubject: exampleLiteralSubject}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: literalSubjectGenerator(t, exampleLiteralSubject),
+			},
+			literalCertificateSubjectFeatureEnabled: true,
+		},
+		{
+			name: "Generate CSR from certificate with literal multi value subject honouring the exact order",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{LiteralSubject: exampleMultiValueRDNLiteralSubject}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: literalSubjectGenerator(t, exampleMultiValueRDNLiteralSubject),
+			},
+			literalCertificateSubjectFeatureEnabled: true,
+		},
+		{
+			name:                                    "Error on generating CSR from certificate without CommonName in LiteralSubject, email addresses, ip addresses, otherNames, uri names set",
+			crt:                                     &cmapi.Certificate{Spec: cmapi.CertificateSpec{LiteralSubject: "O=EmptyOrg"}},
+			wantErr:                                 true,
+			literalCertificateSubjectFeatureEnabled: true,
+		},
+		{
+			name: "KeyUsages and ExtendedKeyUsages: no usages set",
+			crt:  &cmapi.Certificate{Spec: cmapi.CertificateSpec{DNSNames: []string{"example.org"}}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{
+							{Tag: nameTypeDNSName, Class: 2, Bytes: []byte("example.org")},
+						},
+						true,
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{}),
 			},
 			wantErr: false,
 		},
 		{
-			name: "Test client auth extended usage set",
+			name: "KeyUsages and ExtendedKeyUsages: client auth extended usage set",
 			crt: &cmapi.Certificate{
 				Spec: cmapi.CertificateSpec{
-					Usages: []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageClientAuth},
+					DNSNames: []string{"example.org"},
+					Usages:   []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageClientAuth},
 				},
 			},
-			want: []pkix.Extension{
-				{
-					Id:    OIDExtensionKeyUsage,
-					Value: asn1DefaultKeyUsage,
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{
+							{Tag: nameTypeDNSName, Class: 2, Bytes: []byte("example.org")},
+						},
+						true,
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+					{
+						Id:    OIDExtensionExtendedKeyUsage,
+						Value: asn1ClientAuth,
+					},
 				},
-				{
-					Id:    OIDExtensionExtendedKeyUsage,
-					Value: asn1ClientAuth,
-				},
+				RawSubject: subjectGenerator(t, pkix.Name{}),
 			},
 			wantErr: false,
 		},
 		{
-			name: "Test server + client auth extended usage set",
+			name: "KeyUsages and ExtendedKeyUsages: server + client auth extended usage set",
 			crt: &cmapi.Certificate{
 				Spec: cmapi.CertificateSpec{
-					Usages: []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageServerAuth, cmapi.UsageClientAuth},
+					DNSNames: []string{"example.org"},
+					Usages:   []cmapi.KeyUsage{cmapi.UsageDigitalSignature, cmapi.UsageKeyEncipherment, cmapi.UsageServerAuth, cmapi.UsageClientAuth},
 				},
 			},
-			want: []pkix.Extension{
-				{
-					Id:    OIDExtensionKeyUsage,
-					Value: asn1DefaultKeyUsage,
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					sansGenerator(
+						t,
+						[]asn1.RawValue{
+							{Tag: nameTypeDNSName, Class: 2, Bytes: []byte("example.org")},
+						},
+						true,
+					),
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1DefaultKeyUsage,
+						Critical: true,
+					},
+					{
+						Id:    OIDExtensionExtendedKeyUsage,
+						Value: asn1ServerClientAuth,
+					},
 				},
-				{
-					Id:    OIDExtensionExtendedKeyUsage,
-					Value: asn1ServerClientAuth,
-				},
+				RawSubject: subjectGenerator(t, pkix.Name{}),
 			},
 			wantErr: false,
+		},
+		{
+			name: "Generate CSR from certificate with NameConstraints flag enabled",
+			crt: &cmapi.Certificate{Spec: cmapi.CertificateSpec{
+				CommonName: "example.org",
+				IsCA:       true,
+				NameConstraints: &cmapi.NameConstraints{
+					Critical: true,
+					Permitted: &cmapi.NameConstraintItem{
+						DNSDomains:     []string{"example.org"},
+						IPRanges:       []string{"10.10.0.0/16"},
+						EmailAddresses: []string{"email@email.org"},
+					},
+					Excluded: &cmapi.NameConstraintItem{
+						IPRanges: []string{"10.10.0.0/24"},
+					},
+				},
+			}},
+			want: &x509.CertificateRequest{
+				Version:            0,
+				SignatureAlgorithm: x509.SHA256WithRSA,
+				PublicKeyAlgorithm: x509.RSA,
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:       OIDExtensionKeyUsage,
+						Value:    asn1KeyUsageWithCa,
+						Critical: true,
+					},
+					{
+						Id:       OIDExtensionNameConstraints,
+						Value:    []byte{0x30, 0x3e, 0xa0, 0x2e, 0x30, 0xd, 0x82, 0xb, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x6f, 0x72, 0x67, 0x30, 0xa, 0x87, 0x8, 0xa, 0xa, 0x0, 0x0, 0xff, 0xff, 0x0, 0x0, 0x30, 0x11, 0x81, 0xf, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x40, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x2e, 0x6f, 0x72, 0x67, 0xa1, 0xc, 0x30, 0xa, 0x87, 0x8, 0xa, 0xa, 0x0, 0x0, 0xff, 0xff, 0xff, 0x0},
+						Critical: true,
+					},
+				},
+				RawSubject: subjectGenerator(t, pkix.Name{CommonName: "example.org"}),
+			},
+			nameConstraintsFeatureEnabled: true,
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := buildKeyUsagesExtensionsForCertificate(tt.crt)
+			got, err := GenerateCSR(
+				tt.crt,
+				WithEncodeBasicConstraintsInRequest(tt.basicConstraintsFeatureEnabled),
+				WithNameConstraints(tt.nameConstraintsFeatureEnabled),
+				WithOtherNames(tt.otherNamesFeatureEnabled),
+				WithUseLiteralSubject(tt.literalCertificateSubjectFeatureEnabled),
+			)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("buildKeyUsagesExtensionsForCertificate() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("GenerateCSR() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("buildKeyUsagesExtensionsForCertificate() got = %v, want %v", got, tt.want)
+			assert.Equal(t, tt.want, got, "GenerateCSR()")
+
+			// TODO find a better way around the nil check
+			if got != nil {
+				// also check CSR generates valid certificate
+				pk, err := GenerateRSAPrivateKey(2048)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				csrDER, err := EncodeCSR(got, pk)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				_, err = x509.ParseCertificateRequest(csrDER)
+				if err != nil {
+					t.Errorf("Failed to parse generated certificate %s, Der: %v", err.Error(), csrDER)
+				}
 			}
 		})
 	}
@@ -622,11 +1035,14 @@ func TestSignCSRTemplate(t *testing.T) {
 	// for that, we construct a chain of four certificates:
 	// a root CA, two intermediate CA, and a leaf certificate.
 
-	mustCreatePair := func(issuerCert *x509.Certificate, issuerPK crypto.Signer, name string, isCA bool) ([]byte, *x509.Certificate, *x509.Certificate, crypto.Signer) {
+	mustCreatePair := func(issuerCert *x509.Certificate, issuerPK crypto.Signer, name string, isCA bool, nameConstraints *NameConstraints) ([]byte, *x509.Certificate, *x509.Certificate, crypto.Signer) {
 		pk, err := GenerateECPrivateKey(256)
 		require.NoError(t, err)
+		var permittedIPRanges []*net.IPNet
+		if nameConstraints != nil {
+			permittedIPRanges = nameConstraints.PermittedIPRanges
+		}
 		tmpl := &x509.Certificate{
-			Version:               2,
 			BasicConstraintsValid: true,
 			SerialNumber:          big.NewInt(0),
 			Subject: pkix.Name{
@@ -638,6 +1054,7 @@ func TestSignCSRTemplate(t *testing.T) {
 			KeyUsage:           x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 			PublicKey:          pk.Public(),
 			IsCA:               isCA,
+			PermittedIPRanges:  permittedIPRanges,
 		}
 
 		if isCA {
@@ -656,10 +1073,16 @@ func TestSignCSRTemplate(t *testing.T) {
 		return pem, cert, tmpl, pk
 	}
 
-	rootPEM, rootCert, rootTmpl, rootPK := mustCreatePair(nil, nil, "root", true)
-	int1PEM, int1Cert, int1Tmpl, int1PK := mustCreatePair(rootCert, rootPK, "int1", true)
-	int2PEM, int2Cert, int2Tmpl, int2PK := mustCreatePair(int1Cert, int1PK, "int2", true)
-	leafPEM, _, leafTmpl, _ := mustCreatePair(int2Cert, int2PK, "leaf", false)
+	rootPEM, rootCert, rootTmpl, rootPK := mustCreatePair(nil, nil, "root", true, nil)
+	int1PEM, int1Cert, int1Tmpl, int1PK := mustCreatePair(rootCert, rootPK, "int1", true, nil)
+	int2PEM, int2Cert, int2Tmpl, int2PK := mustCreatePair(int1Cert, int1PK, "int2", true, nil)
+	leafPEM, _, leafTmpl, _ := mustCreatePair(int2Cert, int2PK, "leaf", false, nil)
+
+	// vars for testing name constraints
+	_, permittedIPNet, _ := net.ParseCIDR("10.10.0.0/16")
+	_, ncRootCert, _, ncRootPK := mustCreatePair(nil, nil, "ncroot", true, &NameConstraints{PermittedIPRanges: []*net.IPNet{permittedIPNet}})
+	_, _, ncLeafTmpl, _ := mustCreatePair(ncRootCert, ncRootPK, "ncleaf", false, nil)
+	ncLeafTmpl.IPAddresses = []net.IP{net.ParseIP("10.20.0.5")}
 
 	tests := map[string]struct {
 		caCerts           []*x509.Certificate
@@ -802,10 +1225,389 @@ func TestEncodeX509Chain(t *testing.T) {
 					test.expErr, err)
 			}
 
-			if !reflect.DeepEqual(chainOut, test.expChain) {
-				t.Errorf("unexpected output from EncodeX509Chain, exp=%+s got=%+s",
-					test.expChain, chainOut)
+			assert.Equal(t, test.expChain, chainOut, "unexpected output from EncodeX509Chain")
+		})
+	}
+}
+
+func rsaKey(t *testing.T, size int) crypto.Signer {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, size)
+	if err != nil {
+		t.Fatalf("failed to generate RSA key with size %d: %s", size, err)
+	}
+
+	return key
+}
+
+func ecdsaKey(t *testing.T, curve elliptic.Curve) crypto.Signer {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate ECDSA key with curve %s: %s", curve, err)
+	}
+
+	return key
+}
+
+func ed25519Key(t *testing.T) crypto.Signer {
+	t.Helper()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate ed25519 key: %s", err)
+	}
+
+	return priv
+}
+
+func mldsaKey(t *testing.T, params mldsa.Parameters) crypto.Signer {
+	t.Helper()
+
+	key, err := mldsa.GenerateKey(params)
+	if err != nil {
+		t.Fatalf("failed to generate %s key: %s", params, err)
+	}
+
+	return key
+}
+
+func Test_SignCertificate_Signatures(t *testing.T) {
+	specs := map[string]struct {
+		SignerKey                  crypto.Signer
+		ExpectedSignatureAlgorithm x509.SignatureAlgorithm
+		ExpectErr                  bool
+	}{
+		"RSA 2048": {
+			SignerKey:                  rsaKey(t, 2048),
+			ExpectedSignatureAlgorithm: x509.SHA256WithRSA,
+		},
+		"RSA 3072": {
+			SignerKey:                  rsaKey(t, 3072),
+			ExpectedSignatureAlgorithm: x509.SHA384WithRSA,
+		},
+		"RSA 4096": {
+			SignerKey:                  rsaKey(t, 4096),
+			ExpectedSignatureAlgorithm: x509.SHA512WithRSA,
+		},
+		"RSA 8192": {
+			SignerKey:                  rsaKey(t, 8192),
+			ExpectedSignatureAlgorithm: x509.SHA512WithRSA,
+		},
+		"RSA 1024 should error": {
+			SignerKey:                  rsaKey(t, 1024),
+			ExpectedSignatureAlgorithm: x509.UnknownSignatureAlgorithm,
+			ExpectErr:                  true,
+		},
+		"ECDSA P-224 should error": {
+			SignerKey:                  ecdsaKey(t, elliptic.P224()),
+			ExpectedSignatureAlgorithm: x509.UnknownSignatureAlgorithm,
+			ExpectErr:                  true,
+		},
+		"ECDSA P-256": {
+			SignerKey:                  ecdsaKey(t, elliptic.P256()),
+			ExpectedSignatureAlgorithm: x509.ECDSAWithSHA256,
+		},
+		"ECDSA P-384": {
+			SignerKey:                  ecdsaKey(t, elliptic.P384()),
+			ExpectedSignatureAlgorithm: x509.ECDSAWithSHA384,
+		},
+		"ECDSA P-521": {
+			SignerKey:                  ecdsaKey(t, elliptic.P521()),
+			ExpectedSignatureAlgorithm: x509.ECDSAWithSHA512,
+		},
+		"Ed25519": {
+			SignerKey:                  ed25519Key(t),
+			ExpectedSignatureAlgorithm: x509.PureEd25519,
+		},
+		"ML-DSA-44": {
+			SignerKey:                  mldsaKey(t, mldsa.MLDSA44()),
+			ExpectedSignatureAlgorithm: x509.MLDSA44,
+		},
+		"ML-DSA-65": {
+			SignerKey:                  mldsaKey(t, mldsa.MLDSA65()),
+			ExpectedSignatureAlgorithm: x509.MLDSA65,
+		},
+		"ML-DSA-87": {
+			SignerKey:                  mldsaKey(t, mldsa.MLDSA87()),
+			ExpectedSignatureAlgorithm: x509.MLDSA87,
+		},
+	}
+
+	for name, spec := range specs {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			signerKey := spec.SignerKey
+			pub := signerKey.Public()
+
+			tmpl := &x509.Certificate{
+				PublicKey: pub,
+				Subject:   pkix.Name{CommonName: "abc123"},
+
+				DNSNames: []string{"example.com"},
 			}
+
+			leafPriv := ed25519Key(t)
+			leafPub := leafPriv.Public()
+
+			_, cert, err := SignCertificate(tmpl, tmpl, leafPub, signerKey)
+			if (err != nil) != spec.ExpectErr {
+				t.Errorf("failed to SignCertificate: %s", err)
+			}
+
+			if spec.ExpectErr {
+				return
+			}
+
+			if cert.SignatureAlgorithm != spec.ExpectedSignatureAlgorithm {
+				t.Errorf("wanted sigalg=%v but got %v", spec.ExpectedSignatureAlgorithm, cert.SignatureAlgorithm)
+				return
+			}
+		})
+	}
+}
+
+// Test_SignCertificate_MLDSAForbiddenKeyUsages checks that SignCertificate
+// refuses to sign certificates for ML-DSA keys with key usages that RFC 9881
+// forbids, whatever the signer's key type.
+func Test_SignCertificate_MLDSAForbiddenKeyUsages(t *testing.T) {
+	forbidden := []x509.KeyUsage{
+		x509.KeyUsageKeyEncipherment,
+		x509.KeyUsageDataEncipherment,
+		x509.KeyUsageKeyAgreement,
+		x509.KeyUsageEncipherOnly,
+		x509.KeyUsageDecipherOnly,
+	}
+
+	signerKey := ecdsaKey(t, elliptic.P256())
+	issuer := &x509.Certificate{
+		PublicKey: signerKey.Public(),
+		Subject:   pkix.Name{CommonName: "issuer"},
+	}
+
+	for _, usage := range forbidden {
+		t.Run(fmt.Sprintf("%#b", usage), func(t *testing.T) {
+			tmpl := &x509.Certificate{
+				SerialNumber: big.NewInt(1),
+				DNSNames:     []string{"example.com"},
+				KeyUsage:     x509.KeyUsageDigitalSignature | usage,
+			}
+
+			_, _, err := SignCertificate(tmpl, issuer, mldsaKey(t, mldsa.MLDSA44()).Public(), signerKey)
+			require.ErrorContains(t, err, "are not allowed for ML-DSA keys")
+
+			// The same key usages are still allowed for a classical key,
+			// even when the signer has an ML-DSA key.
+			mldsaSigner := mldsaKey(t, mldsa.MLDSA44())
+			mldsaIssuer := &x509.Certificate{
+				PublicKey: mldsaSigner.Public(),
+				Subject:   pkix.Name{CommonName: "issuer"},
+			}
+			_, _, err = SignCertificate(tmpl, mldsaIssuer, ecdsaKey(t, elliptic.P256()).Public(), mldsaSigner)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestMLDSACertificateRoundTrip generates an ML-DSA key and CSR for a
+// Certificate with unset usages, turns the CSR into a certificate template via
+// a CertificateRequest and signs it, checking the ML-DSA default key usages
+// at each step.
+func TestMLDSACertificateRoundTrip(t *testing.T) {
+	for _, size := range []int{0, MLDSA44, MLDSA65, MLDSA87} {
+		for _, isCA := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size %d isCA %v", size, isCA), func(t *testing.T) {
+				expectedSigAlg := map[int]x509.SignatureAlgorithm{
+					0:       x509.MLDSA44,
+					MLDSA44: x509.MLDSA44,
+					MLDSA65: x509.MLDSA65,
+					MLDSA87: x509.MLDSA87,
+				}[size]
+
+				expectedKeyUsage := x509.KeyUsageDigitalSignature
+				if isCA {
+					expectedKeyUsage |= x509.KeyUsageCertSign
+				}
+
+				crt := buildCertificateWithKeyParams(cmapi.MLDSAKeyAlgorithm, size)
+				crt.Spec.IsCA = isCA
+
+				key, err := GeneratePrivateKeyForCertificate(crt)
+				require.NoError(t, err)
+
+				csrTemplate, err := GenerateCSR(crt)
+				require.NoError(t, err)
+				assert.Equal(t, x509.MLDSA, csrTemplate.PublicKeyAlgorithm)
+				assert.Equal(t, expectedSigAlg, csrTemplate.SignatureAlgorithm)
+
+				csrDER, err := EncodeCSR(csrTemplate, key)
+				require.NoError(t, err)
+				csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+				csr, err := DecodeX509CertificateRequestBytes(csrPEM)
+				require.NoError(t, err)
+				require.NoError(t, csr.CheckSignature())
+
+				var csrKeyUsage x509.KeyUsage
+				for _, ext := range csr.Extensions {
+					if ext.Id.Equal(OIDExtensionKeyUsage) {
+						csrKeyUsage, err = UnmarshalKeyUsage(ext.Value)
+						require.NoError(t, err)
+					}
+				}
+				assert.Equal(t, expectedKeyUsage, csrKeyUsage, "CSR key usages don't match")
+
+				template, err := CertificateTemplateFromCertificateRequest(&cmapi.CertificateRequest{
+					Spec: cmapi.CertificateRequestSpec{
+						Request: csrPEM,
+						IsCA:    isCA,
+					},
+				})
+				require.NoError(t, err)
+				assert.Equal(t, expectedKeyUsage, template.KeyUsage, "template key usages don't match")
+
+				_, cert, err := SignCertificate(template, template, template.PublicKey, key)
+				require.NoError(t, err)
+				assert.Equal(t, expectedSigAlg, cert.SignatureAlgorithm)
+				assert.Equal(t, expectedKeyUsage, cert.KeyUsage, "certificate key usages don't match")
+				require.NoError(t, cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature))
+
+				matches, err := PublicKeyMatchesCertificate(key.Public(), cert)
+				require.NoError(t, err)
+				assert.True(t, matches)
+			})
+		}
+	}
+}
+
+// TestCertificateTemplateFromCertificateRequestBadSignature checks that a CSR
+// whose signature doesn't verify is rejected.
+func TestCertificateTemplateFromCertificateRequestBadSignature(t *testing.T) {
+	key := mldsaKey(t, mldsa.MLDSA44())
+
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "example.com"},
+	}, key)
+	require.NoError(t, err)
+
+	// The signature is at the end of the CSR, so flipping the last byte
+	// corrupts it while keeping the CSR parseable.
+	csrDER[len(csrDER)-1] ^= 0xff
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+	_, err = CertificateTemplateFromCertificateRequest(&cmapi.CertificateRequest{
+		Spec: cmapi.CertificateRequestSpec{
+			Request: csrPEM,
+		},
+	})
+	require.Error(t, err)
+}
+
+// TestMLDSAMixedChains checks that root -> intermediate -> leaf chains which
+// mix ML-DSA and classical keys in either direction verify.
+func TestMLDSAMixedChains(t *testing.T) {
+	type keyGen func(t *testing.T) crypto.Signer
+
+	mldsa44 := func(t *testing.T) crypto.Signer { return mldsaKey(t, mldsa.MLDSA44()) }
+	mldsa65 := func(t *testing.T) crypto.Signer { return mldsaKey(t, mldsa.MLDSA65()) }
+	mldsa87 := func(t *testing.T) crypto.Signer { return mldsaKey(t, mldsa.MLDSA87()) }
+	ecdsa256 := func(t *testing.T) crypto.Signer { return ecdsaKey(t, elliptic.P256()) }
+	rsa2048 := func(t *testing.T) crypto.Signer { return rsaKey(t, 2048) }
+
+	tests := map[string][3]keyGen{
+		"ML-DSA-87 -> ML-DSA-65 -> ML-DSA-44": {mldsa87, mldsa65, mldsa44},
+		"RSA -> ML-DSA-87 -> ML-DSA-44":       {rsa2048, mldsa87, mldsa44},
+		"ECDSA -> ECDSA -> ML-DSA-65":         {ecdsa256, ecdsa256, mldsa65},
+		"ML-DSA-87 -> ECDSA -> RSA":           {mldsa87, ecdsa256, rsa2048},
+		"ML-DSA-65 -> RSA -> ML-DSA-44":       {mldsa65, rsa2048, mldsa44},
+	}
+
+	for name, keyGens := range tests {
+		t.Run(name, func(t *testing.T) {
+			var certs []*x509.Certificate
+			var parent *x509.Certificate
+			var parentKey crypto.Signer
+
+			for i, keyGen := range keyGens {
+				key := keyGen(t)
+				isCA := i < len(keyGens)-1
+
+				template := &x509.Certificate{
+					SerialNumber:          big.NewInt(int64(i + 1)),
+					Subject:               pkix.Name{CommonName: fmt.Sprintf("cert %d", i)},
+					NotBefore:             time.Now().Add(-time.Minute),
+					NotAfter:              time.Now().Add(time.Hour),
+					BasicConstraintsValid: true,
+					IsCA:                  isCA,
+					KeyUsage:              x509.KeyUsageDigitalSignature,
+					ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+				}
+				if isCA {
+					template.KeyUsage |= x509.KeyUsageCertSign
+				} else {
+					template.DNSNames = []string{"example.com"}
+				}
+
+				if parent == nil {
+					parent, parentKey = template, key
+				}
+
+				_, cert, err := SignCertificate(template, parent, key.Public(), parentKey)
+				require.NoError(t, err)
+
+				certs = append(certs, cert)
+				parent, parentKey = cert, key
+			}
+
+			roots := x509.NewCertPool()
+			roots.AddCert(certs[0])
+			intermediates := x509.NewCertPool()
+			intermediates.AddCert(certs[1])
+
+			_, err := certs[2].Verify(x509.VerifyOptions{
+				DNSName:       "example.com",
+				Roots:         roots,
+				Intermediates: intermediates,
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestIPAddressesFromStrings(t *testing.T) {
+	tests := map[string]struct {
+		in      []string
+		want    []net.IP
+		wantErr string
+	}{
+		"valid addresses": {
+			in:   []string{"10.0.0.1", "2001:db8::1"},
+			want: []net.IP{net.ParseIP("10.0.0.1").To4(), net.ParseIP("2001:db8::1")},
+		},
+		"invalid address": {
+			in:      []string{"not-an-ip"},
+			wantErr: `ParseAddr("not-an-ip"): unable to parse IP`,
+		},
+		// netip.ParseAddr accepts zoned IPv6 addresses, but RFC 5280 IP
+		// address SANs have no zone.
+		"zoned IPv6 address": {
+			in:      []string{"fe80::1%eth0"},
+			wantErr: `IP address "fe80::1%eth0" has a zone identifier, which is not allowed in a certificate`,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := IPAddressesFromStrings(test.in)
+			if test.wantErr != "" {
+				assert.EqualError(t, err, test.wantErr)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.want, got)
 		})
 	}
 }

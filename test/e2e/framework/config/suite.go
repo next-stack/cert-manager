@@ -17,9 +17,8 @@ limitations under the License.
 package config
 
 import (
-	"os"
-
 	"flag"
+	"os"
 )
 
 type Suite struct {
@@ -33,7 +32,7 @@ type ACME struct {
 type Cloudflare struct {
 	Domain string
 	Email  string
-	APIKey string
+	APIKey string // #nosec G117 -- test config only
 }
 
 func (f *Suite) AddFlags(fs *flag.FlagSet) {

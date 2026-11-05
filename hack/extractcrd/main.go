@@ -55,11 +55,13 @@ func main() {
 		wantedCRDName = &val
 	}
 
-	rawYAMLBytes, err := os.ReadFile(filename)
+	rawYAMLBytes, err := os.ReadFile(filename) // #nosec G703 -- filename provided by CLI user in dev tool
 	if err != nil {
 		logger.Printf("failed to read %q: %s", filename, err)
 		os.Exit(1)
 	}
+
+	outWriter := os.Stdout
 
 	docs := docSeparatorRegexp.Split(string(rawYAMLBytes), -1)
 
@@ -80,20 +82,20 @@ func main() {
 			continue
 		}
 
-		doc = string(strings.TrimPrefix(doc, "---"))
-		doc = string(strings.TrimSpace(doc))
+		doc = strings.TrimPrefix(doc, "---")
+		doc = strings.TrimSpace(doc)
 
 		if wantedCRDName == nil {
 			if foundAny {
-				fmt.Println("---")
+				fmt.Fprintln(outWriter, "---")
 			}
-			fmt.Println(doc)
+			fmt.Fprintln(outWriter, doc) // #nosec G705 -- CLI tool writing YAML, not HTML context
 			foundAny = true
 			continue
 		} else {
 			crdName := strings.ToLower(crd.Spec.Names.Plural)
 			if crdName == *wantedCRDName {
-				fmt.Println(doc)
+				fmt.Fprintln(outWriter, doc) // #nosec G705 -- CLI tool writing YAML, not HTML context
 				return
 			}
 		}

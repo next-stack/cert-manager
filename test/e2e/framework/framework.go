@@ -18,44 +18,31 @@ package framework
 
 import (
 	"context"
-	"time"
+	"slices"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
+	clientset "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
+	certmgrscheme "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/scheme"
 	api "k8s.io/api/core/v1"
 	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextcs "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	apireg "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
-	gwapi "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
+	gwapiclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 
-	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	clientset "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	certmgrscheme "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/scheme"
-	"github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/addon"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/config"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/log"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/util"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/util/errors"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/addon"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/config"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/log"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/util"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/util/errors"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
-
-// TODO: this really should be done somewhere in cert-manager proper
-var Scheme = runtime.NewScheme()
-
-func init() {
-	kscheme.AddToScheme(Scheme)
-	certmgrscheme.AddToScheme(Scheme)
-	apiext.AddToScheme(Scheme)
-	apireg.AddToScheme(Scheme)
-}
 
 // DefaultConfig contains the default shared config the is likely parsed from
 // command line arguments.
@@ -69,10 +56,12 @@ type Framework struct {
 
 	// KubeClientConfig which was used to create the connection.
 	KubeClientConfig *rest.Config
+	// Scheme which is used to encode/decode kubernetes objects.
+	Scheme *runtime.Scheme
 
 	// Kubernetes API clientsets
 	KubeClientSet          kubernetes.Interface
-	GWClientSet            gwapi.Interface
+	GWClientSet            gwapiclient.Interface
 	CertManagerClientSet   clientset.Interface
 	APIExtensionsClientSet apiextcs.Interface
 
@@ -93,7 +82,7 @@ type Framework struct {
 
 // NewDefaultFramework makes a new framework for you, similar to NewFramework.
 // It uses the suite-wide 'DefaultConfig' which should be populated by the
-// testing harness in test/e2e/e2e_test.go
+// testing harness in e2e-tests/e2e_test.go
 func NewDefaultFramework(baseName string) *Framework {
 	return NewFramework(baseName, DefaultConfig)
 }
@@ -102,9 +91,16 @@ func NewDefaultFramework(baseName string) *Framework {
 // you (you can write additional before/after each functions).
 // It uses the config provided to it for the duration of the tests.
 func NewFramework(baseName string, cfg *config.Config) *Framework {
+	scheme := runtime.NewScheme()
+	Expect(kscheme.AddToScheme(scheme)).NotTo(HaveOccurred())
+	Expect(certmgrscheme.AddToScheme(scheme)).NotTo(HaveOccurred())
+	Expect(apiext.AddToScheme(scheme)).NotTo(HaveOccurred())
+	Expect(apireg.AddToScheme(scheme)).NotTo(HaveOccurred())
+
 	f := &Framework{
 		Config:   cfg,
 		BaseName: baseName,
+		Scheme:   scheme,
 	}
 
 	f.helper = helper.NewHelper(cfg)
@@ -115,12 +111,16 @@ func NewFramework(baseName string, cfg *config.Config) *Framework {
 }
 
 // BeforeEach gets a client and makes a namespace.
-func (f *Framework) BeforeEach() {
+func (f *Framework) BeforeEach(ctx context.Context) {
 	f.cleanupHandle = AddCleanupAction(f.AfterEach)
 
 	By("Creating a kubernetes client")
 	kubeConfig, err := util.LoadConfig(f.Config.KubeConfig, f.Config.KubeContext)
 	Expect(err).NotTo(HaveOccurred())
+
+	kubeConfig.Burst = 9000
+	kubeConfig.QPS = 9000
+
 	f.KubeClientConfig = kubeConfig
 
 	f.KubeClientSet, err = kubernetes.NewForConfig(kubeConfig)
@@ -135,21 +135,21 @@ func (f *Framework) BeforeEach() {
 	Expect(err).NotTo(HaveOccurred())
 
 	By("Creating a controller-runtime client")
-	f.CRClient, err = crclient.New(kubeConfig, crclient.Options{Scheme: Scheme})
+	f.CRClient, err = crclient.New(kubeConfig, crclient.Options{Scheme: f.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 
 	By("Creating a gateway-api client")
-	f.GWClientSet, err = gwapi.NewForConfig(kubeConfig)
+	f.GWClientSet, err = gwapiclient.NewForConfig(kubeConfig)
 	Expect(err).NotTo(HaveOccurred())
 
 	By("Building a namespace api object")
-	f.Namespace, err = f.CreateKubeNamespace(f.BaseName)
+	f.Namespace, err = f.CreateKubeNamespace(ctx, f.BaseName)
 	Expect(err).NotTo(HaveOccurred())
 
 	By("Using the namespace " + f.Namespace.Name)
 
 	By("Building a ResourceQuota api object")
-	_, err = f.CreateKubeResourceQuota()
+	_, err = f.CreateKubeResourceQuota(ctx)
 	Expect(err).NotTo(HaveOccurred())
 
 	f.helper.CMClient = f.CertManagerClientSet
@@ -157,32 +157,31 @@ func (f *Framework) BeforeEach() {
 }
 
 // AfterEach deletes the namespace, after reading its events.
-func (f *Framework) AfterEach() {
+func (f *Framework) AfterEach(ctx context.Context) {
 	RemoveCleanupAction(f.cleanupHandle)
 
-	f.printAddonLogs()
+	f.printAddonLogs(ctx)
 
 	if !f.Config.Cleanup {
 		return
 	}
 
-	for i := len(f.requiredAddons) - 1; i >= 0; i-- {
-		a := f.requiredAddons[i]
+	for _, a := range slices.Backward(f.requiredAddons) {
 		By("De-provisioning test-scoped addon")
-		err := a.Deprovision()
+		err := a.Deprovision(ctx)
 		Expect(err).NotTo(HaveOccurred())
 	}
 
 	By("Deleting test namespace")
-	err := f.DeleteKubeNamespace(f.Namespace.Name)
+	err := f.DeleteKubeNamespace(ctx, f.Namespace.Name)
 	Expect(err).NotTo(HaveOccurred())
 }
 
-func (f *Framework) printAddonLogs() {
+func (f *Framework) printAddonLogs(ctx context.Context) {
 	if CurrentSpecReport().Failed() {
 		for _, a := range f.requiredAddons {
 			if a, ok := a.(loggableAddon); ok {
-				l, err := a.Logs()
+				l, err := a.Logs(ctx)
 				Expect(err).NotTo(HaveOccurred())
 
 				for ident, l := range l {
@@ -201,15 +200,15 @@ func (f *Framework) printAddonLogs() {
 // are present in the 'globals' variable, as they will not be Provisioned properly
 // otherwise.
 func (f *Framework) RequireGlobalAddon(a addon.Addon) {
-	BeforeEach(func() {
+	BeforeEach(func(ctx context.Context) {
 		By("Setting up access for global shared addon")
-		err := a.Setup(f.Config)
+		_, err := a.Setup(ctx, f.Config)
 		Expect(err).NotTo(HaveOccurred())
 	})
 }
 
 type loggableAddon interface {
-	Logs() (map[string]string, error)
+	Logs(ctx context.Context) (map[string]string, error)
 }
 
 // RequireAddon calls the Setup and Provision method on the given addon, failing
@@ -217,54 +216,21 @@ type loggableAddon interface {
 func (f *Framework) RequireAddon(a addon.Addon) {
 	f.requiredAddons = append(f.requiredAddons, a)
 
-	BeforeEach(func() {
+	BeforeEach(func(ctx context.Context) {
 		By("Provisioning test-scoped addon")
-		err := a.Setup(f.Config)
+		_, err := a.Setup(ctx, f.Config)
 		if errors.IsSkip(err) {
 			Skipf("Skipping test as addon could not be setup: %v", err)
 		}
 		Expect(err).NotTo(HaveOccurred())
 
-		err = a.Provision()
+		err = a.Provision(ctx)
 		Expect(err).NotTo(HaveOccurred())
 	})
 }
 
 func (f *Framework) Helper() *helper.Helper {
 	return f.helper
-}
-
-func (f *Framework) CertificateDurationValid(c *v1.Certificate, duration, fuzz time.Duration) {
-	By("Verifying TLS certificate exists")
-	secret, err := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Get(context.TODO(), c.Spec.SecretName, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
-	certBytes, ok := secret.Data[api.TLSCertKey]
-	if !ok {
-		Failf("No certificate data found for Certificate %q", c.Name)
-	}
-	cert, err := pki.DecodeX509CertificateBytes(certBytes)
-	Expect(err).NotTo(HaveOccurred())
-	By("Verifying that the duration is valid")
-	certDuration := cert.NotAfter.Sub(cert.NotBefore)
-	if certDuration > (duration+fuzz) || certDuration < duration {
-		Failf("Expected duration of %s, got %s (fuzz: %s) [NotBefore: %s, NotAfter: %s]", duration, certDuration,
-			fuzz, cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339))
-	}
-}
-
-func (f *Framework) CertificateRequestDurationValid(c *v1.CertificateRequest, duration, fuzz time.Duration) {
-	By("Verifying TLS certificate exists")
-	if len(c.Status.Certificate) == 0 {
-		Failf("No certificate data found for CertificateRequest %s", c.Name)
-	}
-	cert, err := pki.DecodeX509CertificateBytes(c.Status.Certificate)
-	Expect(err).NotTo(HaveOccurred())
-	By("Verifying that the duration is valid")
-	certDuration := cert.NotAfter.Sub(cert.NotBefore)
-	if certDuration > (duration+fuzz) || certDuration < duration {
-		Failf("Expected duration of %s, got %s (fuzz: %s) [NotBefore: %s, NotAfter: %s]", duration, certDuration,
-			fuzz, cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339))
-	}
 }
 
 // CertManagerDescribe is a wrapper function for ginkgo describe. Adds namespacing.

@@ -17,49 +17,97 @@ limitations under the License.
 package dns
 
 import (
-	"context"
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
-	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/test"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/acmedns"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/cloudflare"
+	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/digitalocean"
+	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/route53"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
+	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
 
-func newIssuer(name, namespace string) *v1.Issuer {
-	return &v1.Issuer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: v1.IssuerSpec{
-			IssuerConfig: v1.IssuerConfig{
-				ACME: &cmacme.ACMEIssuer{},
-			},
-		},
+const (
+	fakeIssuerNamespace                = "fake-issuer-namespace"
+	fakeClusterIssuerResourceNamespace = "fake-cluster-resource-namespace"
+)
+
+func newSecret(name string, data map[string][]byte, namespace string) *corev1.Secret {
+	return &corev1.Secret{
+		Name:      name,
+		Namespace: namespace,
+		Data:      data,
 	}
 }
 
-func newSecret(name, namespace string, data map[string][]byte) *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+func TestClusterIssuerNamespace(t *testing.T) {
+	t.Parallel()
+	f := &solverFixture{
+		Builder: &test.Builder{
+			KubeObjects: []runtime.Object{
+				newSecret(
+					"route53",
+					map[string][]byte{
+						"secret": []byte("AKIENDINNEWLINE \n"),
+					},
+					fakeClusterIssuerResourceNamespace, // since this is a ClusterIssuer, the secret should be in the clusterResourceNamespace
+				),
+			},
+			Context: &controller.Context{
+				ClusterResourceNamespace: fakeClusterIssuerResourceNamespace,
+			},
 		},
-		Data: data,
+		Challenge: &cmacme.Challenge{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "random-certificate-namespace", // Random namespace in which the Certificate and Challenge live
+			},
+			Spec: cmacme.ChallengeSpec{
+				Solver: cmacme.ACMEChallengeSolver{
+					DNS01: &cmacme.ACMEChallengeSolverDNS01{
+						Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
+							AccessKeyID: "  test_with_spaces  ",
+							Region:      "us-west-2",
+							SecretAccessKey: cmmeta.SecretKeySelector{
+								LocalObjectReference: cmmeta.LocalObjectReference{
+									Name: "route53",
+								},
+								Key: "secret",
+							},
+						},
+					},
+				},
+				IssuerRef: cmmeta.IssuerReference{
+					Name: "test-issuer",
+					Kind: "ClusterIssuer", // ClusterIssuer reference, so should use the clusterResourceNamespace
+				},
+			},
+		},
+		dnsProviders: newFakeDNSProviders(),
+	}
+
+	f.Setup(t)
+	defer f.Finish(t)
+
+	s := f.Solver
+	_, _, err := s.solverForChallenge(t.Context(), f.Challenge)
+	if err != nil {
+		t.Fatalf("expected solverFor to not error, but got: %s", err)
 	}
 }
+
 func TestSolverFor(t *testing.T) {
+	t.Parallel()
 	type testT struct {
 		*solverFixture
 		domain             string
@@ -71,82 +119,85 @@ func TestSolverFor(t *testing.T) {
 			solverFixture: &solverFixture{
 				Builder: &test.Builder{
 					KubeObjects: []runtime.Object{
-						newSecret("cloudflare-key", "default", map[string][]byte{
+						newSecret("cloudflare-key", map[string][]byte{
 							"api-key": []byte("a-cloudflare-api-key"),
-						}),
+						}, fakeIssuerNamespace),
 					},
 				},
-				Issuer: newIssuer("test", "default"),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
 								Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 									Email: "test",
 									APIKey: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-key",
-										},
-										Key: "api-key",
+										Name: "cloudflare-key",
+										Key:  "api-key",
 									},
 								},
 							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
 						},
 					},
 				},
 			},
 			domain:             "example.com",
-			expectedSolverType: reflect.TypeOf(&cloudflare.DNSProvider{}),
+			expectedSolverType: reflect.TypeFor[*cloudflare.DNSProvider](),
 		},
 		"loads api token for cloudflare provider": {
 			solverFixture: &solverFixture{
 				Builder: &test.Builder{
 					KubeObjects: []runtime.Object{
-						newSecret("cloudflare-token", "default", map[string][]byte{
+						newSecret("cloudflare-token", map[string][]byte{
 							"api-token": []byte("a-cloudflare-api-token"),
-						}),
+						}, fakeIssuerNamespace),
 					},
 				},
-				Issuer: newIssuer("test", "default"),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
 								Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 									Email: "test",
 									APIToken: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-token",
-										},
-										Key: "api-token",
+										Name: "cloudflare-token",
+										Key:  "api-token",
 									},
 								},
 							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
 						},
 					},
 				},
 			},
 			domain:             "example.com",
-			expectedSolverType: reflect.TypeOf(&cloudflare.DNSProvider{}),
+			expectedSolverType: reflect.TypeFor[*cloudflare.DNSProvider](),
 		},
 		"fails to load a cloudflare provider with a missing secret": {
 			solverFixture: &solverFixture{
-				Issuer: newIssuer("test", "default"),
 				// don't include any secrets in the lister
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
 								Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 									Email: "test",
 									APIToken: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-token",
-										},
-										Key: "api-token",
+										Name: "cloudflare-token",
+										Key:  "api-token",
 									},
 								},
 							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
 						},
 					},
 				},
@@ -156,28 +207,27 @@ func TestSolverFor(t *testing.T) {
 		},
 		"fails to load a cloudflare provider when key and token are provided": {
 			solverFixture: &solverFixture{
-				Issuer: newIssuer("test", "default"),
 				// don't include any secrets in the lister
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
 								Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 									Email: "test",
 									APIToken: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-token",
-										},
-										Key: "api-token",
+										Name: "cloudflare-token",
+										Key:  "api-token",
 									},
 									APIKey: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-key",
-										},
-										Key: "api-key",
+										Name: "cloudflare-key",
+										Key:  "api-key",
 									},
 								},
 							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
 						},
 					},
 				},
@@ -189,26 +239,27 @@ func TestSolverFor(t *testing.T) {
 			solverFixture: &solverFixture{
 				Builder: &test.Builder{
 					KubeObjects: []runtime.Object{
-						newSecret("cloudflare-key", "default", map[string][]byte{
+						newSecret("cloudflare-key", map[string][]byte{
 							"api-key-oops": []byte("a-cloudflare-api-key"),
-						}),
+						}, fakeIssuerNamespace),
 					},
 				},
-				Issuer: newIssuer("test", "default"),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
 								Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 									Email: "test",
 									APIKey: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-key",
-										},
-										Key: "api-key",
+										Name: "cloudflare-key",
+										Key:  "api-key",
 									},
 								},
 							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
 						},
 					},
 				},
@@ -220,26 +271,27 @@ func TestSolverFor(t *testing.T) {
 			solverFixture: &solverFixture{
 				Builder: &test.Builder{
 					KubeObjects: []runtime.Object{
-						newSecret("cloudflare-token", "default", map[string][]byte{
+						newSecret("cloudflare-token", map[string][]byte{
 							"api-key-oops": []byte("a-cloudflare-api-token"),
-						}),
+						}, fakeIssuerNamespace),
 					},
 				},
-				Issuer: newIssuer("test", "default"),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
 								Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
 									Email: "test",
 									APIToken: &cmmeta.SecretKeySelector{
-										LocalObjectReference: cmmeta.LocalObjectReference{
-											Name: "cloudflare-token",
-										},
-										Key: "api-token",
+										Name: "cloudflare-token",
+										Key:  "api-token",
 									},
 								},
 							},
+						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
 						},
 					},
 				},
@@ -251,13 +303,13 @@ func TestSolverFor(t *testing.T) {
 			solverFixture: &solverFixture{
 				Builder: &test.Builder{
 					KubeObjects: []runtime.Object{
-						newSecret("acmedns-key", "default", map[string][]byte{
+						newSecret("acmedns-key", map[string][]byte{
 							"acmedns.json": []byte("{}"),
-						}),
+						}, fakeIssuerNamespace),
 					},
 				},
-				Issuer: newIssuer("test", "default"),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
@@ -272,19 +324,23 @@ func TestSolverFor(t *testing.T) {
 								},
 							},
 						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
+						},
 					},
 				},
 			},
 			domain:             "example.com",
-			expectedSolverType: reflect.TypeOf(&acmedns.DNSProvider{}),
+			expectedSolverType: reflect.TypeFor[*acmedns.DNSProvider](),
 		},
 	}
 	testFn := func(test testT) func(*testing.T) {
 		return func(t *testing.T) {
+			t.Parallel()
 			test.Setup(t)
 			defer test.Finish(t)
 			s := test.Solver
-			dnsSolver, _, err := s.solverForChallenge(context.Background(), test.Issuer, test.Challenge)
+			dnsSolver, _, err := s.solverForChallenge(t.Context(), test.Challenge)
 			if err != nil && !test.expectErr {
 				t.Errorf("expected solverFor to not error, but got: %s", err.Error())
 				return
@@ -302,16 +358,17 @@ func TestSolverFor(t *testing.T) {
 }
 
 func TestSolveForDigitalOcean(t *testing.T) {
+	t.Parallel()
 	f := &solverFixture{
 		Builder: &test.Builder{
 			KubeObjects: []runtime.Object{
-				newSecret("digitalocean", "default", map[string][]byte{
+				newSecret("digitalocean", map[string][]byte{
 					"token": []byte("FAKE-TOKEN"),
-				}),
+				}, fakeIssuerNamespace),
 			},
 		},
-		Issuer: newIssuer("test", "default"),
 		Challenge: &cmacme.Challenge{
+			Namespace: fakeIssuerNamespace,
 			Spec: cmacme.ChallengeSpec{
 				Solver: cmacme.ACMEChallengeSolver{
 					DNS01: &cmacme.ACMEChallengeSolverDNS01{
@@ -325,6 +382,9 @@ func TestSolveForDigitalOcean(t *testing.T) {
 						},
 					},
 				},
+				IssuerRef: cmmeta.IssuerReference{
+					Name: "test-issuer",
+				},
 			},
 		},
 		dnsProviders: newFakeDNSProviders(),
@@ -334,35 +394,38 @@ func TestSolveForDigitalOcean(t *testing.T) {
 	defer f.Finish(t)
 
 	s := f.Solver
-	_, _, err := s.solverForChallenge(context.Background(), f.Issuer, f.Challenge)
+	_, _, err := s.solverForChallenge(t.Context(), f.Challenge)
 	if err != nil {
 		t.Fatalf("expected solverFor to not error, but got: %s", err)
 	}
 
 	expectedDOCall := []fakeDNSProviderCall{
 		{
-			name: "digitalocean",
-			args: []interface{}{"FAKE-TOKEN", util.RecursiveNameservers},
+			Name: "digitalocean",
+			Args: []any{digitalocean.DNSProviderOptions{
+				Token:       "FAKE-TOKEN",
+				Nameservers: s.DNS01Nameservers,
+				UserAgent:   s.RESTConfig.UserAgent,
+				Resolver:    s.DNSResolver,
+			}},
 		},
 	}
 
-	if !reflect.DeepEqual(expectedDOCall, f.dnsProviders.calls) {
-		t.Fatalf("expected %+v == %+v", expectedDOCall, f.dnsProviders.calls)
-	}
-
+	assertProviderCalls(t, expectedDOCall, f.dnsProviders.calls)
 }
 
 func TestRoute53TrimCreds(t *testing.T) {
+	t.Parallel()
 	f := &solverFixture{
 		Builder: &test.Builder{
 			KubeObjects: []runtime.Object{
-				newSecret("route53", "default", map[string][]byte{
+				newSecret("route53", map[string][]byte{
 					"secret": []byte("AKIENDINNEWLINE \n"),
-				}),
+				}, fakeIssuerNamespace),
 			},
 		},
-		Issuer: newIssuer("test", "default"),
 		Challenge: &cmacme.Challenge{
+			Namespace: fakeIssuerNamespace,
 			Spec: cmacme.ChallengeSpec{
 				Solver: cmacme.ACMEChallengeSolver{
 					DNS01: &cmacme.ACMEChallengeSolverDNS01{
@@ -378,6 +441,9 @@ func TestRoute53TrimCreds(t *testing.T) {
 						},
 					},
 				},
+				IssuerRef: cmmeta.IssuerReference{
+					Name: "test-issuer",
+				},
 			},
 		},
 		dnsProviders: newFakeDNSProviders(),
@@ -387,44 +453,49 @@ func TestRoute53TrimCreds(t *testing.T) {
 	defer f.Finish(t)
 
 	s := f.Solver
-	_, _, err := s.solverForChallenge(context.Background(), f.Issuer, f.Challenge)
+	_, _, err := s.solverForChallenge(t.Context(), f.Challenge)
 	if err != nil {
 		t.Fatalf("expected solverFor to not error, but got: %s", err)
 	}
 
 	expectedR53Call := []fakeDNSProviderCall{
 		{
-			name: "route53",
-			args: []interface{}{"test_with_spaces", "AKIENDINNEWLINE", "", "us-west-2", "", false, util.RecursiveNameservers},
+			Name: "route53",
+			Args: []any{route53.DNSProviderOptions{
+				AccessKeyID:     "test_with_spaces",
+				SecretAccessKey: "AKIENDINNEWLINE",
+				Region:          "us-west-2",
+				Nameservers:     util.RecursiveNameservers,
+				Ambient:         new(false),
+				UserAgent:       f.Solver.RESTConfig.UserAgent,
+				Resolver:        s.DNSResolver,
+			}},
 		},
 	}
 
-	if !reflect.DeepEqual(expectedR53Call, f.dnsProviders.calls) {
-		t.Fatalf("expected %+v == %+v", expectedR53Call, f.dnsProviders.calls)
-	}
+	assertProviderCalls(t, expectedR53Call, f.dnsProviders.calls)
 }
 
 func TestRoute53SecretAccessKey(t *testing.T) {
+	t.Parallel()
 	f := &solverFixture{
 		Builder: &test.Builder{
 			KubeObjects: []runtime.Object{
-				newSecret("route53", "default", map[string][]byte{
+				newSecret("route53", map[string][]byte{
 					"accessKeyID":     []byte("AWSACCESSKEYID"),
 					"secretAccessKey": []byte("AKIENDINNEWLINE \n"),
-				}),
+				}, fakeIssuerNamespace),
 			},
 		},
-		Issuer: newIssuer("test", "default"),
 		Challenge: &cmacme.Challenge{
+			Namespace: fakeIssuerNamespace,
 			Spec: cmacme.ChallengeSpec{
 				Solver: cmacme.ACMEChallengeSolver{
 					DNS01: &cmacme.ACMEChallengeSolverDNS01{
 						Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
 							SecretAccessKeyID: &cmmeta.SecretKeySelector{
-								LocalObjectReference: cmmeta.LocalObjectReference{
-									Name: "route53",
-								},
-								Key: "accessKeyID",
+								Name: "route53",
+								Key:  "accessKeyID",
 							},
 							Region: "us-west-2",
 							SecretAccessKey: cmmeta.SecretKeySelector{
@@ -436,6 +507,9 @@ func TestRoute53SecretAccessKey(t *testing.T) {
 						},
 					},
 				},
+				IssuerRef: cmmeta.IssuerReference{
+					Name: "test-issuer",
+				},
 			},
 		},
 		dnsProviders: newFakeDNSProviders(),
@@ -445,81 +519,87 @@ func TestRoute53SecretAccessKey(t *testing.T) {
 	defer f.Finish(t)
 
 	s := f.Solver
-	_, _, err := s.solverForChallenge(context.Background(), f.Issuer, f.Challenge)
+	_, _, err := s.solverForChallenge(t.Context(), f.Challenge)
 	if err != nil {
 		t.Fatalf("expected solverFor to not error, but got: %s", err)
 	}
 
 	expectedR53Call := []fakeDNSProviderCall{
 		{
-			name: "route53",
-			args: []interface{}{"AWSACCESSKEYID", "AKIENDINNEWLINE", "", "us-west-2", "", false, util.RecursiveNameservers},
+			Name: "route53",
+			Args: []any{route53.DNSProviderOptions{
+				AccessKeyID:     "AWSACCESSKEYID",
+				SecretAccessKey: "AKIENDINNEWLINE",
+				Region:          "us-west-2",
+				Nameservers:     s.DNS01Nameservers,
+				UserAgent:       s.RESTConfig.UserAgent,
+				Ambient:         new(false),
+				Resolver:        s.DNSResolver,
+			}},
 		},
 	}
 
-	if !reflect.DeepEqual(expectedR53Call, f.dnsProviders.calls) {
-		t.Fatalf("expected %+v == %+v", expectedR53Call, f.dnsProviders.calls)
-	}
+	assertProviderCalls(t, expectedR53Call, f.dnsProviders.calls)
 }
 
 func TestRoute53AmbientCreds(t *testing.T) {
+	t.Parallel()
 	type result struct {
-		expectedCall *fakeDNSProviderCall
+		expectedCall func(*solverFixture) *fakeDNSProviderCall
 		expectedErr  error
 	}
 
 	tests := []struct {
-		in  solverFixture
-		out result
+		name string
+		in   solverFixture
+		out  result
 	}{
 		{
+			"ambient credentials enabled",
 			solverFixture{
 				Builder: &test.Builder{
 					Context: &controller.Context{
-						RESTConfig: new(rest.Config),
-						ContextOptions: controller.ContextOptions{
-							IssuerOptions: controller.IssuerOptions{
-								IssuerAmbientCredentials: true,
-							},
-						},
+						RESTConfig:               new(rest.Config),
+						IssuerAmbientCredentials: true,
 					},
 				},
-				Issuer:       newIssuer("test", "default"),
 				dnsProviders: newFakeDNSProviders(),
-				Challenge: &cmacme.Challenge{
-					Spec: cmacme.ChallengeSpec{
-						Solver: cmacme.ACMEChallengeSolver{
-							DNS01: &cmacme.ACMEChallengeSolverDNS01{
-								Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
-									Region: "us-west-2",
-								},
-							},
-						},
-					},
-				},
+				Challenge: gen.Challenge("",
+					gen.SetChallengeNamespace(fakeIssuerNamespace),
+					gen.SetChallengeIssuer(cmmeta.IssuerReference{Name: "test-issuer"}),
+					gen.SetChallengeSolverDNS01(cmacme.ACMEChallengeSolverDNS01{
+						Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
+							Region: "us-west-2",
+						}}),
+				),
 			},
 			result{
-				expectedCall: &fakeDNSProviderCall{
-					name: "route53",
-					args: []interface{}{"", "", "", "us-west-2", "", true, util.RecursiveNameservers},
+				expectedCall: func(f *solverFixture) *fakeDNSProviderCall {
+					return &fakeDNSProviderCall{
+						Name: "route53",
+						Args: []any{route53.DNSProviderOptions{
+							Region:      "us-west-2",
+							Nameservers: f.Solver.DNS01Nameservers,
+							UserAgent:   f.Solver.RESTConfig.UserAgent,
+							Ambient:     new(true),
+							Resolver:    f.Solver.DNSResolver,
+						}},
+					}
 				},
 			},
 		},
 		{
+			"ambient credentials disabled",
 			solverFixture{
 				Builder: &test.Builder{
 					Context: &controller.Context{
-						RESTConfig: new(rest.Config),
-						ContextOptions: controller.ContextOptions{
-							IssuerOptions: controller.IssuerOptions{
-								IssuerAmbientCredentials: false,
-							},
-						},
+						RESTConfig:               new(rest.Config),
+						IssuerAmbientCredentials: false,
 					},
 				},
-				Issuer:       newIssuer("test", "default"),
 				dnsProviders: newFakeDNSProviders(),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
@@ -528,95 +608,313 @@ func TestRoute53AmbientCreds(t *testing.T) {
 								},
 							},
 						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
+						},
 					},
 				},
 			},
 			result{
-				expectedCall: &fakeDNSProviderCall{
-					name: "route53",
-					args: []interface{}{"", "", "", "us-west-2", "", false, util.RecursiveNameservers},
+				expectedCall: func(f *solverFixture) *fakeDNSProviderCall {
+					return &fakeDNSProviderCall{
+						Name: "route53",
+						Args: []any{route53.DNSProviderOptions{
+							Region:      "us-west-2",
+							Nameservers: util.RecursiveNameservers,
+							UserAgent:   f.Solver.RESTConfig.UserAgent,
+							Ambient:     new(false),
+							Resolver:    f.Solver.DNSResolver,
+						}},
+					}
 				},
 			},
 		},
 	}
 
 	for _, tt := range tests {
-		f := tt.in
-		f.Setup(t)
-		defer f.Finish(t)
-		s := f.Solver
-		_, _, err := s.solverForChallenge(context.Background(), f.Issuer, f.Challenge)
-		if tt.out.expectedErr != err {
-			t.Fatalf("expected error %v, got error %v", tt.out.expectedErr, err)
-		}
-
-		if tt.out.expectedCall != nil {
-			if !reflect.DeepEqual([]fakeDNSProviderCall{*tt.out.expectedCall}, f.dnsProviders.calls) {
-				t.Fatalf("expected %+v == %+v", []fakeDNSProviderCall{*tt.out.expectedCall}, f.dnsProviders.calls)
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := tt.in
+			f.Setup(t)
+			defer f.Finish(t)
+			s := f.Solver
+			_, _, err := s.solverForChallenge(t.Context(), f.Challenge)
+			if tt.out.expectedErr != err {
+				t.Fatalf("expected error %v, got error %v", tt.out.expectedErr, err)
 			}
-		}
+
+			if tt.out.expectedCall != nil {
+				expectedCall := *tt.out.expectedCall(&f)
+				assertProviderCalls(t, []fakeDNSProviderCall{expectedCall}, f.dnsProviders.calls)
+			}
+		})
+	}
+}
+
+func TestSolverForChallengeNameservers(t *testing.T) {
+	perSolverNameservers := []string{"1.1.1.1:53"}
+
+	tests := map[string]struct {
+		fixture      *solverFixture
+		expectedCall func(*solverFixture) fakeDNSProviderCall
+	}{
+		"route53: per-solver nameservers passed to constructor": {
+			fixture: &solverFixture{
+				dnsProviders: newFakeDNSProviders(),
+				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
+					Spec: cmacme.ChallengeSpec{
+						Solver: cmacme.ACMEChallengeSolver{
+							DNS01: &cmacme.ACMEChallengeSolverDNS01{
+								Nameservers: perSolverNameservers,
+								Route53:     &cmacme.ACMEIssuerDNS01ProviderRoute53{Region: "us-west-2"},
+							},
+						},
+						IssuerRef: cmmeta.IssuerReference{Name: "test-issuer"},
+					},
+				},
+			},
+			expectedCall: func(f *solverFixture) fakeDNSProviderCall {
+				return fakeDNSProviderCall{
+					Name: "route53",
+					Args: []any{route53.DNSProviderOptions{
+						Region:      "us-west-2",
+						Nameservers: perSolverNameservers,
+						Ambient:     new(false),
+						UserAgent:   f.Solver.RESTConfig.UserAgent,
+						Resolver:    f.Solver.DNSResolver,
+					}},
+				}
+			},
+		},
+		"digitalocean: per-solver nameservers passed to constructor": {
+			fixture: &solverFixture{
+				Builder: &test.Builder{
+					KubeObjects: []runtime.Object{
+						newSecret("digitalocean", map[string][]byte{"token": []byte("FAKE-TOKEN")}, fakeIssuerNamespace),
+					},
+				},
+				dnsProviders: newFakeDNSProviders(),
+				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
+					Spec: cmacme.ChallengeSpec{
+						Solver: cmacme.ACMEChallengeSolver{
+							DNS01: &cmacme.ACMEChallengeSolverDNS01{
+								Nameservers: perSolverNameservers,
+								DigitalOcean: &cmacme.ACMEIssuerDNS01ProviderDigitalOcean{
+									Token: cmmeta.SecretKeySelector{
+										LocalObjectReference: cmmeta.LocalObjectReference{Name: "digitalocean"},
+										Key:                  "token",
+									},
+								},
+							},
+						},
+						IssuerRef: cmmeta.IssuerReference{Name: "test-issuer"},
+					},
+				},
+			},
+			expectedCall: func(f *solverFixture) fakeDNSProviderCall {
+				return fakeDNSProviderCall{
+					Name: "digitalocean",
+					Args: []any{digitalocean.DNSProviderOptions{
+						Token:       "FAKE-TOKEN",
+						Nameservers: perSolverNameservers,
+						UserAgent:   f.Solver.RESTConfig.UserAgent,
+						Resolver:    f.Solver.DNSResolver,
+					}},
+				}
+			},
+		},
+		"route53: falls back to global nameservers when none set on solver": {
+			fixture: &solverFixture{
+				dnsProviders: newFakeDNSProviders(),
+				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
+					Spec: cmacme.ChallengeSpec{
+						Solver: cmacme.ACMEChallengeSolver{
+							DNS01: &cmacme.ACMEChallengeSolverDNS01{
+								Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{Region: "us-west-2"},
+							},
+						},
+						IssuerRef: cmmeta.IssuerReference{Name: "test-issuer"},
+					},
+				},
+			},
+			expectedCall: func(f *solverFixture) fakeDNSProviderCall {
+				return fakeDNSProviderCall{
+					Name: "route53",
+					Args: []any{route53.DNSProviderOptions{
+						Region:      "us-west-2",
+						Nameservers: util.RecursiveNameservers,
+						Ambient:     new(false),
+						UserAgent:   f.Solver.RESTConfig.UserAgent,
+						Resolver:    f.Solver.DNSResolver,
+					}},
+				}
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tt.fixture.Setup(t)
+			defer tt.fixture.Finish(t)
+
+			_, _, err := tt.fixture.Solver.solverForChallenge(t.Context(), tt.fixture.Challenge)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			expectedCall := tt.expectedCall(tt.fixture)
+			assertProviderCalls(t, []fakeDNSProviderCall{expectedCall}, tt.fixture.dnsProviders.calls)
+		})
+	}
+}
+
+func TestNameserversForProviderConfig(t *testing.T) {
+	globalNameservers := []string{"8.8.8.8:53", "8.8.4.4:53"}
+	perSolverNameservers := []string{"1.1.1.1:53", "1.0.0.1:53"}
+
+	tests := []struct {
+		name               string
+		globalNameservers  []string
+		checkAuthoritative bool
+		solverNameservers  []string
+		wantNameservers    []string
+		wantCheckAuth      bool
+	}{
+		{
+			name:               "empty solver nameservers falls back to global with authoritative check",
+			globalNameservers:  globalNameservers,
+			checkAuthoritative: true,
+			solverNameservers:  nil,
+			wantNameservers:    globalNameservers,
+			wantCheckAuth:      true,
+		},
+		{
+			name:               "empty solver nameservers falls back to global without authoritative check",
+			globalNameservers:  globalNameservers,
+			checkAuthoritative: false,
+			solverNameservers:  nil,
+			wantNameservers:    globalNameservers,
+			wantCheckAuth:      false,
+		},
+		{
+			name:               "per-solver nameservers override global and disable authoritative check",
+			globalNameservers:  globalNameservers,
+			checkAuthoritative: true,
+			solverNameservers:  perSolverNameservers,
+			wantNameservers:    perSolverNameservers,
+			wantCheckAuth:      false,
+		},
+		{
+			name:               "per-solver nameservers always disable authoritative check",
+			globalNameservers:  globalNameservers,
+			checkAuthoritative: false,
+			solverNameservers:  perSolverNameservers,
+			wantNameservers:    perSolverNameservers,
+			wantCheckAuth:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &solverFixture{
+				Builder: &test.Builder{
+					Context: &controller.Context{
+						DNS01Nameservers:        tt.globalNameservers,
+						DNS01CheckAuthoritative: tt.checkAuthoritative,
+					},
+				},
+				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
+					Spec: cmacme.ChallengeSpec{
+						Solver: cmacme.ACMEChallengeSolver{
+							DNS01: &cmacme.ACMEChallengeSolverDNS01{
+								Nameservers: tt.solverNameservers,
+								Cloudflare:  &cmacme.ACMEIssuerDNS01ProviderCloudflare{},
+							},
+						},
+					},
+				},
+			}
+			f.Setup(t)
+			defer f.Finish(t)
+
+			providerConfig, err := extractChallengeSolverConfig(f.Challenge)
+			if err != nil {
+				t.Fatalf("unexpected error extracting config: %v", err)
+			}
+
+			gotNameservers, gotCheckAuth := f.Solver.nameserversForProviderConfig(providerConfig)
+			assert.Equal(t, tt.wantNameservers, gotNameservers, "nameservers")
+			if tt.wantCheckAuth != gotCheckAuth {
+				t.Errorf("checkAuthoritative: got %v, want %v", gotCheckAuth, tt.wantCheckAuth)
+			}
+		})
 	}
 }
 
 func TestRoute53AssumeRole(t *testing.T) {
+	t.Parallel()
 	type result struct {
-		expectedCall *fakeDNSProviderCall
+		expectedCall func(*solverFixture) *fakeDNSProviderCall
 		expectedErr  error
 	}
 
 	tests := []struct {
-		in  solverFixture
-		out result
+		name string
+		in   solverFixture
+		out  result
 	}{
 		{
+			"assumes role with ambient credentials",
 			solverFixture{
 				Builder: &test.Builder{
 					Context: &controller.Context{
-						RESTConfig: new(rest.Config),
-						ContextOptions: controller.ContextOptions{
-							IssuerOptions: controller.IssuerOptions{
-								IssuerAmbientCredentials: true,
-							},
-						},
+						RESTConfig:               new(rest.Config),
+						IssuerAmbientCredentials: true,
 					},
 				},
-				Issuer:       newIssuer("test", "default"),
 				dnsProviders: newFakeDNSProviders(),
-				Challenge: &cmacme.Challenge{
-					Spec: cmacme.ChallengeSpec{
-						Solver: cmacme.ACMEChallengeSolver{
-							DNS01: &cmacme.ACMEChallengeSolverDNS01{
-								Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
-									Region: "us-west-2",
-									Role:   "my-role",
-								},
-							},
-						},
-					},
-				},
+				Challenge: gen.Challenge("",
+					gen.SetChallengeNamespace(fakeIssuerNamespace),
+					gen.SetChallengeIssuer(cmmeta.IssuerReference{Name: "test-issuer"}),
+					gen.SetChallengeSolverDNS01(cmacme.ACMEChallengeSolverDNS01{
+						Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
+							Region: "us-west-2",
+							Role:   "my-role",
+						}}),
+				),
 			},
 			result{
-				expectedCall: &fakeDNSProviderCall{
-					name: "route53",
-					args: []interface{}{"", "", "", "us-west-2", "my-role", true, util.RecursiveNameservers},
+				expectedCall: func(f *solverFixture) *fakeDNSProviderCall {
+					return &fakeDNSProviderCall{
+						Name: "route53",
+						Args: []any{route53.DNSProviderOptions{
+							Region:      "us-west-2",
+							Role:        "my-role",
+							Nameservers: f.Solver.DNS01Nameservers,
+							UserAgent:   f.Solver.RESTConfig.UserAgent,
+							Ambient:     new(true),
+							Resolver:    f.Solver.DNSResolver,
+						}},
+					}
 				},
 			},
 		},
 		{
+			"assumes role without ambient credentials",
 			solverFixture{
 				Builder: &test.Builder{
 					Context: &controller.Context{
-						RESTConfig: new(rest.Config),
-						ContextOptions: controller.ContextOptions{
-							IssuerOptions: controller.IssuerOptions{
-								IssuerAmbientCredentials: false,
-							},
-						},
+						RESTConfig:               new(rest.Config),
+						IssuerAmbientCredentials: false,
 					},
 				},
-				Issuer:       newIssuer("test", "default"),
 				dnsProviders: newFakeDNSProviders(),
 				Challenge: &cmacme.Challenge{
+					Namespace: fakeIssuerNamespace,
 					Spec: cmacme.ChallengeSpec{
 						Solver: cmacme.ACMEChallengeSolver{
 							DNS01: &cmacme.ACMEChallengeSolverDNS01{
@@ -626,32 +924,48 @@ func TestRoute53AssumeRole(t *testing.T) {
 								},
 							},
 						},
+						IssuerRef: cmmeta.IssuerReference{
+							Name: "test-issuer",
+						},
 					},
 				},
 			},
 			result{
-				expectedCall: &fakeDNSProviderCall{
-					name: "route53",
-					args: []interface{}{"", "", "", "us-west-2", "my-other-role", false, util.RecursiveNameservers},
+				expectedCall: func(f *solverFixture) *fakeDNSProviderCall {
+					return &fakeDNSProviderCall{
+						Name: "route53",
+						Args: []any{
+							route53.DNSProviderOptions{
+								Region:      "us-west-2",
+								Role:        "my-other-role",
+								Nameservers: f.Solver.DNS01Nameservers,
+								UserAgent:   f.Solver.RESTConfig.UserAgent,
+								Ambient:     new(false),
+								Resolver:    f.Solver.DNSResolver,
+							},
+						},
+					}
 				},
 			},
 		},
 	}
 
 	for _, tt := range tests {
-		f := tt.in
-		f.Setup(t)
-		defer f.Finish(t)
-		s := f.Solver
-		_, _, err := s.solverForChallenge(context.Background(), f.Issuer, f.Challenge)
-		if tt.out.expectedErr != err {
-			t.Fatalf("expected error %v, got error %v", tt.out.expectedErr, err)
-		}
-
-		if tt.out.expectedCall != nil {
-			if !reflect.DeepEqual([]fakeDNSProviderCall{*tt.out.expectedCall}, f.dnsProviders.calls) {
-				t.Fatalf("expected %+v == %+v", []fakeDNSProviderCall{*tt.out.expectedCall}, f.dnsProviders.calls)
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := tt.in
+			f.Setup(t)
+			defer f.Finish(t)
+			s := f.Solver
+			_, _, err := s.solverForChallenge(t.Context(), f.Challenge)
+			if tt.out.expectedErr != err {
+				t.Fatalf("expected error %v, got error %v", tt.out.expectedErr, err)
 			}
-		}
+
+			if tt.out.expectedCall != nil {
+				expectedCall := *tt.out.expectedCall(&f)
+				assertProviderCalls(t, []fakeDNSProviderCall{expectedCall}, f.dnsProviders.calls)
+			}
+		})
 	}
 }

@@ -21,20 +21,25 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cert-manager/cert-manager/internal/pem"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 )
 
 func buildCertificateWithKeyParams(keyAlgo v1.PrivateKeyAlgorithm, keySize int) *v1.Certificate {
+	return buildCertificateWithKeyAndSigParams(keyAlgo, keySize, "")
+}
+
+func buildCertificateWithKeyAndSigParams(keyAlgo v1.PrivateKeyAlgorithm, keySize int, sigAlg v1.SignatureAlgorithm) *v1.Certificate {
 	return &v1.Certificate{
 		Spec: v1.CertificateSpec{
 			CommonName: "test",
@@ -43,6 +48,7 @@ func buildCertificateWithKeyParams(keyAlgo v1.PrivateKeyAlgorithm, keySize int) 
 				Algorithm: keyAlgo,
 				Size:      keySize,
 			},
+			SignatureAlgorithm: sigAlg,
 		},
 	}
 }
@@ -155,6 +161,43 @@ func TestGeneratePrivateKeyForCertificate(t *testing.T) {
 			keyAlgo:   v1.Ed25519KeyAlgorithm,
 			expectErr: false,
 		},
+		{
+			name:      "mldsa with keysize not specified",
+			keyAlgo:   v1.MLDSAKeyAlgorithm,
+			expectErr: false,
+		},
+		{
+			name:      "mldsa key with keysize 44",
+			keyAlgo:   v1.MLDSAKeyAlgorithm,
+			keySize:   44,
+			expectErr: false,
+		},
+		{
+			name:      "mldsa key with keysize 65",
+			keyAlgo:   v1.MLDSAKeyAlgorithm,
+			keySize:   65,
+			expectErr: false,
+		},
+		{
+			name:      "mldsa key with keysize 87",
+			keyAlgo:   v1.MLDSAKeyAlgorithm,
+			keySize:   87,
+			expectErr: false,
+		},
+		{
+			name:         "mldsa key with unsupported keysize",
+			keyAlgo:      v1.MLDSAKeyAlgorithm,
+			keySize:      256,
+			expectErr:    true,
+			expectErrStr: "unsupported ML-DSA key size specified",
+		},
+		{
+			name:         "mldsa key with negative keysize",
+			keyAlgo:      v1.MLDSAKeyAlgorithm,
+			keySize:      -1,
+			expectErr:    true,
+			expectErrStr: "unsupported ML-DSA key size specified",
+		},
 	}
 
 	testFn := func(test testT) func(*testing.T) {
@@ -178,7 +221,7 @@ func TestGeneratePrivateKeyForCertificate(t *testing.T) {
 					return
 				}
 
-				if test.keyAlgo == "rsa" {
+				if test.keyAlgo == v1.RSAKeyAlgorithm {
 					// For rsa algorithm, if keysize is not provided, the default of 2048 will be used
 					expectedRsaKeySize := 2048
 					if test.keySize != 0 {
@@ -198,7 +241,7 @@ func TestGeneratePrivateKeyForCertificate(t *testing.T) {
 					}
 				}
 
-				if test.keyAlgo == "ecdsa" {
+				if test.keyAlgo == v1.ECDSAKeyAlgorithm {
 					// For ecdsa algorithm, if keysize is not provided, the default of 256 will be used
 					expectedEcdsaKeySize := ECCurve256
 					if test.keySize != 0 {
@@ -219,21 +262,44 @@ func TestGeneratePrivateKeyForCertificate(t *testing.T) {
 
 					curve, err := ecCurveForKeySize(test.keySize)
 					if err != nil {
-						t.Errorf(err.Error())
+						t.Error(err)
 						return
 					}
 
+					//nolint:staticcheck // SA1019: acceptable in test for ECDSA key validation
 					if !curve.IsOnCurve(key.PublicKey.X, key.PublicKey.Y) {
 						t.Error("expected key to be on specified curve")
 						return
 					}
 				}
 
-				if test.keyAlgo == "ed25519" {
+				if test.keyAlgo == v1.Ed25519KeyAlgorithm {
 					// For eddsa algorithm keysize is ignored
 					_, ok := privateKey.(ed25519.PrivateKey)
 					if !ok {
 						t.Errorf("expected ed25519 private key, but got %T", privateKey)
+						return
+					}
+				}
+
+				if test.keyAlgo == v1.MLDSAKeyAlgorithm {
+					// For mldsa algorithm, if keysize is not provided, ML-DSA-44 will be used
+					expectedParams := mldsa.MLDSA44()
+					switch test.keySize {
+					case MLDSA65:
+						expectedParams = mldsa.MLDSA65()
+					case MLDSA87:
+						expectedParams = mldsa.MLDSA87()
+					}
+
+					key, ok := privateKey.(*mldsa.PrivateKey)
+					if !ok {
+						t.Errorf("expected mldsa private key, but got %T", privateKey)
+						return
+					}
+
+					if actualParams := key.PublicKey().Parameters(); actualParams != expectedParams {
+						t.Errorf("expected %s, but got %s", expectedParams, actualParams)
 						return
 					}
 				}
@@ -249,15 +315,8 @@ func TestGeneratePrivateKeyForCertificate(t *testing.T) {
 func signTestCert(key crypto.Signer) *x509.Certificate {
 	commonName := "testingcert"
 
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		panic(fmt.Errorf("failed to generate serial number: %s", err.Error()))
-	}
-
 	template := &x509.Certificate{
-		Version:               2,
 		BasicConstraintsValid: true,
-		SerialNumber:          serialNumber,
 		SignatureAlgorithm:    x509.SHA256WithRSA,
 		Subject: pkix.Name{
 			Organization: []string{"cert-manager"},
@@ -318,6 +377,7 @@ func TestPublicKeyMatchesCertificateRequest(t *testing.T) {
 	}
 
 	template := &x509.CertificateRequest{
+		Version: 0,
 		// SignatureAlgorithm: sigAlgo,
 		Subject: pkix.Name{
 			CommonName: "cn",
@@ -422,11 +482,16 @@ O7WnDn8nuLFdW+NzzbIrTw==
 
 	testFn := func(test testT) func(*testing.T) {
 		return func(t *testing.T) {
-			block, _ := pem.Decode(privateKeyBytes)
+			block, _, err := pem.SafeDecodePrivateKey(privateKeyBytes)
+			if err != nil {
+				t.Fatalf("expected no PEM decode err but got %s", err)
+			}
+
 			decodedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			encodedKey, err := EncodePrivateKey(decodedKey, test.keyEncoding)
 			if test.expectErr {
 				if err == nil {
@@ -448,7 +513,10 @@ O7WnDn8nuLFdW+NzzbIrTw==
 
 				expectedEncoding := test.keyEncoding
 				actualEncoding := v1.PrivateKeyEncoding("")
-				block, _ := pem.Decode(encodedKey)
+				block, _, err := pem.SafeDecodePrivateKey(encodedKey)
+				if err != nil {
+					t.Fatalf("expected no PEM decode err but got %s", err)
+				}
 
 				switch block.Type {
 				case "PRIVATE KEY":
@@ -488,17 +556,9 @@ func TestPublicKeysEqualECDSA(t *testing.T) {
 	}
 
 	pub1 := key1.Public().(*ecdsa.PublicKey)
-
-	// (pub1.X, pub1.Y) isn't likely to be on the curve for key2, so pub2 will be
-	// invalid after changing its X and Y below; still, pub2 is useful for
-	// the test
-
-	// this is not dissimilar to the standard library's test:
-	// https://github.com/golang/go/blob/14a18b7d2538232c6cd6937297c421d5f6b7d92f/src/crypto/ecdsa/equal_test.go#L55-L64
 	pub2 := key2.Public().(*ecdsa.PublicKey)
-	pub2.X = pub1.X
-	pub2.Y = pub1.Y
 
+	// Keys are on different curves → must not be equal
 	if pub1.Equal(pub2) {
 		t.Fatalf("invalid test: got a match from curves which should differ:\npub1: %#v\npub2: %#v\n", pub1, pub2)
 	}
@@ -578,5 +638,108 @@ func TestPublicKeysEqualRSA(t *testing.T) {
 
 	if match {
 		t.Errorf("got an incorrect match from different RSA keys:\npub1: %#v\npub2: %#v\n", pub1, pub2)
+	}
+}
+
+func TestPrivateKeyEncodingsMLDSA(t *testing.T) {
+	// ML-DSA keys are always PKCS#8 encoded, because there is no PKCS#1
+	// encoding for them; a PKCS#1 (or empty) encoding is ignored.
+	for _, keyEncoding := range []v1.PrivateKeyEncoding{"", v1.PKCS1, v1.PKCS8} {
+		for _, params := range []mldsa.Parameters{mldsa.MLDSA44(), mldsa.MLDSA65(), mldsa.MLDSA87()} {
+			t.Run(fmt.Sprintf("%s with %q key encoding", params, keyEncoding), func(t *testing.T) {
+				key, err := GenerateMLDSAPrivateKey(params)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				encodedKey, err := EncodePrivateKey(key, keyEncoding)
+				if err != nil {
+					t.Fatalf("expected no err, but got '%q'", err)
+				}
+
+				block, _, err := pem.SafeDecodePrivateKey(encodedKey)
+				if err != nil {
+					t.Fatalf("expected no PEM decode err but got %s", err)
+				}
+
+				if block.Type != "PRIVATE KEY" {
+					t.Errorf("expected PEM block type %q, but got %q", "PRIVATE KEY", block.Type)
+				}
+
+				decodedKey, err := DecodePrivateKeyBytes(encodedKey)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if !key.Equal(decodedKey) {
+					t.Error("expected decoded key to be equal to the original key")
+				}
+			})
+		}
+	}
+}
+
+func TestPublicKeysEqualMLDSA(t *testing.T) {
+	key1, err := GenerateMLDSAPrivateKey(mldsa.MLDSA65())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key2, err := GenerateMLDSAPrivateKey(mldsa.MLDSA65())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// note the different parameter set
+	key3, err := GenerateMLDSAPrivateKey(mldsa.MLDSA87())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rsaKey, err := DecodePrivateKeyBytes([]byte(hardcodedTestKey))
+	if err != nil {
+		t.Fatalf("couldn't parse RSA test key: %v", err)
+	}
+
+	pub1, err := PublicKeyForPrivateKey(key1)
+	if err != nil {
+		t.Fatalf("unexpected error from PublicKeyForPrivateKey: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		b     any
+		match bool
+	}{
+		{name: "same key", b: key1.Public(), match: true},
+		{name: "different key with the same parameter set", b: key2.Public(), match: false},
+		{name: "different parameter set", b: key3.Public(), match: false},
+		{name: "different key type", b: rsaKey.Public(), match: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			match, err := PublicKeysEqual(pub1, test.b)
+			if err != nil {
+				t.Fatalf("unexpected error from PublicKeysEqual: %v", err)
+			}
+
+			if match != test.match {
+				t.Errorf("expected match to be %v, but got %v", test.match, match)
+			}
+		})
+	}
+}
+
+func TestPublicKeysEqualUnknownKeyType(t *testing.T) {
+	type unknownPublicKey struct{}
+
+	match, err := PublicKeysEqual(unknownPublicKey{}, unknownPublicKey{})
+	if err == nil {
+		t.Error("expected an error for an unknown public key type, but got none")
+	}
+
+	if match {
+		t.Error("expected no match for an unknown public key type")
 	}
 }

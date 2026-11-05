@@ -20,13 +20,14 @@ import (
 	"context"
 	"fmt"
 	"hash/adler32"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/utils/pointer"
 
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
@@ -47,35 +48,60 @@ func podLabels(ch *cmacme.Challenge) map[string]string {
 	}
 }
 
-func (s *Solver) ensurePod(ctx context.Context, ch *cmacme.Challenge) (*corev1.Pod, error) {
+// acmeIdentityLabelKeys defines the set of label keys reserved for ACME
+// challenge resource discovery. These cannot be overridden by global solver
+// extra labels.
+var acmeIdentityLabelKeys = map[string]bool{
+	cmacme.DomainLabelKey:               true,
+	cmacme.TokenLabelKey:                true,
+	cmacme.SolverIdentificationLabelKey: true,
+}
+
+// filterACMEIdentityLabels returns a copy of labels with ACME identity
+// labels removed. Does not mutate the input map.
+func filterACMEIdentityLabels(labels map[string]string) map[string]string {
+	if labels == nil {
+		return nil
+	}
+	result := make(map[string]string, len(labels))
+	for key, val := range labels {
+		if !acmeIdentityLabelKeys[key] {
+			result[key] = val
+		}
+	}
+	return result
+}
+
+func (s *Solver) ensurePod(ctx context.Context, ch *cmacme.Challenge) error {
 	log := logf.FromContext(ctx).WithName("ensurePod")
 
 	log.V(logf.DebugLevel).Info("checking for existing HTTP01 solver pods")
 	existingPods, err := s.getPodsForChallenge(ctx, ch)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(existingPods) == 1 {
 		logf.WithRelatedResource(log, existingPods[0]).Info("found one existing HTTP01 solver pod")
-		return existingPods[0], nil
+		return nil
 	}
 	if len(existingPods) > 1 {
 		log.V(logf.InfoLevel).Info("multiple challenge solver pods found for challenge. cleaning up all existing pods.")
 		err := s.cleanupPods(ctx, ch)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return nil, fmt.Errorf("multiple existing challenge solver pods found and cleaned up. retrying challenge sync")
+		return fmt.Errorf("multiple existing challenge solver pods found and cleaned up. retrying challenge sync")
 	}
 
 	log.V(logf.InfoLevel).Info("creating HTTP01 challenge solver pod")
 
-	return s.createPod(ctx, ch)
+	_, err = s.createPod(ctx, ch)
+	return err
 }
 
 // getPodsForChallenge returns a list of pods that were created to solve
 // the given challenge
-func (s *Solver) getPodsForChallenge(ctx context.Context, ch *cmacme.Challenge) ([]*corev1.Pod, error) {
+func (s *Solver) getPodsForChallenge(ctx context.Context, ch *cmacme.Challenge) ([]*metav1.PartialObjectMetadata, error) {
 	log := logf.FromContext(ctx)
 
 	podLabels := podLabels(ch)
@@ -88,19 +114,23 @@ func (s *Solver) getPodsForChallenge(ctx context.Context, ch *cmacme.Challenge) 
 		orderSelector = orderSelector.Add(*req)
 	}
 
-	podList, err := s.podLister.Pods(ch.Namespace).List(orderSelector)
+	podMetadataList, err := s.podLister.ByNamespace(ch.Namespace).List(orderSelector)
 	if err != nil {
 		return nil, err
 	}
 
-	var relevantPods []*corev1.Pod
-	for _, pod := range podList {
-		if !metav1.IsControlledBy(pod, ch) {
-			logf.WithRelatedResource(log, pod).Info("found existing solver pod for this challenge resource, however " +
+	var relevantPods []*metav1.PartialObjectMetadata
+	for _, pod := range podMetadataList {
+		p, ok := pod.(*metav1.PartialObjectMetadata)
+		if !ok {
+			return nil, fmt.Errorf("internal error: cannot cast PartialMetadata: %+#v", pod)
+		}
+		if !metav1.IsControlledBy(p, ch) {
+			logf.WithRelatedResource(log, p).Info("found existing solver pod for this challenge resource, however " +
 				"it does not have an appropriate OwnerReference referencing this challenge. Skipping it altogether.")
 			continue
 		}
-		relevantPods = append(relevantPods, pod)
+		relevantPods = append(relevantPods, p)
 	}
 
 	return relevantPods, nil
@@ -111,7 +141,7 @@ func (s *Solver) cleanupPods(ctx context.Context, ch *cmacme.Challenge) error {
 
 	pods, err := s.getPodsForChallenge(ctx, ch)
 	if err != nil {
-		return err
+		return fmt.Errorf("error retrieving pods for cleanup: %w", err)
 	}
 	var errs []error
 	for _, pod := range pods {
@@ -119,9 +149,15 @@ func (s *Solver) cleanupPods(ctx context.Context, ch *cmacme.Challenge) error {
 		log.V(logf.InfoLevel).Info("deleting pod resource")
 
 		err := s.Client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		if k8sErrors.IsNotFound(err) {
+			// the lister can be behind the API server, so a pod that is
+			// already gone is the state we wanted anyway
+			log.V(logf.DebugLevel).Info("pod resource already deleted")
+			continue
+		}
 		if err != nil {
 			log.V(logf.WarnLevel).Info("failed to delete pod resource", "error", err)
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("error deleting pod: %w", err))
 			continue
 		}
 		log.V(logf.InfoLevel).Info("successfully deleted pod resource")
@@ -150,6 +186,10 @@ func (s *Solver) buildPod(ch *cmacme.Challenge) *corev1.Pod {
 			pod = s.mergePodObjectMetaWithPodTemplate(pod,
 				ch.Spec.Solver.HTTP01.Ingress.PodTemplate)
 		}
+		if ch.Spec.Solver.HTTP01.GatewayHTTPRoute != nil {
+			pod = s.mergePodObjectMetaWithPodTemplate(pod,
+				ch.Spec.Solver.HTTP01.GatewayHTTPRoute.PodTemplate)
+		}
 	}
 
 	return pod
@@ -158,38 +198,48 @@ func (s *Solver) buildPod(ch *cmacme.Challenge) *corev1.Pod {
 // Note: this function builds pod spec using defaults and any configuration
 // options passed via flags to cert-manager controller.
 // Solver pod configuration via flags is a now deprecated
-// mechanism- please use pod template instead when adding any new
+// mechanism - please use pod template instead when adding any new
 // configuration options
 // https://github.com/cert-manager/cert-manager/blob/f1d7c432763100c3fb6eb6a1654d29060b479b3c/pkg/apis/acme/v1/types_issuer.go#L270
 func (s *Solver) buildDefaultPod(ch *cmacme.Challenge) *corev1.Pod {
 	podLabels := podLabels(ch)
+	maps.Copy(podLabels, filterACMEIdentityLabels(s.ACMEOptions.HTTP01SolverExtraLabels))
+	var runtimeClassName *string
+	if s.ACMEOptions.HTTP01SolverRuntimeClassName != "" {
+		runtimeClassName = new(s.ACMEOptions.HTTP01SolverRuntimeClassName)
+	}
 
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "cm-acme-http-solver-",
-			Namespace:    ch.Namespace,
-			Labels:       podLabels,
-			Annotations: map[string]string{
-				"sidecar.istio.io/inject": "false",
-			},
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ch, challengeGvk)},
+		GenerateName: "cm-acme-http-solver-",
+		Namespace:    ch.Namespace,
+		Labels:       podLabels,
+		Annotations: map[string]string{
+			"sidecar.istio.io/inject":                        "false",
+			"cluster-autoscaler.kubernetes.io/safe-to-evict": "true",
 		},
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ch, challengeGvk)},
 		Spec: corev1.PodSpec{
+			// The HTTP01 solver process does not need access to the
+			// Kubernetes API server, so we turn off automounting of
+			// the Kubernetes ServiceAccount token.
+			// See https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#opt-out-of-api-credential-automounting
+			AutomountServiceAccountToken: new(false),
 			NodeSelector: map[string]string{
 				"kubernetes.io/os": "linux",
 			},
-			RestartPolicy: corev1.RestartPolicyOnFailure,
+			RestartPolicy:      corev1.RestartPolicyOnFailure,
+			EnableServiceLinks: new(false),
+			RuntimeClassName:   runtimeClassName,
 			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot: pointer.BoolPtr(true),
+				RunAsNonRoot: new(s.ACMEOptions.ACMEHTTP01SolverRunAsNonRoot),
 				SeccompProfile: &corev1.SeccompProfile{
 					Type: corev1.SeccompProfileTypeRuntimeDefault,
 				},
 			},
 			Containers: []corev1.Container{
 				{
-					Name: "acmesolver",
-					// TODO: use an image as specified as a config option
-					Image:           s.Context.HTTP01SolverImage,
+					Name:            "acmesolver",
+					Image:           s.ACMEOptions.HTTP01SolverImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					// TODO: replace this with some kind of cmdline generator
 					Args: []string{
@@ -215,7 +265,8 @@ func (s *Solver) buildDefaultPod(ch *cmacme.Challenge) *corev1.Pod {
 						},
 					},
 					SecurityContext: &corev1.SecurityContext{
-						AllowPrivilegeEscalation: pointer.BoolPtr(false),
+						ReadOnlyRootFilesystem:   new(true),
+						AllowPrivilegeEscalation: new(false),
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{"ALL"},
 						},
@@ -236,25 +287,19 @@ func (s *Solver) mergePodObjectMetaWithPodTemplate(pod *corev1.Pod, podTempl *cm
 		pod.Labels = make(map[string]string)
 	}
 
-	for k, v := range podTempl.Labels {
-		pod.Labels[k] = v
-	}
+	maps.Copy(pod.Labels, podTempl.Labels)
 
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
 
-	for k, v := range podTempl.Annotations {
-		pod.Annotations[k] = v
-	}
+	maps.Copy(pod.Annotations, podTempl.Annotations)
 
 	if pod.Spec.NodeSelector == nil {
 		pod.Spec.NodeSelector = make(map[string]string)
 	}
 
-	for k, v := range podTempl.Spec.NodeSelector {
-		pod.Spec.NodeSelector[k] = v
-	}
+	maps.Copy(pod.Spec.NodeSelector, podTempl.Spec.NodeSelector)
 
 	if pod.Spec.Tolerations == nil {
 		pod.Spec.Tolerations = []corev1.Toleration{}
@@ -272,6 +317,44 @@ func (s *Solver) mergePodObjectMetaWithPodTemplate(pod *corev1.Pod, podTempl *cm
 
 	if podTempl.Spec.ServiceAccountName != "" {
 		pod.Spec.ServiceAccountName = podTempl.Spec.ServiceAccountName
+	}
+
+	if pod.Spec.ImagePullSecrets == nil {
+		pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{}
+	}
+
+	pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, podTempl.Spec.ImagePullSecrets...)
+
+	if podTempl.Spec.SecurityContext != nil {
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{}
+		pod.Spec.SecurityContext.SELinuxOptions = podTempl.Spec.SecurityContext.SELinuxOptions
+		pod.Spec.SecurityContext.RunAsUser = podTempl.Spec.SecurityContext.RunAsUser
+		pod.Spec.SecurityContext.RunAsGroup = podTempl.Spec.SecurityContext.RunAsGroup
+		pod.Spec.SecurityContext.RunAsNonRoot = podTempl.Spec.SecurityContext.RunAsNonRoot
+		pod.Spec.SecurityContext.SupplementalGroups = podTempl.Spec.SecurityContext.SupplementalGroups
+		pod.Spec.SecurityContext.FSGroup = podTempl.Spec.SecurityContext.FSGroup
+		pod.Spec.SecurityContext.Sysctls = podTempl.Spec.SecurityContext.Sysctls
+		pod.Spec.SecurityContext.FSGroupChangePolicy = podTempl.Spec.SecurityContext.FSGroupChangePolicy
+		pod.Spec.SecurityContext.SeccompProfile = podTempl.Spec.SecurityContext.SeccompProfile
+	}
+
+	// Merge container resources based on precedence:
+	// 1. If pod template resources are set, use them (highest priority)
+	// 2. Otherwise use values from ACMEOptions (already set in the 'buildDefaultPod' function)
+	if podTempl.Spec.Resources != nil {
+		container := &pod.Spec.Containers[0]
+		if podTempl.Spec.Resources.Requests != nil {
+			if container.Resources.Requests == nil {
+				container.Resources.Requests = make(corev1.ResourceList)
+			}
+			maps.Copy(container.Resources.Requests, podTempl.Spec.Resources.Requests)
+		}
+		if podTempl.Spec.Resources.Limits != nil {
+			if container.Resources.Limits == nil {
+				container.Resources.Limits = make(corev1.ResourceList)
+			}
+			maps.Copy(container.Resources.Limits, podTempl.Spec.Resources.Limits)
+		}
 	}
 
 	return pod

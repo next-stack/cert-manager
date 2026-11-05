@@ -16,7 +16,12 @@ limitations under the License.
 
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logsapi "k8s.io/component-base/logs/api/v1"
+
+	sharedv1alpha1 "github.com/cert-manager/cert-manager/pkg/apis/config/shared/v1alpha1"
+)
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
@@ -24,21 +29,24 @@ type WebhookConfiguration struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// securePort is the port number to listen on for secure TLS connections from the kube-apiserver.
+	// If 0, a random available port will be chosen.
 	// Defaults to 6443.
-	SecurePort *int `json:"securePort,omitempty"`
+	SecurePort *int32 `json:"securePort,omitempty"`
 
 	// healthzPort is the port number to listen on (using plaintext HTTP) for healthz connections.
+	// If 0, a random available port will be chosen.
 	// Defaults to 6080.
-	HealthzPort *int `json:"healthzPort,omitempty"`
+	HealthzPort *int32 `json:"healthzPort,omitempty"`
 
 	// tlsConfig is used to configure the secure listener's TLS settings.
-	TLSConfig TLSConfig `json:"tlsConfig"`
+	TLSConfig sharedv1alpha1.TLSConfig `json:"tlsConfig"`
 
 	// kubeConfig is the kubeconfig file used to connect to the Kubernetes apiserver.
 	// If not specified, the webhook will attempt to load the in-cluster-config.
 	KubeConfig string `json:"kubeConfig,omitempty"`
 
 	// apiServerHost is used to override the API server connection address.
+	//
 	// Deprecated: use `kubeConfig` instead.
 	APIServerHost string `json:"apiServerHost,omitempty"`
 
@@ -49,60 +57,55 @@ type WebhookConfiguration struct {
 	// Defaults to 'localhost:6060'.
 	PprofAddress string `json:"pprofAddress,omitempty"`
 
+	// logging configures the logging behaviour of the webhook.
+	// https://pkg.go.dev/k8s.io/component-base@v0.27.3/logs/api/v1#LoggingConfiguration
+	Logging logsapi.LoggingConfiguration `json:"logging"`
+
 	// featureGates is a map of feature names to bools that enable or disable experimental
 	// features.
-	// Default: nil
 	// +optional
 	FeatureGates map[string]bool `json:"featureGates,omitempty"`
+
+	// The host and port that the metrics endpoint should listen on.
+	// The value "0" disables the metrics server.
+	// Defaults to '0.0.0.0:9402'.
+	MetricsListenAddress string `json:"metricsListenAddress,omitempty"`
+
+	// metricsTLSConfig is used to configure the metrics server TLS settings.
+	MetricsTLSConfig sharedv1alpha1.TLSConfig `json:"metricsTLSConfig"`
+
+	// EnableClientVerification turns on client verification of requests
+	// made to the webhook server
+	EnableClientVerification bool `json:"enableClientVerification,omitempty"`
+
+	// ClientCAPath is the CA certificate name which server used to verify remote(client)'s certificate.
+	// Defaults to "", which means server does not verify client's certificate.
+	ClientCAPath string `json:"clientCAPath,omitempty"`
+
+	// ClientCertificateSubjects is a list of acceptable subject names for client
+	// certificates used by the apiserver to contact webhooks. Each entry will
+	// be matched against the certificate's CommonName and DNS SubjectAltNames.
+	// Multiple values allow zero-downtime rotations.
+	ClientCertificateSubjects []string `json:"clientCertificateSubjects,omitempty"`
+
+	// pemSizeLimitsConfig configures the maximum sizes for PEM-encoded data
+	PEMSizeLimitsConfig PEMSizeLimitsConfig `json:"pemSizeLimitsConfig,omitzero"`
 }
 
-// TLSConfig configures how TLS certificates are sourced for serving.
-// Only one of 'filesystem' or 'dynamic' may be specified.
-type TLSConfig struct {
-	// cipherSuites is the list of allowed cipher suites for the server.
-	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
-	// If not specified, the default for the Go version will be used and may change over time.
-	CipherSuites []string `json:"cipherSuites,omitempty"`
+type PEMSizeLimitsConfig struct {
+	// Maximum size for a single PEM-encoded certificate (in bytes).
+	// Defaults to 36500 bytes.
+	MaxCertificateSize *int32 `json:"maxCertificateSize,omitempty"`
 
-	// minTLSVersion is the minimum TLS version supported.
-	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
-	// If not specified, the default for the Go version will be used and may change over time.
-	MinTLSVersion string `json:"minTLSVersion,omitempty"`
+	// Maximum size for a single PEM-encoded private key (in bytes).
+	// Defaults to 13000 bytes.
+	MaxPrivateKeySize *int32 `json:"maxPrivateKeySize,omitempty"`
 
-	// Filesystem enables using a certificate and private key found on the local filesystem.
-	// These files will be periodically polled in case they have changed, and dynamically reloaded.
-	Filesystem FilesystemServingConfig `json:"filesystem"`
+	// Maximum size for a PEM-encoded certificate chain (in bytes).
+	// Defaults to 95000 bytes.
+	MaxChainLength *int32 `json:"maxChainLength,omitempty"`
 
-	// When Dynamic serving is enabled, the webhook will generate a CA used to sign webhook
-	// certificates and persist it into a Kubernetes Secret resource (for other replicas of the
-	// webhook to consume).
-	// It will then generate a certificate in-memory for itself using this CA to serve with.
-	// The CAs certificate can then be copied into the appropriate Validating, Mutating and Conversion
-	// webhook configuration objects (typically by cainjector).
-	Dynamic DynamicServingConfig `json:"dynamic"`
-}
-
-// DynamicServingConfig makes the webhook generate a CA and persist it into Secret resources.
-// This CA will be used by all instances of the webhook for signing serving certificates.
-type DynamicServingConfig struct {
-	// Namespace of the Kubernetes Secret resource containing the TLS certificate
-	// used as a CA to sign dynamic serving certificates.
-	SecretNamespace string `json:"secretNamespace,omitempty"`
-
-	// Namespace of the Kubernetes Secret resource containing the TLS certificate
-	// used as a CA to sign dynamic serving certificates.
-	SecretName string `json:"secretName,omitempty"`
-
-	// DNSNames that must be present on serving certificates signed by the CA.
-	DNSNames []string `json:"dnsNames,omitempty"`
-}
-
-// FilesystemServingConfig enables using a certificate and private key found on the local filesystem.
-// These files will be periodically polled in case they have changed, and dynamically reloaded.
-type FilesystemServingConfig struct {
-	// Path to a file containing TLS certificate & chain to serve with
-	CertFile string `json:"certFile,omitempty"`
-
-	// Path to a file containing a TLS private key to server with
-	KeyFile string `json:"keyFile,omitempty"`
+	// Maximum size for PEM-encoded certificate bundles (in bytes).
+	// Defaults to 330000 bytes.
+	MaxBundleSize *int32 `json:"maxBundleSize,omitempty"`
 }

@@ -17,10 +17,10 @@ limitations under the License.
 package gen
 
 import (
+	"maps"
 	"strconv"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	experimentalapi "github.com/cert-manager/cert-manager/pkg/apis/experimental/v1alpha1"
 )
@@ -29,11 +29,9 @@ type CertificateSigningRequestModifier func(*certificatesv1.CertificateSigningRe
 
 func CertificateSigningRequest(name string, mods ...CertificateSigningRequestModifier) *certificatesv1.CertificateSigningRequest {
 	c := &certificatesv1.CertificateSigningRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Annotations: make(map[string]string),
-			Labels:      make(map[string]string),
-		},
+		Name:        name,
+		Annotations: make(map[string]string),
+		Labels:      make(map[string]string),
 	}
 	for _, mod := range mods {
 		mod(c)
@@ -43,11 +41,9 @@ func CertificateSigningRequest(name string, mods ...CertificateSigningRequestMod
 
 func CertificateSigningRequestWithRandomName(prefix string, mods ...CertificateSigningRequestModifier) *certificatesv1.CertificateSigningRequest {
 	c := &certificatesv1.CertificateSigningRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: prefix,
-			Annotations:  make(map[string]string),
-			Labels:       make(map[string]string),
-		},
+		GenerateName: prefix,
+		Annotations:  make(map[string]string),
+		Labels:       make(map[string]string),
 	}
 	for _, mod := range mods {
 		mod(c)
@@ -82,9 +78,7 @@ func AddCertificateSigningRequestAnnotations(annotations map[string]string) Cert
 		if annotationsNew == nil {
 			annotationsNew = make(map[string]string)
 		}
-		for k, v := range annotations {
-			annotationsNew[k] = v
-		}
+		maps.Copy(annotationsNew, annotations)
 		csr.SetAnnotations(annotationsNew)
 	}
 }

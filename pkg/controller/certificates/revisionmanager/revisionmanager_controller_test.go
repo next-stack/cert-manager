@@ -17,11 +17,10 @@ limitations under the License.
 package revisionmanager
 
 import (
-	"context"
-	"reflect"
 	"testing"
 
-	logtesting "github.com/go-logr/logr/testing"
+	"github.com/go-logr/logr/testr"
+	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -29,7 +28,6 @@ import (
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
@@ -52,7 +50,7 @@ func TestProcessItem(t *testing.T) {
 		// key that should be passed to ProcessItem.
 		// if not set, the 'namespace/name' of the 'Certificate' field will be used.
 		// if neither is set, the key will be ""
-		key string
+		key types.NamespacedName
 
 		// Certificate to be synced for the test.
 		// if not set, the 'key' will be passed to ProcessItem instead.
@@ -68,15 +66,20 @@ func TestProcessItem(t *testing.T) {
 	}{
 		"do nothing if an empty 'key' is used": {},
 		"do nothing if an invalid 'key' is used": {
-			key: "abc/def/ghi",
+			key: types.NamespacedName{
+				Namespace: "abc",
+				Name:      "def/ghi",
+			},
 		},
 		"do nothing if a key references a Certificate that does not exist": {
-			key: "namespace/name",
+			key: types.NamespacedName{
+				Namespace: "namespace",
+				Name:      "name",
+			},
 		},
 		"do nothing if Certificate is not in a Ready=True state": {
 			certificate: gen.CertificateFrom(baseCrt,
 				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse}),
-				gen.SetCertificateRevisionHistoryLimit(1),
 			),
 			requests: []runtime.Object{
 				gen.CertificateRequestFrom(baseCR,
@@ -91,13 +94,11 @@ func TestProcessItem(t *testing.T) {
 		"do nothing if no requests exist": {
 			certificate: gen.CertificateFrom(baseCrt,
 				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionReady, Status: cmmeta.ConditionTrue}),
-				gen.SetCertificateRevisionHistoryLimit(1),
 			),
 		},
 		"do nothing if requests don't have or bad revisions set": {
 			certificate: gen.CertificateFrom(baseCrt,
 				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionReady, Status: cmmeta.ConditionTrue}),
-				gen.SetCertificateRevisionHistoryLimit(1),
 			),
 			requests: []runtime.Object{
 				gen.CertificateRequestFrom(baseCR,
@@ -112,7 +113,6 @@ func TestProcessItem(t *testing.T) {
 		"do nothing if requests aren't owned by this Certificate": {
 			certificate: gen.CertificateFrom(baseCrt,
 				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionReady, Status: cmmeta.ConditionTrue}),
-				gen.SetCertificateRevisionHistoryLimit(1),
 			),
 			requests: []runtime.Object{
 				gen.CertificateRequestFrom(baseCRNoOwner,
@@ -141,25 +141,9 @@ func TestProcessItem(t *testing.T) {
 				),
 			},
 		},
-		"do nothing if revision limit is not set": {
+		"delete 1 request if 2 requests exist since the default limit is 1": {
 			certificate: gen.CertificateFrom(baseCrt,
 				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionReady, Status: cmmeta.ConditionTrue}),
-			),
-			requests: []runtime.Object{
-				gen.CertificateRequestFrom(baseCR,
-					gen.SetCertificateRequestName("cr-1"),
-					gen.SetCertificateRequestRevision("1"),
-				),
-				gen.CertificateRequestFrom(baseCR,
-					gen.SetCertificateRequestName("cr-2"),
-					gen.SetCertificateRequestRevision("2"),
-				),
-			},
-		},
-		"delete 1 request if limit is 1 and 2 requests exist": {
-			certificate: gen.CertificateFrom(baseCrt,
-				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionReady, Status: cmmeta.ConditionTrue}),
-				gen.SetCertificateRevisionHistoryLimit(1),
 			),
 			requests: []runtime.Object{
 				gen.CertificateRequestFrom(baseCR,
@@ -239,15 +223,15 @@ func TestProcessItem(t *testing.T) {
 			defer builder.Stop()
 
 			key := test.key
-			if key == "" && test.certificate != nil {
-				key, err = controllerpkg.KeyFunc(test.certificate)
-				if err != nil {
-					t.Fatal(err)
+			if key == (types.NamespacedName{}) && test.certificate != nil {
+				key = types.NamespacedName{
+					Name:      test.certificate.Name,
+					Namespace: test.certificate.Namespace,
 				}
 			}
 
 			// Call ProcessItem
-			err = w.controller.ProcessItem(context.Background(), key)
+			err = w.controller.ProcessItem(t.Context(), key)
 			switch {
 			case err != nil:
 				if test.err != err.Error() {
@@ -263,9 +247,6 @@ func TestProcessItem(t *testing.T) {
 				builder.T.Error(err)
 			}
 			if err := builder.AllActionsExecuted(); err != nil {
-				builder.T.Error(err)
-			}
-			if err := builder.AllReactorsCalled(); err != nil {
 				builder.T.Error(err)
 			}
 		})
@@ -315,7 +296,7 @@ func TestCertificateRequestsToDelete(t *testing.T) {
 			limit: 1,
 			exp:   []revision{},
 		},
-		"multiple requests with some with good revsions should return list in order": {
+		"multiple requests with some with good revisions should return list in order": {
 			input: []*cmapi.CertificateRequest{
 				gen.CertificateRequestFrom(baseCR,
 					gen.SetCertificateRequestName("cr-1"),
@@ -367,7 +348,7 @@ func TestCertificateRequestsToDelete(t *testing.T) {
 				},
 			},
 		},
-		"multiple requests with some with good revsions but less than the limit, should return list in order under limit": {
+		"multiple requests with some with good revisions but less than the limit, should return list in order under limit": {
 			input: []*cmapi.CertificateRequest{
 				gen.CertificateRequestFrom(baseCR,
 					gen.SetCertificateRequestName("cr-1"),
@@ -409,12 +390,9 @@ func TestCertificateRequestsToDelete(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			log := logtesting.NewTestLogger(t)
+			log := testr.New(t)
 			output := certificateRequestsToDelete(log, test.limit, test.input)
-			if !reflect.DeepEqual(test.exp, output) {
-				t.Errorf("unexpected prune sort response, exp=%v got=%v",
-					test.exp, output)
-			}
+			assert.Equal(t, test.exp, output, "prune sort response")
 		})
 	}
 }

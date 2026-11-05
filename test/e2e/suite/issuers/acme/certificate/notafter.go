@@ -21,22 +21,21 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper/featureset"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper/validation"
-	"github.com/cert-manager/cert-manager/test/e2e/util"
-	e2eutil "github.com/cert-manager/cert-manager/test/e2e/util"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/featureset"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/validation"
+	e2eutil "github.com/cert-manager/cert-manager/e2e-tests/util"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = framework.CertManagerDescribe("ACME Certificate (HTTP01 + Not After)", func() {
@@ -56,7 +55,7 @@ var _ = framework.CertManagerDescribe("ACME Certificate (HTTP01 + Not After)", f
 	unsupportedFeatures := featureset.NewFeatureSet(featureset.SaveCAToSecret)
 	validations := validation.CertificateSetForUnsupportedFeatureSet(unsupportedFeatures)
 
-	BeforeEach(func() {
+	BeforeEach(func(testingCtx context.Context) {
 		solvers := []cmacme.ACMEChallengeSolver{
 			{
 				HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
@@ -88,10 +87,10 @@ var _ = framework.CertManagerDescribe("ACME Certificate (HTTP01 + Not After)", f
 			gen.SetIssuerACMEDuration(true),
 			gen.SetIssuerACMESolvers(solvers))
 		By("Creating an Issuer")
-		_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), acmeIssuer, metav1.CreateOptions{})
+		_, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, acmeIssuer, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		By("Waiting for Issuer to become Ready")
-		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+		err = e2eutil.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuerName,
 			v1.IssuerCondition{
 				Type:   v1.IssuerConditionReady,
@@ -99,7 +98,7 @@ var _ = framework.CertManagerDescribe("ACME Certificate (HTTP01 + Not After)", f
 			})
 		Expect(err).NotTo(HaveOccurred())
 		By("Verifying the ACME account URI is set")
-		err = util.WaitForIssuerStatusFunc(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+		err = e2eutil.WaitForIssuerStatusFunc(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuerName,
 			func(i *v1.Issuer) (bool, error) {
 				if i.GetStatus().ACMEStatus().URI == "" {
@@ -109,48 +108,50 @@ var _ = framework.CertManagerDescribe("ACME Certificate (HTTP01 + Not After)", f
 			})
 		Expect(err).NotTo(HaveOccurred())
 		By("Verifying ACME account private key exists")
-		secret, err := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Get(context.TODO(), f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.GetOptions{})
+		secret, err := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Get(testingCtx, f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		if len(secret.Data) != 1 {
 			Fail("Expected 1 key in ACME account private key secret, but there was %d", len(secret.Data))
 		}
 	})
 
-	JustBeforeEach(func() {
+	JustBeforeEach(func(testingCtx context.Context) {
 		acmeIngressDomain = e2eutil.RandomSubdomain(f.Config.Addons.IngressController.Domain)
 	})
 
-	AfterEach(func() {
+	AfterEach(func(testingCtx context.Context) {
 		By("Cleaning up")
-		f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(context.TODO(), issuerName, metav1.DeleteOptions{})
-		f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(context.TODO(), f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.DeleteOptions{})
+		err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(testingCtx, issuerName, metav1.DeleteOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		err = f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(testingCtx, f.Config.Addons.ACMEServer.TestingACMEPrivateKey, metav1.DeleteOptions{})
+		Expect(err).NotTo(HaveOccurred())
 	})
 
-	It("should obtain a signed certificate with a single CN from the ACME server with 1 hour validity", func() {
+	It("should obtain a signed certificate with a single CN from the ACME server with 1 hour validity", func(testingCtx context.Context) {
 		certClient := f.CertManagerClientSet.CertmanagerV1().Certificates(f.Namespace.Name)
 
 		By("Creating a Certificate")
 		cert := gen.Certificate(certificateName,
-			gen.SetCertificateDuration(time.Hour),
-			gen.SetCertificateRenewBefore(45*time.Minute),
+			gen.SetCertificateDuration(&metav1.Duration{Duration: time.Hour}),
+			gen.SetCertificateRenewBefore(&metav1.Duration{Duration: 45 * time.Minute}),
 			gen.SetCertificateSecretName(certificateSecretName),
-			gen.SetCertificateIssuer(cmmeta.ObjectReference{Name: issuerName}),
+			gen.SetCertificateIssuer(cmmeta.IssuerReference{Name: issuerName}),
 			gen.SetCertificateDNSNames(acmeIngressDomain),
 		)
 		cert.Namespace = f.Namespace.Name
 
-		cert, err := certClient.Create(context.TODO(), cert, metav1.CreateOptions{})
+		cert, err := certClient.Create(testingCtx, cert, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for the Certificate to be issued...")
-		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(cert, time.Minute*5)
+		cert, err = f.Helper().WaitForCertificateReadyAndDoneIssuing(testingCtx, cert, time.Minute*5)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Validating the issued Certificate...")
 		err = f.Helper().ValidateCertificate(cert, validations...)
 		Expect(err).NotTo(HaveOccurred())
 
-		sec, err := f.Helper().WaitForSecretCertificateData(f.Namespace.Name, certificateSecretName, time.Minute*5)
+		sec, err := f.Helper().WaitForSecretCertificateData(testingCtx, f.Namespace.Name, certificateSecretName, time.Minute*5)
 		Expect(err).NotTo(HaveOccurred(), "failed to wait for secret")
 
 		crtPEM := sec.Data[corev1.TLSCertKey]

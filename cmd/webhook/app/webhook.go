@@ -22,30 +22,53 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-	cliflag "k8s.io/component-base/cli/flag"
-
-	cmdutil "github.com/cert-manager/cert-manager/cmd/util"
-	"github.com/cert-manager/cert-manager/cmd/webhook/app/options"
 	config "github.com/cert-manager/cert-manager/internal/apis/config/webhook"
+	"github.com/cert-manager/cert-manager/internal/apis/config/webhook/validation"
+	"github.com/cert-manager/cert-manager/internal/pem"
 	cmwebhook "github.com/cert-manager/cert-manager/internal/webhook"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/util"
+	"github.com/cert-manager/cert-manager/pkg/util/configfile"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
-	"github.com/cert-manager/cert-manager/pkg/webhook/configfile"
+	webhookconfigfile "github.com/cert-manager/cert-manager/pkg/webhook/configfile"
+	"github.com/cert-manager/cert-manager/pkg/webhook/options"
+	"github.com/go-logr/logr"
+	"github.com/spf13/cobra"
 )
 
 const componentWebhook = "webhook"
 
-func NewServerCommand(stopCh <-chan struct{}) *cobra.Command {
-	ctx := cmdutil.ContextWithStopCh(context.Background(), stopCh)
-	log := logf.Log
-	ctx = logf.NewContext(ctx, log, componentWebhook)
+func NewServerCommand(ctx context.Context) *cobra.Command {
+	return newServerCommand(
+		ctx,
+		func(ctx context.Context, webhookConfig *config.WebhookConfiguration) error {
+			log := logf.FromContext(ctx, componentWebhook)
 
-	cleanFlagSet := pflag.NewFlagSet(componentWebhook, pflag.ContinueOnError)
-	// Replaces all instances of `_` in flag names with `-`
-	cleanFlagSet.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+			versionInfo := util.VersionInfo()
+			log.Info("starting cert-manager webhook", "version", versionInfo.GitVersion, "git_commit", versionInfo.GitCommit, "go_version", versionInfo.GoVersion, "platform", versionInfo.Platform)
+
+			if err := configurePEMSizeLimits(webhookConfig, log); err != nil {
+				return fmt.Errorf("failed to configure PEM size limits: %w", err)
+			}
+
+			srv, err := cmwebhook.NewCertManagerWebhookServer(log, *webhookConfig)
+			if err != nil {
+				return err
+			}
+
+			return srv.Run(ctx)
+		},
+		os.Args[1:],
+	)
+}
+
+func newServerCommand(
+	setupCtx context.Context,
+	run func(context.Context, *config.WebhookConfiguration) error,
+	allArgs []string,
+) *cobra.Command {
+	log := logf.FromContext(setupCtx, componentWebhook)
+
 	webhookFlags := options.NewWebhookFlags()
 	webhookConfig, err := options.NewWebhookConfiguration()
 	if err != nil {
@@ -54,156 +77,159 @@ func NewServerCommand(stopCh <-chan struct{}) *cobra.Command {
 	}
 
 	cmd := &cobra.Command{
-		Use:  componentWebhook,
-		Long: fmt.Sprintf("Webhook component providing API validation, mutation and conversion functionality for cert-manager (%s) (%s)", util.AppVersion, util.AppGitCommit),
-		// The webhook has special flag parsing requirements to handle precedence of providing
-		// configuration via versioned configuration files and flag values.
-		// Setting DisableFlagParsing=true prevents Cobra from interfering with flag parsing
-		// at all, and instead we handle it all in the RunE below.
-		DisableFlagParsing: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			// initial flag parse, since we disable cobra's flag parsing
-			if err := cleanFlagSet.Parse(args); err != nil {
-				log.Error(err, "Failed to parse webhook flag")
-				cmd.Usage()
-				os.Exit(1)
+		Use: componentWebhook,
+		Long: `
+cert-manager is a Kubernetes addon to automate the management and issuance of
+TLS certificates from various issuing sources.
+
+The webhook component provides API validation, mutation and conversion
+functionality for cert-manager.`,
+
+		SilenceErrors: true, // We already log errors in main.go
+		SilenceUsage:  true, // Don't print usage on every error
+
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if err := loadConfigFromFile(
+				cmd, allArgs, webhookFlags.Config, webhookConfig,
+				func() error {
+					// set feature gates from initial flags-based config
+					if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(webhookConfig.FeatureGates); err != nil {
+						return fmt.Errorf("failed to set feature gates from initial flags-based config: %w", err)
+					}
+
+					return nil
+				},
+			); err != nil {
+				return err
 			}
 
-			// check if there are non-flag arguments in the command line
-			cmds := cleanFlagSet.Args()
-			if len(cmds) > 0 {
-				log.Error(nil, "Unknown command", "command", cmds[0])
-				cmd.Usage()
-				os.Exit(1)
+			if err := validation.ValidateWebhookConfiguration(webhookConfig, nil); len(err) > 0 {
+				return fmt.Errorf("error validating flags: %w", err.ToAggregate())
 			}
 
-			// short-circuit on help
-			help, err := cleanFlagSet.GetBool("help")
-			if err != nil {
-				log.Info(`"help" flag is non-bool, programmer error, please correct`)
-				os.Exit(1)
-			}
-			if help {
-				cmd.Help()
-				return
+			// ValidateWebhookConfiguration should already have validated the
+			// logging flags, the logging API does not have an Apply-only function
+			// so we validate again here. This should not catch any validation errors
+			// anymore.
+			if err := logf.ValidateAndApply(&webhookConfig.Logging); err != nil {
+				return fmt.Errorf("failed to validate webhook logging flags: %w", err)
 			}
 
-			// set feature gates from initial flags-based config
-			if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(webhookConfig.FeatureGates); err != nil {
-				log.Error(err, "Failed to set feature gates from initial flags-based config")
-				os.Exit(1)
-			}
-
-			if err := options.ValidateWebhookFlags(webhookFlags); err != nil {
-				log.Error(err, "Failed to validate webhook flags")
-				os.Exit(1)
-			}
-
-			if configFile := webhookFlags.Config; len(configFile) > 0 {
-				webhookConfig, err = loadConfigFile(configFile)
-				if err != nil {
-					log.Error(err, "Failed to load webhook config file", "path", configFile)
-					os.Exit(1)
-				}
-
-				if err := webhookConfigFlagPrecedence(webhookConfig, args); err != nil {
-					log.Error(err, "Failed to merge flags with config file values")
-					os.Exit(1)
-				}
-				// update feature gates based on new config
-				if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(webhookConfig.FeatureGates); err != nil {
-					log.Error(err, "Failed to set feature gates from config file")
-					os.Exit(1)
-				}
-			}
-
-			srv, err := cmwebhook.NewCertManagerWebhookServer(log, *webhookFlags, *webhookConfig)
-			if err != nil {
-				log.Error(err, "Failed initialising server")
-				os.Exit(1)
-			}
-
-			if err := srv.Run(ctx); err != nil {
-				log.Error(err, "Failed running server")
-				os.Exit(1)
-			}
+			return nil
+		},
+		//nolint:contextcheck // False positive
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run(cmd.Context(), webhookConfig)
 		},
 	}
 
-	webhookFlags.AddFlags(cleanFlagSet)
-	options.AddConfigFlags(cleanFlagSet, webhookConfig)
-	options.AddGlobalFlags(cleanFlagSet)
+	webhookFlags.AddFlags(cmd.Flags())
+	options.AddConfigFlags(cmd.Flags(), webhookConfig)
 
-	cleanFlagSet.BoolP("help", "h", false, fmt.Sprintf("help for %s", cmd.Name()))
-
-	// ugly, but necessary, because Cobra's default UsageFunc and HelpFunc pollute the flagset with global flags
-	const usageFmt = "Usage:\n  %s\n\nFlags:\n%s"
-	cmd.SetUsageFunc(func(cmd *cobra.Command) error {
-		fmt.Fprintf(cmd.OutOrStderr(), usageFmt, cmd.UseLine(), cleanFlagSet.FlagUsagesWrapped(2))
-		return nil
-	})
-	cmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
-		fmt.Fprintf(cmd.OutOrStdout(), "%s\n\n"+usageFmt, cmd.Long, cmd.UseLine(), cleanFlagSet.FlagUsagesWrapped(2))
-	})
+	// explicitly set provided args in case it does not equal os.Args[:1],
+	// e.g., when running tests
+	cmd.SetArgs(allArgs)
 
 	return cmd
 }
 
-// newFlagSetWithGlobals constructs a new pflag.FlagSet with global flags registered
-// on it.
-func newFlagSetWithGlobals() *pflag.FlagSet {
-	fs := pflag.NewFlagSet("", pflag.ExitOnError)
-	// set the normalize func, similar to k8s.io/component-base/cli//flags.go:InitFlags
-	fs.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
-	// explicitly add flags from libs that register global flags
-	options.AddGlobalFlags(fs)
-	return fs
-}
-
-// newFakeFlagSet constructs a pflag.FlagSet with the same flags as fs, but where
-// all values have noop Set implementations
-func newFakeFlagSet(fs *pflag.FlagSet) *pflag.FlagSet {
-	ret := pflag.NewFlagSet("", pflag.ExitOnError)
-	ret.SetNormalizeFunc(fs.GetNormalizeFunc())
-	fs.VisitAll(func(f *pflag.Flag) {
-		ret.VarP(cliflag.NoOp{}, f.Name, f.Shorthand, f.Usage)
-	})
-	return ret
-}
-
-// webhookConfigFlagPrecedence re-parses flags over the WebhookConfiguration object.
-// We must enforce flag precedence by re-parsing the command line into the new object.
-// This is necessary to preserve backwards-compatibility across binary upgrades.
-// See issue #56171 for more details.
-func webhookConfigFlagPrecedence(cfg *config.WebhookConfiguration, args []string) error {
-	// We use a throwaway webhookFlags and a fake global flagset to avoid double-parses,
-	// as some Set implementations accumulate values from multiple flag invocations.
-	fs := newFakeFlagSet(newFlagSetWithGlobals())
-	// register throwaway KubeletFlags
-	options.NewWebhookFlags().AddFlags(fs)
-	// register new WebhookConfiguration
-	options.AddConfigFlags(fs, cfg)
-	// re-parse flags
-	if err := fs.Parse(args); err != nil {
+// loadConfigFromFile loads the configuration from the provided config file
+// path, if one is provided. After loading the config file, the flags are
+// re-parsed to ensure that any flags provided to the command line override
+// those provided in the config file.
+// The newConfigHook is called when the options have been loaded from the
+// flags (but not yet the config file) and is re-called after the config file
+// has been loaded. This allows us to use the feature flags set by the flags
+// while loading the config file.
+func loadConfigFromFile(
+	cmd *cobra.Command,
+	allArgs []string,
+	configFilePath string,
+	cfg *config.WebhookConfiguration,
+	newConfigHook func() error,
+) error {
+	if err := newConfigHook(); err != nil {
 		return err
 	}
+
+	if len(configFilePath) > 0 {
+		// compute absolute path based on current working dir
+		webhookConfigFile, err := filepath.Abs(configFilePath)
+		if err != nil {
+			return fmt.Errorf("failed to load config file %s, error %v", configFilePath, err)
+		}
+
+		loader, err := configfile.NewConfigurationFSLoader(nil, webhookConfigFile)
+		if err != nil {
+			return fmt.Errorf("failed to load config file %s, error %v", configFilePath, err)
+		}
+
+		webhookConfigFromFile := webhookconfigfile.New()
+		if err := loader.Load(webhookConfigFromFile); err != nil {
+			return fmt.Errorf("failed to load config file %s, error %v", configFilePath, err)
+		}
+
+		webhookConfigFromFile.Config.DeepCopyInto(cfg)
+
+		_, args, err := cmd.Root().Find(allArgs)
+		if err != nil {
+			return fmt.Errorf("failed to re-parse flags: %w", err)
+		}
+
+		if err := cmd.ParseFlags(args); err != nil {
+			return fmt.Errorf("failed to re-parse flags: %w", err)
+		}
+
+		if err := newConfigHook(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-func loadConfigFile(name string) (*config.WebhookConfiguration, error) {
-	const errFmt = "failed to load webhook config file %s, error %v"
-	// compute absolute path based on current working dir
-	webhookConfigFile, err := filepath.Abs(name)
-	if err != nil {
-		return nil, fmt.Errorf(errFmt, name, err)
+func configurePEMSizeLimits(cfg *config.WebhookConfiguration, log logr.Logger) error {
+	if cfg == nil {
+		return fmt.Errorf("webhook configuration is nil")
 	}
-	loader, err := configfile.NewFSLoader(configfile.NewRealFS(), webhookConfigFile)
-	if err != nil {
-		return nil, fmt.Errorf(errFmt, name, err)
+
+	if cfg.PEMSizeLimitsConfig.MaxCertificateSize <= 0 {
+		return fmt.Errorf("maxCertificateSize must be greater than 0, got %d", cfg.PEMSizeLimitsConfig.MaxCertificateSize)
 	}
-	cfg, err := loader.Load()
-	if err != nil {
-		return nil, fmt.Errorf(errFmt, name, err)
+	if cfg.PEMSizeLimitsConfig.MaxPrivateKeySize <= 0 {
+		return fmt.Errorf("maxPrivateKeySize must be greater than 0, got %d", cfg.PEMSizeLimitsConfig.MaxPrivateKeySize)
 	}
-	return cfg, nil
+	if cfg.PEMSizeLimitsConfig.MaxChainLength <= 0 {
+		return fmt.Errorf("maxChainLength must be greater than 0, got %d", cfg.PEMSizeLimitsConfig.MaxChainLength)
+	}
+	if cfg.PEMSizeLimitsConfig.MaxBundleSize <= 0 {
+		return fmt.Errorf("maxBundleSize must be greater than 0, got %d", cfg.PEMSizeLimitsConfig.MaxBundleSize)
+	}
+
+	if cfg.PEMSizeLimitsConfig.MaxCertificateSize > cfg.PEMSizeLimitsConfig.MaxBundleSize {
+		return fmt.Errorf("maxCertificateSize (%d) must not be larger than maxBundleSize (%d)",
+			cfg.PEMSizeLimitsConfig.MaxCertificateSize, cfg.PEMSizeLimitsConfig.MaxBundleSize)
+	}
+
+	if cfg.PEMSizeLimitsConfig.MaxChainLength > cfg.PEMSizeLimitsConfig.MaxBundleSize {
+		return fmt.Errorf("maxChainLength (%d) must not exceed maxBundleSize (%d)",
+			cfg.PEMSizeLimitsConfig.MaxChainLength, cfg.PEMSizeLimitsConfig.MaxBundleSize)
+	}
+
+	limits := pem.NewSizeLimitsFromConfig(
+		cfg.PEMSizeLimitsConfig.MaxCertificateSize,
+		cfg.PEMSizeLimitsConfig.MaxPrivateKeySize,
+		cfg.PEMSizeLimitsConfig.MaxChainLength,
+		cfg.PEMSizeLimitsConfig.MaxBundleSize,
+	)
+
+	pem.SetGlobalSizeLimits(limits)
+
+	log.V(logf.InfoLevel).Info("configured PEM size limits",
+		"maxCertificateSize", limits.MaxCertificateSize,
+		"maxPrivateKeySize", limits.MaxPrivateKeySize,
+		"maxChainLength", limits.MaxChainLength,
+		"maxBundleSize", limits.MaxBundleSize)
+
+	return nil
 }

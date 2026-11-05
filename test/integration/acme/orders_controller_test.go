@@ -22,12 +22,6 @@ import (
 	"testing"
 	"time"
 
-	acmeapi "golang.org/x/crypto/acme"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/utils/clock"
-
 	accountstest "github.com/cert-manager/cert-manager/pkg/acme/accounts/test"
 	acmecl "github.com/cert-manager/cert-manager/pkg/acme/client"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
@@ -36,26 +30,29 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/controller/acmeorders"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/metrics"
-	"github.com/cert-manager/cert-manager/test/integration/framework"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
+	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/clock"
+
+	"github.com/cert-manager/cert-manager/integration-tests/framework"
 )
 
 func TestAcmeOrdersController(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*40)
-	defer cancel()
-
-	config, stopFn := framework.RunControlPlane(t, ctx)
-	defer stopFn()
+	config, stopFn := framework.RunControlPlane(t)
+	t.Cleanup(stopFn)
 
 	// Create clients and informer factories for Kubernetes API and
 	// cert-manager.
-	kubeClient, factory, cmCl, cmFactory := framework.NewClients(t, config)
+	kubeClient, factory, cmCl, cmFactory, scheme := framework.NewClients(t, config)
 
 	// some test values
 	var (
-		testName      string = "acmetest"
-		challengeType string = "dns-01"
-		authType      string = "dns"
+		testName      = "acmetest"
+		challengeType = "dns-01"
+		authType      = "dns"
 	)
 
 	// Initial ACME authorization to be returned by GetAuthorization.
@@ -102,7 +99,7 @@ func TestAcmeOrdersController(t *testing.T) {
 		FakeDNS01ChallengeRecord: func(_ string) (string, error) {
 			return testName, nil
 		},
-		FakeCreateOrderCert: func(_ context.Context, _ string, _ []byte, _ bool) ([][]byte, string, error) {
+		FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, _ []byte, _ bool) ([][]byte, string, error) {
 			// A hack to ensure the status of the _ACME_ order gets set to valid
 			// when we're finalizing the order.
 			acmeOrder.Status = acmeapi.StatusValid
@@ -118,20 +115,30 @@ func TestAcmeOrdersController(t *testing.T) {
 		},
 	}
 
+	controllerContext := controllerpkg.Context{
+		Client:                    kubeClient,
+		Scheme:                    scheme,
+		KubeSharedInformerFactory: factory,
+		CMClient:                  cmCl,
+		SharedInformerFactory:     cmFactory,
+		ACMEAccountRegistry:       accountRegistry,
+		Clock:                     clock.RealClock{},
+		ContextOptions:            controllerpkg.ContextOptions{},
+
+		Recorder:     framework.NewEventRecorder(t, scheme),
+		FieldManager: "cert-manager-orders-test",
+	}
+
 	// Create a new orders controller.
-	ctrl, queue, mustSync := acmeorders.NewController(
+	ctrl, queue, mustSync, err := acmeorders.NewController(
 		logf.Log,
-		cmCl,
-		factory,
-		cmFactory,
-		accountRegistry,
-		framework.NewEventRecorder(t),
-		clock.RealClock{},
+		&controllerContext,
 		false,
-		"cert-manager-test",
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	c := controllerpkg.NewController(
-		ctx,
 		"orders_test",
 		metrics.New(logf.Log, clock.RealClock{}),
 		ctrl.ProcessItem,
@@ -150,9 +157,8 @@ func TestAcmeOrdersController(t *testing.T) {
 	defer stopController()
 
 	// Create a Namespace.
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testName}}
-	_, err := kubeClient.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
-	if err != nil {
+	ns := &corev1.Namespace{Name: testName}
+	if _, err := kubeClient.CoreV1().Namespaces().Create(t.Context(), ns, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -177,7 +183,7 @@ func TestAcmeOrdersController(t *testing.T) {
 		gen.SetIssuerNamespace(testName),
 		gen.SetIssuerACME(acmeIssuer))
 
-	_, err = cmCl.CertmanagerV1().Issuers(testName).Create(ctx, iss, metav1.CreateOptions{})
+	_, err = cmCl.CertmanagerV1().Issuers(testName).Create(t.Context(), iss, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,26 +192,26 @@ func TestAcmeOrdersController(t *testing.T) {
 
 	// Create an Order CR.
 	order := gen.Order(testName,
-		gen.SetOrderIssuer(cmmeta.ObjectReference{
+		gen.SetOrderIssuer(cmmeta.IssuerReference{
 			Name: testName,
 		}),
 		gen.SetOrderNamespace(testName),
 		gen.SetOrderCsr([]byte(testName)),
 		gen.SetOrderDNSNames(testName))
 
-	order, err = cmCl.AcmeV1().Orders(testName).Create(ctx, order, metav1.CreateOptions{})
+	order, err = cmCl.AcmeV1().Orders(testName).Create(t.Context(), order, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Wait for the Challenge to be created.
 	var chal *cmacme.Challenge
-	err = wait.PollImmediateUntil(time.Millisecond*100, func() (done bool, err error) {
-		chals, err := cmCl.AcmeV1().Challenges(testName).List(ctx, metav1.ListOptions{})
+	err = wait.PollUntilContextCancel(t.Context(), time.Millisecond*100, true, func(ctx context.Context) (done bool, err error) {
+		challenges, err := cmCl.AcmeV1().Challenges(testName).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return false, err
 		}
-		l := len(chals.Items)
+		l := len(challenges.Items)
 		// Challenge has not been created yet
 		if l == 0 {
 			return false, nil
@@ -215,12 +221,12 @@ func TestAcmeOrdersController(t *testing.T) {
 			return false, fmt.Errorf("expected maximum 1 challenge, got %d", l)
 		}
 		// Check that the Challenge is owned by our Order.
-		chal = &chals.Items[0]
+		chal = &challenges.Items[0]
 		if !metav1.IsControlledBy(chal, order) {
 			return false, fmt.Errorf("found an unexpected Challenge resource: %v", chal.Name)
 		}
 		return true, nil
-	}, ctx.Done())
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,10 +238,10 @@ func TestAcmeOrdersController(t *testing.T) {
 	// valid.
 	// https://github.com/cert-manager/cert-manager/issues/2868
 
-	// Set the Challenge state to valid- the status of the ACME order remains 'pending'.
+	// Set the Challenge state to valid, the status of the ACME order remains 'pending'.
 	chal = chal.DeepCopy()
 	chal.Status.State = cmacme.Valid
-	_, err = cmCl.AcmeV1().Challenges(testName).UpdateStatus(ctx, chal, metav1.UpdateOptions{})
+	_, err = cmCl.AcmeV1().Challenges(testName).UpdateStatus(t.Context(), chal, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,9 +255,15 @@ func TestAcmeOrdersController(t *testing.T) {
 	// Reason field on Order's status. Change this test once we are setting
 	// Reasons on intermittent Order states.
 	var pendingOrder *cmacme.Order
-	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, acmeorders.RequeuePeriod)
-	defer timeoutCancel()
-	err = wait.PollImmediateUntil(time.Millisecond*200, func() (bool, error) {
+	startTime := time.Now()
+	successful := false
+	err = wait.PollUntilContextCancel(t.Context(), time.Millisecond*200, true, func(ctx context.Context) (bool, error) {
+		// Check if order has been pending for 2s (requeue period)
+		if time.Since(startTime) > acmeorders.RequeuePeriod {
+			successful = true
+			return true, nil
+		}
+
 		pendingOrder, err = cmCl.AcmeV1().Orders(testName).Get(ctx, testName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -260,16 +272,12 @@ func TestAcmeOrdersController(t *testing.T) {
 			return true, nil
 		}
 		return false, nil
-	}, timeoutCtx.Done())
+	})
 	switch {
-	case err == nil:
+	case err == nil && !successful:
 		t.Fatalf("Expected Order to have pending status instead got: %v", pendingOrder.Status.State)
-	case err == wait.ErrWaitTimeout:
-		if ctx.Err() != nil {
-			t.Error(ctx.Err())
-		}
-
-		// 'happy case' - Order remained pending
+	case err == nil && successful:
+		// this is the expected 'happy case'
 	default:
 		t.Fatal(err)
 	}
@@ -278,7 +286,7 @@ func TestAcmeOrdersController(t *testing.T) {
 	acmeOrder.Status = acmeapi.StatusReady
 
 	// Wait for the status of the Order to become Valid.
-	err = wait.PollImmediateUntil(time.Millisecond*100, func() (bool, error) {
+	err = wait.PollUntilContextCancel(t.Context(), time.Millisecond*100, true, func(ctx context.Context) (done bool, err error) {
 		o, err := cmCl.AcmeV1().Orders(testName).Get(ctx, testName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -288,7 +296,7 @@ func TestAcmeOrdersController(t *testing.T) {
 			return false, nil
 		}
 		return true, nil
-	}, ctx.Done())
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -23,24 +23,28 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificaterequests"
 	crutil "github.com/cert-manager/cert-manager/pkg/controller/certificaterequests/util"
 	"github.com/cert-manager/cert-manager/pkg/issuer"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	cmerrors "github.com/cert-manager/cert-manager/pkg/util/errors"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/kube"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
-	"github.com/go-logr/logr"
 )
 
 const (
@@ -48,16 +52,16 @@ const (
 	emptyDNMessage   = "Certificate will be issued with an empty Issuer DN, which contravenes RFC 5280 and could break some strict clients"
 )
 
-type signingFn func(*x509.Certificate, *x509.Certificate, crypto.PublicKey, interface{}) ([]byte, *x509.Certificate, error)
+type signingFn func(*x509.Certificate, *x509.Certificate, crypto.PublicKey, any) ([]byte, *x509.Certificate, error)
 
 type SelfSigned struct {
 	issuerOptions controllerpkg.IssuerOptions
-	secretsLister corelisters.SecretLister
+	secretsLister internalinformers.SecretLister
 
 	reporter *crutil.Reporter
 	recorder record.EventRecorder
 
-	// Used for testing to get reproducible resulting certificates
+	// signingFn is the function called to actually sign certificates. It's a member of the struct so it can be mocked for testing.
 	signingFn signingFn
 }
 
@@ -71,21 +75,32 @@ func init() {
 
 				// Handle informed Secrets which may be referenced by the
 				// "cert-manager.io/private-key-secret-name" annotation.
-				func(ctx *controllerpkg.Context, log logr.Logger, queue workqueue.RateLimitingInterface) ([]cache.InformerSynced, error) {
-					secretInformer := ctx.KubeSharedInformerFactory.Core().V1().Secrets().Informer()
+				func(ctx *controllerpkg.Context, log logr.Logger, queue workqueue.TypedRateLimitingInterface[types.NamespacedName]) ([]cache.InformerSynced, error) {
+					secretInformer := ctx.KubeSharedInformerFactory.Secrets().Informer()
 					certificateRequestLister := ctx.SharedInformerFactory.Certmanager().V1().CertificateRequests().Lister()
-					helper := issuer.NewHelper(
-						ctx.SharedInformerFactory.Certmanager().V1().Issuers().Lister(),
-						ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Lister(),
-					)
-					secretInformer.AddEventHandler(&controllerpkg.BlockingEventHandler{
-						WorkFunc: handleSecretReferenceWorkFunc(log, certificateRequestLister, helper, queue),
-					})
-					return []cache.InformerSynced{
+
+					isNamespaced := ctx.Namespace != ""
+
+					mustSync := []cache.InformerSynced{
 						secretInformer.HasSynced,
 						ctx.SharedInformerFactory.Certmanager().V1().Issuers().Informer().HasSynced,
-						ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Informer().HasSynced,
-					}, nil
+					}
+
+					var clusterIssuerLister cmlisters.ClusterIssuerLister
+					if !isNamespaced {
+						clusterIssuerLister = ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Lister()
+						mustSync = append(mustSync, ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Informer().HasSynced)
+					}
+					helper := issuer.NewHelper(
+						ctx.SharedInformerFactory.Certmanager().V1().Issuers().Lister(),
+						clusterIssuerLister,
+					)
+					if _, err := secretInformer.AddEventHandler(controllerpkg.BlockingEventHandler(
+						handleSecretReferenceWorkFunc(log, certificateRequestLister, helper, queue),
+					)); err != nil {
+						return nil, fmt.Errorf("error setting up event handler: %v", err)
+					}
+					return mustSync, nil
 				},
 			)).
 			Complete()
@@ -95,7 +110,7 @@ func init() {
 func NewSelfSigned(ctx *controllerpkg.Context) certificaterequests.Issuer {
 	return &SelfSigned{
 		issuerOptions: ctx.IssuerOptions,
-		secretsLister: ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
+		secretsLister: ctx.KubeSharedInformerFactory.Secrets().Lister(),
 		reporter:      crutil.NewReporter(ctx.Clock, ctx.Recorder),
 		recorder:      ctx.Recorder,
 		signingFn:     pki.SignCertificate,
@@ -147,7 +162,8 @@ func (s *SelfSigned) Sign(ctx context.Context, cr *cmapi.CertificateRequest, iss
 		return nil, err
 	}
 
-	template, err := pki.GenerateTemplateFromCertificateRequest(cr)
+	var template *x509.Certificate
+	template, err = pki.CertificateTemplateFromCertificateRequest(cr)
 	if err != nil {
 		message := "Error generating certificate template"
 		s.reporter.Failed(cr, err, "ErrorGenerating", message)
@@ -189,6 +205,14 @@ func (s *SelfSigned) Sign(ctx context.Context, cr *cmapi.CertificateRequest, iss
 		return nil, nil
 	}
 
+	if !utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) && pki.IsMLDSAPublicKey(publickey) {
+		err := errors.New("the MLDSAPrivateKeys feature gate is disabled")
+		message := "Refusing to sign a certificate involving an ML-DSA key"
+		s.reporter.Pending(cr, err, "MLDSAPrivateKeysDisabled", message)
+		log.Error(err, message)
+		return nil, nil
+	}
+
 	// sign and encode the certificate
 	certPem, _, err := s.signingFn(template, template, publickey, privatekey)
 	if err != nil {
@@ -198,9 +222,9 @@ func (s *SelfSigned) Sign(ctx context.Context, cr *cmapi.CertificateRequest, iss
 		return nil, nil
 	}
 
-	log.V(logf.DebugLevel).Info("self signed certificate issued")
+	log.V(logf.DebugLevel).Info("self-signed certificate issued")
 
-	// We set the CA to the returned certificate here since this is self signed.
+	// We set the CA to the returned certificate here since this is self-signed.
 	return &issuer.IssueResponse{
 		Certificate: certPem,
 		CA:          certPem,

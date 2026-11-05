@@ -17,20 +17,20 @@ limitations under the License.
 package controller
 
 import (
-	"context"
 	"testing"
 	"time"
 
-	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	kclient "k8s.io/client-go/kubernetes"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
+	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 )
 
 var ingressGVK = networkingv1.SchemeGroupVersion.WithKind("Ingress")
@@ -41,87 +41,117 @@ func Test_controller_Register(t *testing.T) {
 		existingKObjects  []runtime.Object
 		existingCMObjects []runtime.Object
 		givenCall         func(*testing.T, cmclient.Interface, kclient.Interface)
-		expectRequeueKey  string
+		expectRequeueKey  types.NamespacedName
 	}{
 		{
 			name: "ingress is re-queued when an 'Added' event is received for this ingress",
 			givenCall: func(t *testing.T, _ cmclient.Interface, c kclient.Interface) {
-				_, err := c.NetworkingV1().Ingresses("namespace-1").Create(context.Background(), &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-					Namespace: "namespace-1", Name: "ingress-1",
-				}}, metav1.CreateOptions{})
+				_, err := c.NetworkingV1().Ingresses("namespace-1").Create(t.Context(), &networkingv1.Ingress{
+					Namespace: "namespace-1",
+					Name:      "ingress-1",
+				}, metav1.CreateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "namespace-1/ingress-1",
+			expectRequeueKey: types.NamespacedName{
+				Namespace: "namespace-1",
+				Name:      "ingress-1",
+			},
 		},
 		{
 			name: "ingress is re-queued when an 'Updated' event is received for this ingress",
-			existingKObjects: []runtime.Object{&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-				Namespace: "namespace-1", Name: "ingress-1",
-			}}},
+			existingKObjects: []runtime.Object{&networkingv1.Ingress{
+				Namespace: "namespace-1",
+				Name:      "ingress-1",
+			}},
 			givenCall: func(t *testing.T, _ cmclient.Interface, c kclient.Interface) {
-				_, err := c.NetworkingV1().Ingresses("namespace-1").Update(context.Background(), &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-					Namespace: "namespace-1", Name: "ingress-1",
-				}}, metav1.UpdateOptions{})
+				_, err := c.NetworkingV1().Ingresses("namespace-1").Update(t.Context(), &networkingv1.Ingress{
+					Namespace: "namespace-1",
+					Name:      "ingress-1",
+				}, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "namespace-1/ingress-1",
+			expectRequeueKey: types.NamespacedName{
+				Namespace: "namespace-1",
+				Name:      "ingress-1",
+			},
 		},
 		{
 			name: "ingress is re-queued when a 'Deleted' event is received for this ingress",
-			existingKObjects: []runtime.Object{&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-				Namespace: "namespace-1", Name: "ingress-1",
-			}}},
+			existingKObjects: []runtime.Object{&networkingv1.Ingress{
+				Namespace: "namespace-1",
+				Name:      "ingress-1",
+			}},
 			givenCall: func(t *testing.T, _ cmclient.Interface, c kclient.Interface) {
-				err := c.NetworkingV1().Ingresses("namespace-1").Delete(context.Background(), "ingress-1", metav1.DeleteOptions{})
+				err := c.NetworkingV1().Ingresses("namespace-1").Delete(t.Context(), "ingress-1", metav1.DeleteOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "namespace-1/ingress-1",
+			expectRequeueKey: types.NamespacedName{
+				Namespace: "namespace-1",
+				Name:      "ingress-1",
+			},
 		},
 		{
 			name: "ingress is re-queued when an 'Added' event is received for its child Certificate",
 			givenCall: func(t *testing.T, c cmclient.Interface, _ kclient.Interface) {
-				_, err := c.CertmanagerV1().Certificates("namespace-1").Create(context.Background(), &cmapi.Certificate{ObjectMeta: metav1.ObjectMeta{
-					Namespace: "namespace-1", Name: "cert-1",
-					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-						Namespace: "namespace-1", Name: "ingress-2",
-					}}, ingressGVK)},
-				}}, metav1.CreateOptions{})
+				_, err := c.CertmanagerV1().Certificates("namespace-1").Create(t.Context(), &cmapi.Certificate{
+					Namespace: "namespace-1",
+					Name:      "cert-1",
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{
+						Namespace: "namespace-1",
+						Name:      "ingress-2",
+					}, ingressGVK)},
+				}, metav1.CreateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "namespace-1/ingress-2",
+			expectRequeueKey: types.NamespacedName{
+				Namespace: "namespace-1",
+				Name:      "ingress-2",
+			},
 		},
 		{
 			name: "ingress is re-queued when an 'Updated' event is received for its child Certificate",
-			existingCMObjects: []runtime.Object{&cmapi.Certificate{ObjectMeta: metav1.ObjectMeta{
-				Namespace: "namespace-1", Name: "cert-1",
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-					Namespace: "namespace-1", Name: "ingress-2",
-				}}, ingressGVK)},
-			}}},
+			existingCMObjects: []runtime.Object{&cmapi.Certificate{
+				Namespace: "namespace-1",
+				Name:      "cert-1",
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{
+					Namespace: "namespace-1",
+					Name:      "ingress-2",
+				}, ingressGVK)},
+			}},
 			givenCall: func(t *testing.T, c cmclient.Interface, _ kclient.Interface) {
-				_, err := c.CertmanagerV1().Certificates("namespace-1").Update(context.Background(), &cmapi.Certificate{ObjectMeta: metav1.ObjectMeta{
-					Namespace: "namespace-1", Name: "cert-1",
-					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-						Namespace: "namespace-1", Name: "ingress-2",
-					}}, ingressGVK)},
-				}}, metav1.UpdateOptions{})
+				_, err := c.CertmanagerV1().Certificates("namespace-1").Update(t.Context(), &cmapi.Certificate{
+					Namespace: "namespace-1",
+					Name:      "cert-1",
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{
+						Namespace: "namespace-1",
+						Name:      "ingress-2",
+					}, ingressGVK)},
+				}, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "namespace-1/ingress-2",
+			expectRequeueKey: types.NamespacedName{
+				Namespace: "namespace-1",
+				Name:      "ingress-2",
+			},
 		},
 		{
 			name: "ingress is re-queued when a 'Deleted' event is received for its child Certificate",
-			existingCMObjects: []runtime.Object{&cmapi.Certificate{ObjectMeta: metav1.ObjectMeta{
-				Namespace: "namespace-1", Name: "cert-1",
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
-					Namespace: "namespace-1", Name: "ingress-2",
-				}}, ingressGVK)},
-			}}},
+			existingCMObjects: []runtime.Object{&cmapi.Certificate{
+				Namespace: "namespace-1",
+				Name:      "cert-1",
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&networkingv1.Ingress{
+					Namespace: "namespace-1",
+					Name:      "ingress-2",
+				}, ingressGVK)},
+			}},
 			givenCall: func(t *testing.T, c cmclient.Interface, _ kclient.Interface) {
-				err := c.CertmanagerV1().Certificates("namespace-1").Delete(context.Background(), "cert-1", metav1.DeleteOptions{})
+				err := c.CertmanagerV1().Certificates("namespace-1").Delete(t.Context(), "cert-1", metav1.DeleteOptions{})
 				require.NoError(t, err)
 			},
-			expectRequeueKey: "namespace-1/ingress-2",
+			expectRequeueKey: types.NamespacedName{
+				Namespace: "namespace-1",
+				Name:      "ingress-2",
+			},
 		},
 	}
 
@@ -149,7 +179,7 @@ func Test_controller_Register(t *testing.T) {
 			// to be nil.
 			time.AfterFunc(50*time.Millisecond, queue.ShutDown)
 
-			var gotKeys []string
+			var gotKeys []types.NamespacedName
 			for {
 				// Get blocks until either (1) a key is returned, or (2) the
 				// queue is shut down.
@@ -157,13 +187,13 @@ func Test_controller_Register(t *testing.T) {
 				if done {
 					break
 				}
-				gotKeys = append(gotKeys, gotKey.(string))
+				gotKeys = append(gotKeys, gotKey)
 			}
 			assert.Equal(t, 0, queue.Len(), "queue should be empty")
 
 			// We only expect 0 or 1 keys received in the queue.
-			if test.expectRequeueKey != "" {
-				assert.Equal(t, []string{test.expectRequeueKey}, gotKeys)
+			if test.expectRequeueKey != (types.NamespacedName{}) {
+				assert.Equal(t, []types.NamespacedName{test.expectRequeueKey}, gotKeys)
 			} else {
 				assert.Nil(t, gotKeys)
 			}

@@ -24,6 +24,7 @@ import (
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	coretesting "k8s.io/client-go/testing"
 	fakeclock "k8s.io/utils/clock/testing"
@@ -36,7 +37,6 @@ import (
 	csrutil "github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests/util"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -330,11 +330,13 @@ func TestController_Sync(t *testing.T) {
 			}
 
 			c := New(util.IssuerSelfSigned, func(*controller.Context) Signer { return scenario.signerImpl })
-			c.Register(scenario.builder.Context)
+			if _, _, err := c.Register(scenario.builder.Context); err != nil {
+				t.Fatal(err)
+			}
 
 			scenario.builder.Start()
 
-			err := c.Sync(context.Background(), scenario.csr)
+			err := c.Sync(t.Context(), scenario.csr)
 			if (err == nil) == scenario.wantErr {
 				t.Errorf("expected error: %v, but got: %v", scenario.wantErr, err)
 			}

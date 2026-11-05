@@ -1,84 +1,98 @@
-.PHONY: ci-presubmit
-## Run all checks (but not Go tests) which should pass before any given pull
-## request or change is merged.
-##
-## @category CI
-ci-presubmit: verify-imports verify-errexit verify-boilerplate verify-codegen verify-crds verify-licenses
+# Copyright 2023 The cert-manager Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-.PHONY: verify-imports
-verify-imports: | $(NEEDS_GOIMPORTS)
-	./hack/verify-goimports.sh $(GOIMPORTS)
+.PHONY: verify-modules
+verify-modules: | $(NEEDS_CMREL)
+	$(CMREL) validate-gomod --path $(shell pwd) --no-dummy-modules github.com/cert-manager/cert-manager/integration-tests
+
+shared_verify_targets += verify-modules
 
 .PHONY: verify-chart
-verify-chart: $(BINDIR)/cert-manager-$(RELEASE_VERSION).tgz
+verify-chart: $(bin_dir)/cert-manager-$(VERSION).tgz | $(NEEDS_CTR)
 	DOCKER=$(CTR) ./hack/verify-chart-version.sh $<
 
 .PHONY: verify-errexit
 verify-errexit:
 	./hack/verify-errexit.sh
 
-__PYTHON := python3
+shared_verify_targets += verify-errexit
 
-.PHONY: verify-boilerplate
-verify-boilerplate:
-	@command -v $(__PYTHON) >/dev/null || (echo "couldn't find python3 at '$(__PYTHON)', required for $@. Install python3 or set '__PYTHON'" && exit 1)
-	$(__PYTHON) hack/verify_boilerplate.py
-
-.PHONY: verify-licenses
-verify-licenses: $(BINDIR)/scratch/LATEST-LICENSES
-	@diff $(BINDIR)/scratch/LATEST-LICENSES LICENSES >/dev/null || (echo -e "\033[0;33mLICENSES seem to be out of date; update with 'make update-licenses'\033[0m" && exit 1)
-
-.PHONY: verify-crds
-verify-crds: | $(NEEDS_GO) $(NEEDS_CONTROLLER-GEN) $(NEEDS_YQ)
-	./hack/check-crds.sh $(GO) $(CONTROLLER-GEN) $(YQ)
-
-.PHONY: update-licenses
-update-licenses: LICENSES
-
-.PHONY: update-crds
-update-crds: generate-test-crds patch-crds
-
-.PHONY: generate-test-crds
-generate-test-crds: | $(NEEDS_CONTROLLER-GEN)
-	$(CONTROLLER-GEN) \
-		crd \
-		paths=./pkg/webhook/handlers/testdata/apis/testgroup/v{1,2}/... \
-		output:crd:dir=./pkg/webhook/handlers/testdata/apis/testgroup/crds
-
-PATCH_CRD_OUTPUT_DIR=./deploy/crds
-.PHONY: patch-crds
-patch-crds: | $(NEEDS_CONTROLLER-GEN)
-	$(CONTROLLER-GEN) \
-		schemapatch:manifests=./deploy/crds \
-		output:dir=$(PATCH_CRD_OUTPUT_DIR) \
-		paths=./pkg/apis/...
-
-.PHONY: verify-codegen
-verify-codegen: | k8s-codegen-tools $(NEEDS_GO)
-	VERIFY_ONLY="true" ./hack/k8s-codegen.sh \
-		$(GO) \
-		./$(BINDIR)/tools/client-gen \
-		./$(BINDIR)/tools/deepcopy-gen \
-		./$(BINDIR)/tools/informer-gen \
-		./$(BINDIR)/tools/lister-gen \
-		./$(BINDIR)/tools/defaulter-gen \
-		./$(BINDIR)/tools/conversion-gen
-
-.PHONY: update-codegen
-update-codegen: | k8s-codegen-tools $(NEEDS_GO)
+.PHONY: generate-codegen
+generate-codegen: | $(NEEDS_CLIENT-GEN) $(NEEDS_DEEPCOPY-GEN) $(NEEDS_INFORMER-GEN) $(NEEDS_LISTER-GEN) $(NEEDS_DEFAULTER-GEN) $(NEEDS_CONVERSION-GEN) $(NEEDS_OPENAPI-GEN) $(NEEDS_APPLYCONFIGURATION-GEN)
 	./hack/k8s-codegen.sh \
-		$(GO) \
-		./$(BINDIR)/tools/client-gen \
-		./$(BINDIR)/tools/deepcopy-gen \
-		./$(BINDIR)/tools/informer-gen \
-		./$(BINDIR)/tools/lister-gen \
-		./$(BINDIR)/tools/defaulter-gen \
-		./$(BINDIR)/tools/conversion-gen
+		$(CLIENT-GEN) \
+		$(DEEPCOPY-GEN) \
+		$(INFORMER-GEN) \
+		$(LISTER-GEN) \
+		$(DEFAULTER-GEN) \
+		$(CONVERSION-GEN) \
+		$(OPENAPI-GEN) \
+		$(APPLYCONFIGURATION-GEN)
 
-.PHONY: update-all
+shared_generate_targets_dirty += generate-codegen
+
+.PHONY: generate-helm-docs
+generate-helm-docs: deploy/charts/cert-manager/README.template.md deploy/charts/cert-manager/values.yaml | $(NEEDS_HELM-TOOL)
+	$(HELM-TOOL) inject \
+		--header-search '^<!-- AUTO-GENERATED -->' \
+		--footer-search '^<!-- /AUTO-GENERATED -->' \
+		-i deploy/charts/cert-manager/values.yaml \
+		-o deploy/charts/cert-manager/README.template.md
+
+shared_generate_targets += generate-helm-docs
+
+.PHONY: generate-helm-schema
+## Generate Helm chart schema.
+## @category [shared] Generate/ Verify
+generate-helm-schema: | $(NEEDS_HELM-TOOL) $(NEEDS_GOJQ)
+	$(HELM-TOOL) schema -i deploy/charts/cert-manager/values.yaml | $(GOJQ) > deploy/charts/cert-manager/values.schema.json
+
+shared_generate_targets += generate-helm-schema
+
+.PHONY: verify-helm-values
+## Verify Helm chart values using helm-tool.
+## @category [shared] Generate/ Verify
+verify-helm-values: | $(NEEDS_HELM-TOOL) $(NEEDS_GOJQ)
+	$(HELM-TOOL) lint -i deploy/charts/cert-manager/values.yaml -d deploy/charts/cert-manager/templates -e deploy/charts/cert-manager/values.linter.exceptions
+
+shared_verify_targets += verify-helm-values
+
+.PHONY: verify-helm-unittest
+## Run Helm chart unit tests using helm-unittest.
+## @category [shared] Generate/ Verify
+verify-helm-unittest: | $(NEEDS_HELM-UNITTEST)
+	$(HELM-UNITTEST) -f 'tests/**/*.yaml' deploy/charts/cert-manager
+
+shared_verify_targets += verify-helm-unittest
+
+.PHONY: update-helm-unittest-snapshots
+## Update Helm chart unit test snapshots using helm-unittest.
+## @category [shared] Generate/ Verify
+update-helm-unittest-snapshots: | $(NEEDS_HELM-UNITTEST)
+	$(HELM-UNITTEST) -u -f 'tests/**/*.yaml' deploy/charts/cert-manager
+
+.PHONY: ci-presubmit
+## Run all checks (but not Go tests) which should pass before any given pull
+## request or change is merged.
+##
+## @category CI
+ci-presubmit: verify
+
+.PHONY: generate-all
 ## Update CRDs, code generation and licenses to the latest versions.
 ## This is provided as a convenience to run locally before creating a PR, to ensure
 ## that everything is up-to-date.
 ##
 ## @category Development
-update-all: update-crds update-codegen update-licenses
+generate-all: generate

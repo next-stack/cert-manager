@@ -17,28 +17,27 @@ limitations under the License.
 package fuzzer
 
 import (
-	fuzz "github.com/google/gofuzz"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/utils/pointer"
+	logsapi "k8s.io/component-base/logs/api/v1"
+	"sigs.k8s.io/randfill"
 
 	"github.com/cert-manager/cert-manager/internal/apis/config/webhook"
 )
 
 // Funcs returns the fuzzer functions for the webhook config api group.
-var Funcs = func(codecs runtimeserializer.CodecFactory) []interface{} {
-	return []interface{}{
-		func(s *webhook.WebhookConfiguration, c fuzz.Continue) {
-			c.FuzzNoCustom(s) // fuzz self without calling this function again
+var Funcs = func(codecs runtimeserializer.CodecFactory) []any {
+	return []any{
+		func(s *webhook.WebhookConfiguration, c randfill.Continue) {
+			c.FillNoCustom(s) // fuzz self without calling this function again
 
-			if s.HealthzPort == nil {
-				s.HealthzPort = pointer.Int(12)
-			}
-			if s.SecurePort == nil {
-				s.SecurePort = pointer.Int(123)
-			}
 			if s.PprofAddress == "" {
 				s.PprofAddress = "something:1234"
 			}
+			if s.MetricsListenAddress == "" {
+				s.MetricsListenAddress = "something:1234"
+			}
+
+			logsapi.SetRecommendedLoggingConfiguration(&s.Logging)
 		},
 	}
 }

@@ -20,8 +20,7 @@
 .idea/
 *.tmproj
 
-BUILD.bazel
-Chart.template.yaml
 README.template.md
 OWNERS
 cert-manager*.tgz
+tests/

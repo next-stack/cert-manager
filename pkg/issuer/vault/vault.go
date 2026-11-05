@@ -17,10 +17,9 @@ limitations under the License.
 package vault
 
 import (
-	corelisters "k8s.io/client-go/listers/core/v1"
-
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
+	vaultinternal "github.com/cert-manager/cert-manager/internal/vault"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
-	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/issuer"
 )
@@ -28,25 +27,21 @@ import (
 // Vault Issuer for the certificate authority of Vault
 type Vault struct {
 	*controller.Context
-	issuer v1.GenericIssuer
 
-	secretsLister corelisters.SecretLister
+	secretsLister internalinformers.SecretLister
 
-	// Namespace in which to read resources related to this Issuer from.
-	// For Issuers, this will be the namespace of the Issuer.
-	// For ClusterIssuers, this will be the cluster resource namespace.
-	resourceNamespace string
+	// For testing purposes.
+	createTokenFn func(ns string) vaultinternal.CreateToken
 }
 
 // NewVault returns a new Vault
-func NewVault(ctx *controller.Context, issuer v1.GenericIssuer) (issuer.Interface, error) {
-	secretsLister := ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister()
+func NewVault(ctx *controller.Context) (issuer.Interface, error) {
+	secretsLister := ctx.KubeSharedInformerFactory.Secrets().Lister()
 
 	return &Vault{
-		Context:           ctx,
-		issuer:            issuer,
-		secretsLister:     secretsLister,
-		resourceNamespace: ctx.IssuerOptions.ResourceNamespace(issuer),
+		Context:       ctx,
+		secretsLister: secretsLister,
+		createTokenFn: func(ns string) vaultinternal.CreateToken { return ctx.Client.CoreV1().ServiceAccounts(ns).CreateToken },
 	}, nil
 }
 

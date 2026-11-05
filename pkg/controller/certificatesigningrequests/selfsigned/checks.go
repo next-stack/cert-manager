@@ -23,7 +23,9 @@ import (
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	clientv1 "k8s.io/client-go/listers/certificates/v1"
 	"k8s.io/client-go/util/workqueue"
 
@@ -43,14 +45,14 @@ import (
 func handleSecretReferenceWorkFunc(log logr.Logger,
 	lister clientv1.CertificateSigningRequestLister,
 	helper issuer.Helper,
-	queue workqueue.RateLimitingInterface,
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName],
 	issuerOptions controllerpkg.IssuerOptions,
-) func(obj any) {
-	return func(obj any) {
+) func(metav1.Object) {
+	return func(obj metav1.Object) {
 		log := log.WithName("handleSecretReference")
-		secret, ok := obj.(*corev1.Secret)
+		secret, ok := controllerpkg.ToSecret(obj)
 		if !ok {
-			log.Error(nil, "object is not a secret")
+			log.Error(nil, "object is not a secret", "object", obj)
 			return
 		}
 		log = logf.WithResource(log, secret)
@@ -60,13 +62,10 @@ func handleSecretReferenceWorkFunc(log logr.Logger,
 			return
 		}
 		for _, request := range requests {
-			log := logf.WithRelatedResource(log, request)
-			key, err := controllerpkg.KeyFunc(request)
-			if err != nil {
-				log.Error(err, "error computing key for resource")
-				continue
-			}
-			queue.Add(key)
+			queue.Add(types.NamespacedName{
+				Name:      request.Name,
+				Namespace: request.Namespace,
+			})
 		}
 	}
 }
@@ -88,7 +87,7 @@ func certificateSigningRequestsForSecret(log logr.Logger,
 		return nil, fmt.Errorf("failed to list certificate requests: %w", err)
 	}
 
-	dbg.Info("checking if self signed certificate signing requests reference secret")
+	dbg.Info("checking if self-signed certificate signing requests reference secret")
 	var affected []*certificatesv1.CertificateSigningRequest
 	for _, request := range requests {
 		ref, ok := util.SignerIssuerRefFromSignerName(request.Spec.SignerName)
@@ -103,7 +102,7 @@ func certificateSigningRequestsForSecret(log logr.Logger,
 			continue
 		}
 
-		issuerObj, err := helper.GetGenericIssuer(cmmeta.ObjectReference{
+		issuerObj, err := helper.GetGenericIssuer(cmmeta.IssuerReference{
 			Name:  ref.Name,
 			Kind:  kind,
 			Group: ref.Group,

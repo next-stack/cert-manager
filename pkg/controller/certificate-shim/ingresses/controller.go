@@ -22,7 +22,7 @@ import (
 
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	networkingv1listers "k8s.io/client-go/listers/networking/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -42,16 +42,21 @@ type controller struct {
 	sync          shimhelper.SyncFn
 }
 
-func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	cmShared := ctx.SharedInformerFactory
 
-	ingressInformer := ctx.KubeSharedInformerFactory.Networking().V1().Ingresses()
+	ingressInformer := ctx.KubeSharedInformerFactory.Ingresses()
 	c.ingressLister = ingressInformer.Lister()
 
 	log := logf.FromContext(ctx.RootContext, ControllerName)
 	c.sync = shimhelper.SyncFnFor(ctx.Recorder, log, ctx.CMClient, cmShared.Certmanager().V1().Certificates().Lister(), ctx.IngressShimOptions, ctx.FieldManager)
 
-	queue := workqueue.NewNamedRateLimitingQueue(controllerpkg.DefaultItemBasedRateLimiter(), ControllerName)
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultItemBasedRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
 	mustSync := []cache.InformerSynced{
 		ingressInformer.Informer().HasSynced,
@@ -64,9 +69,9 @@ func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	// to do some cleanup, we would use a finalizer, and the cleanup logic would
 	// be triggered by the "Updated" event when the object gets marked for
 	// deletion.
-	ingressInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{
-		Queue: queue,
-	})
+	if _, err := ingressInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(queue)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// We still re-queue on "Add" because the workqueue will remove any
 	// duplicate key, although the Ingress controller already re-queues the
@@ -77,29 +82,25 @@ func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.RateLimitin
 	//
 	// We want to immediately recreate a Certificate when the Certificate is
 	// deleted.
-	cmShared.Certmanager().V1().Certificates().Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		WorkFunc: certificateHandler(queue),
-	})
+	if _, err := cmShared.Certmanager().V1().Certificates().Informer().AddEventHandler(controllerpkg.BlockingEventHandler(
+		certificateHandler(queue),
+	)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	return queue, mustSync, nil
 }
 
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
-		return nil
-	}
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
+	namespace, name := key.Namespace, key.Name
 
 	ingress, err := c.ingressLister.Ingresses(namespace).Get(name)
-
-	if err != nil {
-		if k8sErrors.IsNotFound(err) {
-			runtime.HandleError(fmt.Errorf("ingress '%s' in work queue no longer exists", key))
-			return nil
-		}
-
+	if err != nil && !k8sErrors.IsNotFound(err) {
 		return err
+	}
+	if ingress == nil || ingress.DeletionTimestamp != nil {
+		// If the Ingress object was/ is being deleted, we don't want to start creating Certificates.
+		return nil
 	}
 
 	return c.sync(ctx, ingress)
@@ -120,14 +121,8 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 //	    name: ingress-1
 //	    blockOwnerDeletion: true
 //	    uid: 7d3897c2-ce27-4144-883a-e1b5f89bd65a
-func certificateHandler(queue workqueue.RateLimitingInterface) func(obj interface{}) {
-	return func(obj interface{}) {
-		cert, ok := obj.(*cmapi.Certificate)
-		if !ok {
-			runtime.HandleError(fmt.Errorf("not a Certificate object: %#v", obj))
-			return
-		}
-
+func certificateHandler(queue workqueue.TypedRateLimitingInterface[types.NamespacedName]) func(*cmapi.Certificate) {
+	return func(cert *cmapi.Certificate) {
 		ingress := metav1.GetControllerOf(cert)
 		if ingress == nil {
 			// No controller should care about orphans being deleted or
@@ -139,7 +134,10 @@ func certificateHandler(queue workqueue.RateLimitingInterface) func(obj interfac
 			return
 		}
 
-		queue.Add(cert.Namespace + "/" + ingress.Name)
+		queue.Add(types.NamespacedName{
+			Namespace: cert.Namespace,
+			Name:      ingress.Name,
+		})
 	}
 }
 

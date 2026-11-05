@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/client-go/tools/cache"
@@ -40,21 +41,19 @@ type runDurationFunc struct {
 }
 
 type queueingController interface {
-	Register(*Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error)
-	ProcessItem(ctx context.Context, key string) error
+	Register(*Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error)
+	ProcessItem(ctx context.Context, key types.NamespacedName) error
 }
 
 func NewController(
-	ctx context.Context,
 	name string,
 	metrics *metrics.Metrics,
-	syncFunc func(ctx context.Context, key string) error,
+	syncFunc func(ctx context.Context, key types.NamespacedName) error,
 	mustSync []cache.InformerSynced,
 	runDurationFuncs []runDurationFunc,
-	queue workqueue.RateLimitingInterface,
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName],
 ) Interface {
 	return &controller{
-		ctx:              ctx,
 		name:             name,
 		metrics:          metrics,
 		syncHandler:      syncFunc,
@@ -65,15 +64,12 @@ func NewController(
 }
 
 type controller struct {
-	// ctx is the root golang context for the controller
-	ctx context.Context
-
 	// name is the name for this controller
 	name string
 
 	// the function that should be called when an item is popped
 	// off the workqueue
-	syncHandler func(ctx context.Context, key string) error
+	syncHandler func(ctx context.Context, key types.NamespacedName) error
 
 	// mustSync is a slice of informers that must have synced before
 	// this controller can start
@@ -87,31 +83,29 @@ type controller struct {
 
 	// queue is a reference to the queue used to enqueue resources
 	// to be processed
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName]
 
 	// metrics is used to expose Prometheus, shared by all controllers
 	metrics *metrics.Metrics
 }
 
 // Run starts the controller loop
-func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
-	ctx, cancel := context.WithCancel(c.ctx)
+func (c *controller) Run(workers int, ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	log := logf.FromContext(ctx)
+	log := logf.FromContext(ctx, c.name)
 
 	log.V(logf.DebugLevel).Info("starting control loop")
 	// wait for all the informer caches we depend on are synced
-	if !cache.WaitForCacheSync(stopCh, c.mustSync...) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.mustSync...) {
 		return fmt.Errorf("error waiting for informer caches to sync")
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range workers {
+		wg.Go(func() {
 			c.worker(ctx)
-		}()
+		})
 	}
 
 	for _, f := range c.runFirstFuncs {
@@ -119,11 +113,10 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 	}
 
 	for _, f := range c.runDurationFuncs {
-		f := f // capture range variable
-		go wait.Until(func() { f.fn(ctx) }, f.duration, stopCh)
+		go wait.Until(func() { f.fn(ctx) }, f.duration, ctx.Done())
 	}
 
-	<-stopCh
+	<-ctx.Done()
 	log.V(logf.InfoLevel).Info("shutting down queue as workqueue signaled shutdown")
 	c.queue.ShutDown()
 	log.V(logf.DebugLevel).Info("waiting for workers to exit...")
@@ -133,7 +126,7 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 }
 
 func (c *controller) worker(ctx context.Context) {
-	log := logf.FromContext(c.ctx)
+	log := logf.FromContext(ctx)
 
 	log.V(logf.DebugLevel).Info("starting worker")
 	for {
@@ -142,21 +135,16 @@ func (c *controller) worker(ctx context.Context) {
 			break
 		}
 
-		var key string
 		// use an inlined function so we can use defer
 		func() {
 			defer c.queue.Done(obj)
-			var ok bool
-			if key, ok = obj.(string); !ok {
-				return
-			}
-			log := log.WithValues("key", key)
+
 			log.V(logf.DebugLevel).Info("syncing item")
 
 			// Increase sync count for this controller
 			c.metrics.IncrementSyncCallCount(c.name)
 
-			err := c.syncHandler(ctx, key)
+			err := c.syncHandler(ctx, obj)
 			if err != nil {
 				if strings.Contains(err.Error(), genericregistry.OptimisticLockErrorMsg) {
 					log.Info("re-queuing item due to optimistic locking on resource", "error", err.Error())

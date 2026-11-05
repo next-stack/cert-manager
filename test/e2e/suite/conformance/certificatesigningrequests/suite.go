@@ -17,21 +17,23 @@ limitations under the License.
 package certificatesigningrequests
 
 import (
+	"context"
 	"crypto"
-
-	. "github.com/onsi/ginkgo/v2"
-	certificatesv1 "k8s.io/api/certificates/v1"
 
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper/featureset"
+	certificatesv1 "k8s.io/api/certificates/v1"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/featureset"
+
+	. "github.com/onsi/ginkgo/v2"
 )
 
 // Suite defines a reusable conformance test suite that can be used against any
 // Issuer implementation.
 type Suite struct {
-	// Name is the name of the issuer being tested, e.g. SelfSigned, CA, ACME
+	// Name is the name of the issuer being tested, e.g., SelfSigned, CA, ACME
 	// This field must be provided.
 	Name string
 
@@ -39,14 +41,14 @@ type Suite struct {
 	// returns an SignerName to that Issuer that will be used as the SignerName
 	// on CertificateSigningRequest resources that this suite creates.
 	// This field must be provided.
-	CreateIssuerFunc func(*framework.Framework) string
+	CreateIssuerFunc func(context.Context, *framework.Framework) string
 
 	// DeleteIssuerFunc is a function that is run after the test has completed
-	// in order to clean up resources created for a test (e.g. the resources
+	// in order to clean up resources created for a test (e.g., the resources
 	// created in CreateIssuerFunc).
 	// This function will be run regardless whether the test passes or fails.
 	// If not specified, this function will be skipped.
-	DeleteIssuerFunc func(*framework.Framework, string)
+	DeleteIssuerFunc func(context.Context, *framework.Framework, string)
 
 	// ProvisionFunc is a function that is run every test just before the
 	// CertificateSigningRequest is created within a test. This is used to
@@ -55,12 +57,17 @@ type Suite struct {
 	// CertificateSigningRequest, or create a resource like a Secret needed for
 	// signing.
 	// If not specified, this function will be skipped.
-	ProvisionFunc func(*framework.Framework, *certificatesv1.CertificateSigningRequest, crypto.Signer)
+	ProvisionFunc func(context.Context, *framework.Framework, *certificatesv1.CertificateSigningRequest, crypto.Signer)
 
 	// DeProvisionFunc is run after every test. This is to be used to remove and
 	// clean-up any resources which may have been created by ProvisionFunc.
 	// If not specified, this function will be skipped.
-	DeProvisionFunc func(*framework.Framework, *certificatesv1.CertificateSigningRequest)
+	DeProvisionFunc func(context.Context, *framework.Framework, *certificatesv1.CertificateSigningRequest)
+
+	// SharedIPAddress is the IP address that will be used in all certificates
+	// that require an IP address to be set. For HTTP-01 tests, this IP address
+	// will be set to the IP address of the Ingress/ Gateway controller.
+	SharedIPAddress string
 
 	// DomainSuffix is a suffix used on all domain requests.
 	// This is useful when the issuer being tested requires special
@@ -70,18 +77,55 @@ type Suite struct {
 	// nginx-ingress addon.
 	DomainSuffix string
 
+	// HTTP01TestType is set to "Ingress" or "Gateway" to determine which IPs
+	// and Domains will be used to run the ACME HTTP-01 test suites.
+	HTTP01TestType string
+
 	// UnsupportedFeatures is a list of features that are not supported by this
 	// invocation of the test suite.
 	// This is useful if a particular issuers explicitly does not support
 	// certain features due to restrictions in their implementation.
 	UnsupportedFeatures featureset.FeatureSet
 
-	// completed is used internally to track whether Complete() has been called
-	completed bool
+	// validated is used internally to track whether Validate has been called already.
+	validated bool
 }
 
-// complete will validate configuration and set default values.
-func (s *Suite) complete(f *framework.Framework) {
+// setup will set default values for fields on the Suite struct.
+func (s *Suite) setup(f *framework.Framework) {
+	if s.SharedIPAddress == "" {
+		switch s.HTTP01TestType {
+		case "Ingress":
+			s.SharedIPAddress = f.Config.Addons.ACMEServer.IngressIP
+		case "Gateway":
+			s.SharedIPAddress = f.Config.Addons.ACMEServer.GatewayIP
+		default:
+			s.SharedIPAddress = "127.0.0.1"
+		}
+	}
+
+	if s.DomainSuffix == "" {
+		switch s.HTTP01TestType {
+		case "Ingress":
+			s.DomainSuffix = f.Config.Addons.IngressController.Domain
+		case "Gateway":
+			s.DomainSuffix = f.Config.Addons.Gateway.Domain
+		default:
+			s.DomainSuffix = "example.com"
+		}
+	}
+
+	if s.UnsupportedFeatures == nil {
+		s.UnsupportedFeatures = make(featureset.FeatureSet)
+	}
+}
+
+// validate will validate the Suite struct to ensure all required fields are set.
+func (s *Suite) validate() {
+	if s.validated {
+		return
+	}
+
 	if s.Name == "" {
 		Fail("Name must be set")
 	}
@@ -90,51 +134,29 @@ func (s *Suite) complete(f *framework.Framework) {
 		Fail("CreateIssuerFunc must be set")
 	}
 
-	if s.DomainSuffix == "" {
-		s.DomainSuffix = f.Config.Addons.IngressController.Domain
+	if s.HTTP01TestType == "Gateway" {
+		framework.RequireFeatureGate(utilfeature.DefaultFeatureGate, feature.ExperimentalGatewayAPISupport)
 	}
 
-	if s.UnsupportedFeatures == nil {
-		s.UnsupportedFeatures = make(featureset.FeatureSet)
-	}
-
-	s.completed = true
+	s.validated = true
 }
 
 // it is called by the tests to in Define() to setup and run the test
-func (s *Suite) it(f *framework.Framework, name string, fn func(string), requiredFeatures ...featureset.Feature) {
-	if !s.checkFeatures(requiredFeatures...) {
+func (s *Suite) it(f *framework.Framework, name string, fn func(context.Context, string), requiredFeatures ...featureset.Feature) {
+	if s.UnsupportedFeatures.HasAny(requiredFeatures...) {
 		return
 	}
-	It(name, func() {
-		framework.RequireFeatureGate(f, utilfeature.DefaultFeatureGate, feature.ExperimentalCertificateSigningRequestControllers)
+	It(name, func(ctx context.Context) {
+		framework.RequireFeatureGate(utilfeature.DefaultFeatureGate, feature.ExperimentalCertificateSigningRequestControllers)
 
 		By("Creating an issuer resource")
-		signerName := s.CreateIssuerFunc(f)
+		signerName := s.CreateIssuerFunc(ctx, f)
 		defer func() {
 			if s.DeleteIssuerFunc != nil {
 				By("Cleaning up the issuer resource")
-				s.DeleteIssuerFunc(f, signerName)
+				s.DeleteIssuerFunc(ctx, f, signerName)
 			}
 		}()
-		fn(signerName)
+		fn(ctx, signerName)
 	})
-}
-
-// checkFeatures is a helper function that is used to ensure that the features
-// required for a given test case are supported by the suite.
-// It will return 'true' if all features are supported and the test should run,
-// or return 'false' if any required feature is not supported.
-func (s *Suite) checkFeatures(fs ...featureset.Feature) bool {
-	unsupported := make(featureset.FeatureSet)
-	for _, f := range fs {
-		if s.UnsupportedFeatures.Contains(f) {
-			unsupported.Add(f)
-		}
-	}
-	// all features supported, return early!
-	if len(unsupported) == 0 {
-		return true
-	}
-	return false
 }

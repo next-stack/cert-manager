@@ -52,9 +52,9 @@ type ChallengeSpec struct {
 	// challenge is a part of.
 	AuthorizationURL string
 
-	// dnsName is the identifier that this challenge is for, e.g. example.com.
+	// dnsName is the identifier that this challenge is for, e.g., example.com.
 	// If the requested DNSName is a 'wildcard', this field MUST be set to the
-	// non-wildcard domain, e.g. for `*.example.com`, it must be `example.com`.
+	// non-wildcard domain, e.g., for `*.example.com`, it must be `example.com`.
 	DNSName string
 
 	// wildcard will be true if this challenge is for a wildcard identifier,
@@ -87,7 +87,7 @@ type ChallengeSpec struct {
 	// If the Issuer does not exist, processing will be retried.
 	// If the Issuer is not an 'ACME' Issuer, an error will be returned and the
 	// Challenge will be marked as failed.
-	IssuerRef cmmeta.ObjectReference
+	IssuerRef cmmeta.IssuerReference
 }
 
 // The type of ACME challenge. Only HTTP-01 and DNS-01 are supported.
@@ -113,13 +113,18 @@ type ChallengeStatus struct {
 	// any more action.
 	Processing bool
 
-	// Presented will be set to true if the challenge values for this challenge
-	// are currently 'presented'.
-	// This *does not* imply the self check is passing. Only that the values
-	// have been 'submitted' for the appropriate challenge mechanism (i.e. the
-	// DNS01 TXT record has been presented, or the HTTP01 configuration has been
-	// configured).
+	// Presented is true once cert-manager has configured the solver resources
+	// needed to expose this challenge's validation material.
+	// For example, the DNS01 TXT record has been created, or the HTTP01 solver
+	// has been configured to serve the challenge token.
+	// This does not imply the self check is passing, that the ACME server has
+	// validated the challenge, or that cert-manager has already accepted the
+	// challenge with the ACME server.
 	Presented bool
+
+	// PresentedAt records when cert-manager first configured the solver
+	// resources for this challenge.
+	PresentedAt *metav1.Time
 
 	// Reason contains human readable information on why the Challenge is in the
 	// current state.

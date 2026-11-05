@@ -22,9 +22,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	certificatesv1 "k8s.io/api/certificates/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog/v2/klogr"
+	"k8s.io/klog/v2/ktesting"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
@@ -35,10 +37,10 @@ import (
 
 func Test_handleSecretReferenceWorkFunc(t *testing.T) {
 	tests := map[string]struct {
-		secret          runtime.Object
+		secret          metav1.Object
 		existingCSRs    []runtime.Object
 		existingIssuers []runtime.Object
-		expectedQueue   []string
+		expectedQueue   []types.NamespacedName
 	}{
 		"if given object is not secret, expect empty queue": {
 			secret: gen.Certificate("not-a-secret"),
@@ -65,7 +67,7 @@ func Test_handleSecretReferenceWorkFunc(t *testing.T) {
 					gen.SetIssuerSelfSigned(cmapi.SelfSignedIssuer{}),
 				),
 			},
-			expectedQueue: []string{},
+			expectedQueue: []types.NamespacedName{},
 		},
 		"if no requests then expect empty queue": {
 			secret:       gen.Secret("test-secret", gen.SetSecretNamespace("test-namespace")),
@@ -79,7 +81,7 @@ func Test_handleSecretReferenceWorkFunc(t *testing.T) {
 					gen.SetIssuerSelfSigned(cmapi.SelfSignedIssuer{}),
 				),
 			},
-			expectedQueue: []string{},
+			expectedQueue: []types.NamespacedName{},
 		},
 		"referenced requests should be added to the queue": {
 			secret: gen.Secret("test-secret", gen.SetSecretNamespace("test-namespace")),
@@ -106,7 +108,10 @@ func Test_handleSecretReferenceWorkFunc(t *testing.T) {
 					gen.SetIssuerSelfSigned(cmapi.SelfSignedIssuer{}),
 				),
 			},
-			expectedQueue: []string{"a", "b"},
+			expectedQueue: []types.NamespacedName{
+				{Name: "a"},
+				{Name: "b"},
+			},
 		},
 	}
 
@@ -120,7 +125,7 @@ func Test_handleSecretReferenceWorkFunc(t *testing.T) {
 			defer builder.Stop()
 			builder.Init()
 
-			lister := builder.Context.KubeSharedInformerFactory.Certificates().V1().CertificateSigningRequests().Lister()
+			lister := builder.Context.KubeSharedInformerFactory.CertificateSigningRequests().Lister()
 			helper := issuer.NewHelper(
 				builder.Context.SharedInformerFactory.Certmanager().V1().Issuers().Lister(),
 				builder.Context.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Lister(),
@@ -128,15 +133,15 @@ func Test_handleSecretReferenceWorkFunc(t *testing.T) {
 
 			builder.Start()
 
-			queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
-			handleSecretReferenceWorkFunc(klogr.New(), lister, helper, queue,
+			queue := workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](), workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{})
+			handleSecretReferenceWorkFunc(ktesting.NewLogger(t, ktesting.NewConfig()), lister, helper, queue,
 				controllerpkg.IssuerOptions{ClusterResourceNamespace: "test-namespace"},
 			)(test.secret)
 			require.Equal(t, len(test.expectedQueue), queue.Len())
-			var actualQueue []string
+			var actualQueue []types.NamespacedName
 			for range test.expectedQueue {
 				i, _ := queue.Get()
-				actualQueue = append(actualQueue, i.(string))
+				actualQueue = append(actualQueue, i)
 			}
 			assert.ElementsMatch(t, test.expectedQueue, actualQueue)
 		})
@@ -190,7 +195,7 @@ func Test_certificatesRequestsForSecret(t *testing.T) {
 			clusterResourceNamespace: "test-namespace",
 			expectedAffected:         []*certificatesv1.CertificateSigningRequest{},
 		},
-		"if issuers are not self signed then don't return requests": {
+		"if issuers are not self-signed then don't return requests": {
 			existingCSRs: []runtime.Object{
 				gen.CertificateSigningRequest("a",
 					gen.AddCertificateSigningRequestAnnotations(map[string]string{
@@ -330,7 +335,7 @@ func Test_certificatesRequestsForSecret(t *testing.T) {
 			defer builder.Stop()
 			builder.Init()
 
-			lister := builder.Context.KubeSharedInformerFactory.Certificates().V1().CertificateSigningRequests().Lister()
+			lister := builder.Context.KubeSharedInformerFactory.CertificateSigningRequests().Lister()
 			helper := issuer.NewHelper(
 				builder.Context.SharedInformerFactory.Certmanager().V1().Issuers().Lister(),
 				builder.Context.SharedInformerFactory.Certmanager().V1().ClusterIssuers().Lister(),
@@ -338,7 +343,7 @@ func Test_certificatesRequestsForSecret(t *testing.T) {
 
 			builder.Start()
 
-			affected, err := certificateSigningRequestsForSecret(klogr.New(), lister, helper, secret.DeepCopy(), controllerpkg.IssuerOptions{
+			affected, err := certificateSigningRequestsForSecret(ktesting.NewLogger(t, ktesting.NewConfig()), lister, helper, secret.DeepCopy(), controllerpkg.IssuerOptions{
 				ClusterResourceNamespace: test.clusterResourceNamespace,
 			})
 

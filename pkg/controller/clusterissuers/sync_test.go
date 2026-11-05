@@ -17,8 +17,6 @@ limitations under the License.
 package clusterissuers
 
 import (
-	"context"
-	"reflect"
 	"runtime/debug"
 	"testing"
 
@@ -26,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgotesting "k8s.io/client-go/testing"
 
+	"github.com/cert-manager/cert-manager/internal/test/testutil"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
@@ -33,9 +32,7 @@ import (
 
 func newFakeIssuerWithStatus(name string, status v1.IssuerStatus) *v1.ClusterIssuer {
 	return &v1.ClusterIssuer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
+		Name:   name,
 		Status: status,
 	}
 }
@@ -63,7 +60,7 @@ func TestUpdateIssuerStatus(t *testing.T) {
 
 	originalIssuer := newFakeIssuerWithStatus("test", v1.IssuerStatus{})
 
-	issuer, err := fakeClient.CertmanagerV1().ClusterIssuers().Create(context.TODO(), originalIssuer, metav1.CreateOptions{})
+	issuer, err := fakeClient.CertmanagerV1().ClusterIssuers().Create(t.Context(), originalIssuer, metav1.CreateOptions{})
 	assertErrIsNil(t, fatalf, err)
 
 	assertNumberOfActions(t, fatalf, filter(fakeClient.Actions()), 1)
@@ -79,7 +76,7 @@ func TestUpdateIssuerStatus(t *testing.T) {
 
 	issuerCopy := issuer.DeepCopy()
 	issuerCopy.Status = newStatus
-	err = c.updateIssuerStatus(context.TODO(), issuer, issuerCopy)
+	err = c.updateIssuerStatus(t.Context(), issuer, issuerCopy)
 	assertErrIsNil(t, fatalf, err)
 
 	actions := filter(fakeClient.Actions())
@@ -91,7 +88,7 @@ func TestUpdateIssuerStatus(t *testing.T) {
 	obj := updateAction.GetObject()
 	issuer = assertIsClusterIssuer(t, errorf, obj)
 
-	assertDeepEqual(t, errorf, newStatus, issuer.Status)
+	assertEqual(t, errorf, newStatus, issuer.Status)
 }
 
 func assertIsUpdateAction(t *testing.T, f failfFunc, action clientgotesting.Action) clientgotesting.UpdateAction {
@@ -122,9 +119,9 @@ func assertIsClusterIssuer(t *testing.T, f failfFunc, obj runtime.Object) *v1.Cl
 	return issuer
 }
 
-func assertDeepEqual(t *testing.T, f failfFunc, left, right interface{}) {
-	if !reflect.DeepEqual(left, right) {
-		f(t, "object '%#v' does not equal '%#v'", left, right)
+func assertEqual(t *testing.T, f failfFunc, want, got any) {
+	if err := testutil.Diff(want, got); err != nil {
+		f(t, "%v", err)
 	}
 }
 
@@ -140,14 +137,14 @@ func filter(in []clientgotesting.Action) []clientgotesting.Action {
 
 // failfFunc is a type that defines the common signatures of T.Fatalf and
 // T.Errorf.
-type failfFunc func(t *testing.T, msg string, args ...interface{})
+type failfFunc func(t *testing.T, msg string, args ...any)
 
-func fatalf(t *testing.T, msg string, args ...interface{}) {
+func fatalf(t *testing.T, msg string, args ...any) {
 	t.Log(string(debug.Stack()))
 	t.Fatalf(msg, args...)
 }
 
-func errorf(t *testing.T, msg string, args ...interface{}) {
+func errorf(t *testing.T, msg string, args ...any) {
 	t.Log(string(debug.Stack()))
 	t.Errorf(msg, args...)
 }

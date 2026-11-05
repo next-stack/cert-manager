@@ -20,15 +20,17 @@ import (
 	"context"
 	"crypto"
 	"crypto/x509"
+	"errors"
 	"fmt"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	certificatesclient "k8s.io/client-go/kubernetes/typed/certificates/v1"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
@@ -36,6 +38,7 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests/util"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	cmerrors "github.com/cert-manager/cert-manager/pkg/util/errors"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/kube"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 )
@@ -52,7 +55,7 @@ type signingFn func([]*x509.Certificate, crypto.Signer, *x509.Certificate) (pki.
 // or ClusterIssuer
 type CA struct {
 	issuerOptions controllerpkg.IssuerOptions
-	secretsLister corelisters.SecretLister
+	secretsLister internalinformers.SecretLister
 
 	certClient certificatesclient.CertificateSigningRequestInterface
 
@@ -78,11 +81,11 @@ func init() {
 func NewCA(ctx *controllerpkg.Context) certificatesigningrequests.Signer {
 	return &CA{
 		issuerOptions:     ctx.IssuerOptions,
-		secretsLister:     ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
+		secretsLister:     ctx.KubeSharedInformerFactory.Secrets().Lister(),
 		certClient:        ctx.Client.CertificatesV1().CertificateSigningRequests(),
 		fieldManager:      ctx.FieldManager,
 		recorder:          ctx.Recorder,
-		templateGenerator: pki.GenerateTemplateFromCertificateSigningRequest,
+		templateGenerator: pki.CertificateTemplateFromCertificateSigningRequest,
 		signingFn:         pki.SignCSRTemplate,
 	}
 }
@@ -127,8 +130,21 @@ func (c *CA) Sign(ctx context.Context, csr *certificatesv1.CertificateSigningReq
 		return err
 	}
 
+	if !utilfeature.DefaultFeatureGate.Enabled(feature.MLDSAPrivateKeys) &&
+		(pki.IsMLDSAPublicKey(template.PublicKey) || pki.IsMLDSAPublicKey(caKey.Public())) {
+		err := errors.New("the MLDSAPrivateKeys feature gate is disabled")
+		message := "Refusing to sign a certificate involving an ML-DSA key"
+		log.Error(err, message)
+		message = fmt.Sprintf("%s: %s", message, err)
+		c.recorder.Event(csr, corev1.EventTypeWarning, "MLDSAPrivateKeysDisabled", message)
+		util.CertificateSigningRequestSetFailed(csr, "MLDSAPrivateKeysDisabled", message)
+		_, err = util.UpdateOrApplyStatus(ctx, c.certClient, csr, certificatesv1.CertificateFailed, c.fieldManager)
+		return err
+	}
+
 	template.CRLDistributionPoints = issuerObj.GetSpec().CA.CRLDistributionPoints
 	template.OCSPServer = issuerObj.GetSpec().CA.OCSPServers
+	template.IssuingCertificateURL = issuerObj.GetSpec().CA.IssuingCertificateURLs
 
 	bundle, err := c.signingFn(caCerts, caKey, template)
 	if err != nil {

@@ -17,27 +17,23 @@ limitations under the License.
 package predicate
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
-
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 )
 
 // CertificateSecretName returns a predicate that used to filter Certificates
 // to only those with the given 'spec.secretName'.
-func CertificateSecretName(name string) Func {
-	return func(obj runtime.Object) bool {
-		crt := obj.(*cmapi.Certificate)
+func CertificateSecretName(name string) Func[*cmapi.Certificate] {
+	return func(crt *cmapi.Certificate) bool {
 		return crt.Spec.SecretName == name
 	}
 }
 
-// CertificateSecretName returns a predicate that used to filter Certificates
+// CertificateNextPrivateKeySecretName returns a predicate that used to filter Certificates
 // to only those with the given 'status.nextPrivateKeySecretName'.
 // It is not possible to select Certificates with a 'nil' secret name using
 // this predicate function.
-func CertificateNextPrivateKeySecretName(name string) Func {
-	return func(obj runtime.Object) bool {
-		crt := obj.(*cmapi.Certificate)
+func CertificateNextPrivateKeySecretName(name string) Func[*cmapi.Certificate] {
+	return func(crt *cmapi.Certificate) bool {
 		if crt.Status.NextPrivateKeySecretName == nil {
 			return false
 		}

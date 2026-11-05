@@ -17,29 +17,28 @@ limitations under the License.
 package rfc2136
 
 import (
-	"context"
 	"testing"
-
-	logtesting "github.com/go-logr/logr/testing"
 
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/rfc2136"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
-	"github.com/cert-manager/cert-manager/test/acme/dns"
-	testserver "github.com/cert-manager/cert-manager/test/acme/dns/server"
+	dns "github.com/cert-manager/cert-manager/test/acme"
+	testserver "github.com/cert-manager/cert-manager/test/acme/server"
+	"github.com/go-logr/logr/testr"
 )
 
 func TestRunSuiteWithTSIG(t *testing.T) {
-	ctx := logf.NewContext(context.TODO(), logtesting.NewTestLogger(t), t.Name())
+	ctx := logf.NewContext(t.Context(), testr.New(t), t.Name())
 	server := &testserver.BasicServer{
+		T:             t,
 		Zones:         []string{rfc2136TestZone},
 		EnableTSIG:    true,
 		TSIGZone:      rfc2136TestZone,
 		TSIGKeyName:   rfc2136TestTsigKeyName,
 		TSIGKeySecret: rfc2136TestTsigSecret,
 	}
-	if err := server.Run(ctx); err != nil {
+	if err := server.Run(ctx, "UDP"); err != nil {
 		t.Fatalf("failed to start test server: %v", err)
 	}
 	defer func() {
@@ -59,7 +58,7 @@ func TestRunSuiteWithTSIG(t *testing.T) {
 		TSIGKeyName: rfc2136TestTsigKeyName,
 	}
 
-	fixture := dns.NewFixture(&rfc2136.Solver{},
+	fixture := dns.NewFixture(rfc2136.New(rfc2136.InitializeResetLister()),
 		dns.SetResolvedZone(rfc2136TestZone),
 		dns.SetResolvedFQDN(rfc2136TestFqdn),
 		dns.SetAllowAmbientCredentials(false),
@@ -74,11 +73,12 @@ func TestRunSuiteWithTSIG(t *testing.T) {
 }
 
 func TestRunSuiteNoTSIG(t *testing.T) {
-	ctx := logf.NewContext(context.TODO(), logtesting.NewTestLogger(t), t.Name())
+	ctx := logf.NewContext(t.Context(), testr.New(t), t.Name())
 	server := &testserver.BasicServer{
+		T:     t,
 		Zones: []string{rfc2136TestZone},
 	}
-	if err := server.Run(ctx); err != nil {
+	if err := server.Run(ctx, "UDP"); err != nil {
 		t.Fatalf("failed to start test server: %v", err)
 	}
 	defer func() {
@@ -91,7 +91,7 @@ func TestRunSuiteNoTSIG(t *testing.T) {
 		Nameserver: server.ListenAddr(),
 	}
 
-	fixture := dns.NewFixture(&rfc2136.Solver{},
+	fixture := dns.NewFixture(rfc2136.New(rfc2136.InitializeResetLister()),
 		dns.SetResolvedZone(rfc2136TestZone),
 		dns.SetResolvedFQDN(rfc2136TestFqdn),
 		dns.SetAllowAmbientCredentials(false),

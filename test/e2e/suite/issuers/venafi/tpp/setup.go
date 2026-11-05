@@ -19,15 +19,16 @@ package tpp
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
-	vaddon "github.com/cert-manager/cert-manager/test/e2e/framework/addon/venafi"
-	"github.com/cert-manager/cert-manager/test/e2e/util"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+	vaddon "github.com/cert-manager/cert-manager/e2e-tests/framework/addon/venafi"
+	"github.com/cert-manager/cert-manager/e2e-tests/util"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = TPPDescribe("properly configured Venafi TPP Issuer", func() {
@@ -38,26 +39,29 @@ var _ = TPPDescribe("properly configured Venafi TPP Issuer", func() {
 		tppAddon = &vaddon.VenafiTPP{}
 	)
 
-	BeforeEach(func() {
+	BeforeEach(func(testingCtx context.Context) {
 		tppAddon.Namespace = f.Namespace.Name
 	})
 
 	f.RequireAddon(tppAddon)
 
-	AfterEach(func() {
+	AfterEach(func(testingCtx context.Context) {
 		By("Cleaning up")
-		f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(context.TODO(), issuer.Name, metav1.DeleteOptions{})
+		if issuer != nil {
+			err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Delete(testingCtx, issuer.Name, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		}
 	})
 
-	It("should set Ready=True accordingly", func() {
+	It("should set Ready=True accordingly", func(testingCtx context.Context) {
 		var err error
 		By("Creating a Venafi Issuer resource")
 		issuer = tppAddon.Details().BuildIssuer()
-		issuer, err = f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+		issuer, err = f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for Issuer to become Ready")
-		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+		err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuer.Name,
 			cmapi.IssuerCondition{
 				Type:   cmapi.IssuerConditionReady,
@@ -66,13 +70,13 @@ var _ = TPPDescribe("properly configured Venafi TPP Issuer", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	It("should set Ready=False with a bad access token", func() {
+	It("should set Ready=False with reason AuthFailed when a bad access token is supplied", func(testingCtx context.Context) {
 		var err error
 		By("Creating a Venafi Issuer resource")
 		issuer = tppAddon.Details().BuildIssuer()
-		issuer, err = f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+		issuer, err = f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(testingCtx, issuer, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
-		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+		err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuer.Name,
 			cmapi.IssuerCondition{
 				Type:   cmapi.IssuerConditionReady,
@@ -81,14 +85,30 @@ var _ = TPPDescribe("properly configured Venafi TPP Issuer", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Changing the Access Token to something bad")
-		err = tppAddon.SetAccessToken("this_is_a_bad_token")
+		err = tppAddon.SetAccessToken(testingCtx, "this_is_a_bad_token")
 		Expect(err).NotTo(HaveOccurred())
-		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
+
+		By("Waiting for the Issuer to transition to Ready=False")
+		err = util.WaitForIssuerCondition(testingCtx, f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name),
 			issuer.Name,
 			cmapi.IssuerCondition{
 				Type:   cmapi.IssuerConditionReady,
 				Status: cmmeta.ConditionFalse,
 			})
 		Expect(err).NotTo(HaveOccurred())
+
+		By("Asserting that the condition reason is AuthFailed")
+		updatedIssuer, getErr := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Get(testingCtx, issuer.Name, metav1.GetOptions{})
+		Expect(getErr).NotTo(HaveOccurred())
+		var authFailedCondition *cmapi.IssuerCondition
+		for i := range updatedIssuer.Status.Conditions {
+			if updatedIssuer.Status.Conditions[i].Type == cmapi.IssuerConditionReady {
+				authFailedCondition = &updatedIssuer.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(authFailedCondition).NotTo(BeNil(), "expected a Ready condition")
+		Expect(authFailedCondition.Reason).To(Equal("AuthFailed"),
+			"expected reason AuthFailed, got %q (message: %s)", authFailedCondition.Reason, authFailedCondition.Message)
 	})
 })

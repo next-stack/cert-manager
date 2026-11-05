@@ -17,33 +17,33 @@ limitations under the License.
 package requestmanager
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/informers"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 
+	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	cminformers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates"
@@ -54,9 +54,10 @@ import (
 )
 
 const (
-	ControllerName      = "certificates-request-manager"
-	reasonRequestFailed = "RequestFailed"
-	reasonRequested     = "Requested"
+	ControllerName        = "certificates-request-manager"
+	reasonRequestFailed   = "RequestFailed"
+	reasonRequested       = "Requested"
+	reasonRequestConflict = "RequestConflict"
 )
 
 var (
@@ -66,7 +67,7 @@ var (
 type controller struct {
 	certificateLister        cmlisters.CertificateLister
 	certificateRequestLister cmlisters.CertificateRequestLister
-	secretLister             corelisters.SecretLister
+	secretLister             internalinformers.SecretLister
 	client                   cmclient.Interface
 	recorder                 record.EventRecorder
 	clock                    clock.Clock
@@ -79,36 +80,45 @@ type controller struct {
 }
 
 func NewController(
-	log logr.Logger,
-	client cmclient.Interface,
-	factory informers.SharedInformerFactory,
-	cmFactory cminformers.SharedInformerFactory,
-	recorder record.EventRecorder,
-	clock clock.Clock,
-	certificateControllerOptions controllerpkg.CertificateOptions,
-	fieldManager string,
-) (*controller, workqueue.RateLimitingInterface, []cache.InformerSynced) {
+	log logr.Logger, ctx *controllerpkg.Context) (*controller, workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// create a queue used to queue up items to be processed
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(time.Second*1, time.Second*30), ControllerName)
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultCertificateRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
 	// obtain references to all the informers used by this controller
-	certificateInformer := cmFactory.Certmanager().V1().Certificates()
-	certificateRequestInformer := cmFactory.Certmanager().V1().CertificateRequests()
-	secretsInformer := factory.Core().V1().Secrets()
+	certificateInformer := ctx.SharedInformerFactory.Certmanager().V1().Certificates()
+	certificateRequestInformer := ctx.SharedInformerFactory.Certmanager().V1().CertificateRequests()
+	secretsInformer := ctx.KubeSharedInformerFactory.Secrets()
 
-	certificateInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: queue})
-	certificateRequestInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		// Trigger reconciles on changes to any 'owned' CertificateRequest resources
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(),
-			predicate.ResourceOwnerOf,
+	if _, err := certificateInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(queue)); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := certificateRequestInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			// Trigger reconciles on changes to any 'owned' CertificateRequest resources
+			certificates.EnqueueCertificatesForResourceUsingPredicates[*cmapi.CertificateRequest](
+				log, queue, certificateInformer.Lister(),
+				predicate.ResourceOwnerOf,
+			),
 		),
-	})
-	secretsInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		// Trigger reconciles on changes to any 'owned' secret resources
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(),
-			predicate.ResourceOwnerOf,
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := secretsInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			// Trigger reconciles on changes to any 'owned' secret resources
+			certificates.EnqueueCertificatesForResourceUsingPredicates[*corev1.Secret](
+				log, queue, certificateInformer.Lister(),
+				predicate.ResourceOwnerOf,
+			),
 		),
-	})
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// build a list of InformerSynced functions that will be returned by the Register method.
 	// the controller will only begin processing items once all of these informers have synced.
@@ -122,31 +132,28 @@ func NewController(
 		certificateLister:        certificateInformer.Lister(),
 		certificateRequestLister: certificateRequestInformer.Lister(),
 		secretLister:             secretsInformer.Lister(),
-		client:                   client,
-		recorder:                 recorder,
-		clock:                    clock,
-		copiedAnnotationPrefixes: certificateControllerOptions.CopiedAnnotationPrefixes,
-		fieldManager:             fieldManager,
-	}, queue, mustSync
+		client:                   ctx.CMClient,
+		recorder:                 ctx.Recorder,
+		clock:                    ctx.Clock,
+		copiedAnnotationPrefixes: ctx.CertificateOptions.CopiedAnnotationPrefixes,
+		fieldManager:             ctx.FieldManager,
+	}, queue, mustSync, nil
 }
 
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx).WithValues("key", key)
 
 	ctx = logf.NewContext(ctx, log)
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key passed to ProcessItem")
-		return nil
-	}
+	namespace, name := key.Namespace, key.Name
 
 	crt, err := c.certificateLister.Certificates(namespace).Get(name)
-	if apierrors.IsNotFound(err) {
-		log.V(logf.DebugLevel).Info("certificate not found for key", "error", err.Error())
-		return nil
-	}
-	if err != nil {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
+	}
+	if crt == nil || crt.DeletionTimestamp != nil {
+		// If the Certificate object was/ is being deleted, we don't want to create any
+		// new CertificateRequests objects
+		return nil
 	}
 
 	if !apiutil.CertificateHasCondition(crt, cmapi.CertificateCondition{
@@ -156,14 +163,11 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 		return nil
 	}
 
-	// Check for and fetch the 'status.nextPrivateKeySecretName' secret
-	if crt.Status.NextPrivateKeySecretName == nil {
-		log.V(logf.DebugLevel).Info("status.nextPrivateKeySecretName not yet set, waiting for keymanager before processing certificate")
-		return nil
-	}
-	nextPrivateKeySecret, err := c.secretLister.Secrets(crt.Namespace).Get(*crt.Status.NextPrivateKeySecretName)
+	// Check for and fetch the 'status.nextPrivateKeySecretName' secret. An unset
+	// name is reported as not found, the same as a Secret we must not use.
+	nextPrivateKeySecret, err := certificates.GetNextPrivateKeySecret(c.secretLister.Secrets(crt.Namespace), crt)
 	if apierrors.IsNotFound(err) {
-		log.V(logf.DebugLevel).Info("nextPrivateKeySecretName Secret resource does not exist, waiting for keymanager to create it before continuing")
+		log.V(logf.DebugLevel).Info("nextPrivateKeySecretName Secret resource does not exist or is not owned by this Certificate, waiting for keymanager to create it before continuing")
 		return nil
 	}
 	if err != nil {
@@ -178,9 +182,17 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 		log.Error(err, "Failed to decode next private key secret data, waiting for keymanager before processing certificate")
 		return nil
 	}
+	pkViolations := pki.PrivateKeyMatchesSpec(pk, crt.Spec)
+	if len(pkViolations) > 0 {
+		logf.WithResource(log, nextPrivateKeySecret).Info("stored next private key does not match requirements on Certificate resource, waiting for keymanager controller", "violations", pkViolations)
+		return nil
+	}
 
 	// Discover all 'owned' CertificateRequests
-	requests, err := certificates.ListCertificateRequestsMatchingPredicates(c.certificateRequestLister.CertificateRequests(crt.Namespace), labels.Everything(), predicate.ResourceOwnedBy(crt))
+	requests, err := certificates.ListCertificateRequestsMatchingPredicates(
+		c.certificateRequestLister.CertificateRequests(crt.Namespace),
+		predicate.ResourceOwnedBy[*cmapi.CertificateRequest](crt),
+	)
 	if err != nil {
 		return err
 	}
@@ -216,7 +228,16 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 		// TODO: we should handle this case better, but for now do nothing to
 		//  avoid getting into loops where we keep creating multiple requests
 		//  and deleting them again.
-		log.V(logf.ErrorLevel).Info("Multiple matching CertificateRequest resources exist, delete one of them. This is likely an error and should be reported on the issue tracker!")
+		// Issuance cannot make progress until a human deletes all but one of
+		// these CertificateRequests, and no error is returned here, so this is
+		// recorded on the Certificate as well as logged.
+		names := make([]string, len(requests))
+		for i, req := range requests {
+			names[i] = req.Name
+		}
+		slices.Sort(names)
+		log.V(logf.ErrorLevel).Info("Multiple matching CertificateRequest resources exist, delete all but one of them to allow issuance to continue", "requests", names)
+		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonRequestConflict, "Multiple matching CertificateRequest resources exist (%s), delete all but one of them to allow issuance to continue", strings.Join(names, ", "))
 		return nil
 	}
 
@@ -231,34 +252,40 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 
 func (c *controller) deleteCurrentFailedRequests(ctx context.Context, crt *cmapi.Certificate, reqs ...*cmapi.CertificateRequest) ([]*cmapi.CertificateRequest, error) {
 	log := logf.FromContext(ctx).WithValues("Certificate", crt.Name)
+
+	certIssuingCond := apiutil.GetCertificateCondition(crt, cmapi.CertificateConditionIssuing)
+	if certIssuingCond == nil {
+		// This should never happen
+		log.V(logf.ErrorLevel).Info("Certificate does not have Issuing condition")
+		return nil, nil
+	}
+
 	var remaining []*cmapi.CertificateRequest
 	for _, req := range reqs {
-		log = logf.WithRelatedResource(log, req)
+		log := logf.WithRelatedResource(log, req)
 
 		// Check if there are any 'current' CertificateRequests that
 		// failed during the previous issuance cycle. Those should be
 		// deleted so that a new one gets created and the issuance is
 		// re-tried. In practice no more than one CertificateRequest is
 		// expected at this point.
-		crReadyCond := apiutil.GetCertificateRequestCondition(req, cmapi.CertificateRequestConditionReady)
-		if crReadyCond == nil || crReadyCond.Status != cmmeta.ConditionFalse || crReadyCond.Reason != cmapi.CertificateRequestReasonFailed {
-			remaining = append(remaining, req)
-			continue
-		}
-
-		certIssuingCond := apiutil.GetCertificateCondition(crt, cmapi.CertificateConditionIssuing)
-		if certIssuingCond == nil {
-			// This should never happen
-			log.V(logf.ErrorLevel).Info("Certificate does not have Issuing condition")
-			return nil, nil
-		}
+		//
 		// If the Issuing condition on the Certificate is newer than the
-		// failure time on CertificateRequest, it means that the
+		// failure on the CertificateRequest, it means that the
 		// CertificateRequest failed during the previous issuance (for the
 		// same revision). If it is a CertificateRequest that failed
 		// during the previous issuance, then it should be deleted so
 		// that we create a new one for this issuance.
-		if req.Status.FailureTime.Before(certIssuingCond.LastTransitionTime) {
+		var previousIssuance bool
+		if internalcertificates.IsIncompleteFailure(req) {
+			// An external issuer can leave a request with a failureTime
+			// and no Ready condition.
+			previousIssuance = internalcertificates.IncompleteFailureIsFromPreviousIssuance(req, certIssuingCond)
+		} else {
+			previousIssuance = internalcertificates.FailedRequestIsFromPreviousIssuance(req, certIssuingCond)
+		}
+
+		if previousIssuance {
 			log.V(logf.DebugLevel).Info("Found a failed CertificateRequest for previous issuance of this revision, deleting...")
 			if err := c.client.CertmanagerV1().CertificateRequests(req.Namespace).Delete(ctx, req.Name, metav1.DeleteOptions{}); err != nil {
 				return nil, err
@@ -321,7 +348,7 @@ func (c *controller) deleteRequestsNotMatchingSpec(ctx context.Context, crt *cma
 	var remaining []*cmapi.CertificateRequest
 	for _, req := range reqs {
 		log := logf.WithRelatedResource(log, req)
-		violations, err := certificates.RequestMatchesSpec(req, crt.Spec)
+		violations, err := pki.RequestMatchesSpec(req, crt.Spec)
 		if err != nil {
 			log.Error(err, "Failed to check if CertificateRequest matches spec, deleting CertificateRequest")
 			if err := c.client.CertmanagerV1().CertificateRequests(req.Namespace).Delete(ctx, req.Name, metav1.DeleteOptions{}); err != nil {
@@ -359,9 +386,17 @@ func (c *controller) deleteRequestsNotMatchingSpec(ctx context.Context, crt *cma
 
 func (c *controller) createNewCertificateRequest(ctx context.Context, crt *cmapi.Certificate, pk crypto.Signer, nextRevision int, nextPrivateKeySecretName string) error {
 	log := logf.FromContext(ctx)
-	x509CSR, err := pki.GenerateCSR(crt)
+
+	x509CSR, err := pki.GenerateCSR(
+		crt,
+		pki.WithUseLiteralSubject(utilfeature.DefaultMutableFeatureGate.Enabled(feature.LiteralCertificateSubject)),
+		pki.WithEncodeBasicConstraintsInRequest(utilfeature.DefaultMutableFeatureGate.Enabled(feature.UseCertificateRequestBasicConstraints)),
+		pki.WithNameConstraints(utilfeature.DefaultMutableFeatureGate.Enabled(feature.NameConstraints)),
+		pki.WithOtherNames(utilfeature.DefaultMutableFeatureGate.Enabled(feature.OtherNames)),
+	)
 	if err != nil {
 		log.Error(err, "Failed to generate CSR - will not retry")
+		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonRequestFailed, "Failed to generate CSR: %s - will not retry", err.Error())
 		return nil
 	}
 	csrDER, err := pki.EncodeCSR(x509CSR, pk)
@@ -369,11 +404,7 @@ func (c *controller) createNewCertificateRequest(ctx context.Context, crt *cmapi
 		return err
 	}
 
-	csrPEM := bytes.NewBuffer([]byte{})
-	err = pem.Encode(csrPEM, &pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
-	if err != nil {
-		return err
-	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
 
 	annotations := controllerpkg.BuildAnnotationsToCopy(crt.Annotations, c.copiedAnnotationPrefixes)
 	annotations[cmapi.CertificateRequestRevisionAnnotationKey] = strconv.Itoa(nextRevision)
@@ -381,17 +412,18 @@ func (c *controller) createNewCertificateRequest(ctx context.Context, crt *cmapi
 	annotations[cmapi.CertificateNameKey] = crt.Name
 
 	cr := &cmapi.CertificateRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:       crt.Namespace,
-			GenerateName:    apiutil.DNSSafeShortenTo52Characters(crt.Name) + "-",
-			Annotations:     annotations,
-			Labels:          crt.Labels,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(crt, certificateGvk)},
-		},
+		Namespace: crt.Namespace,
+		// We limit the GenerateName to 52 + 1 characters to stay within the 63 - 5 character limit that
+		// is used in Kubernetes when generating names.
+		// see https://github.com/kubernetes/apiserver/blob/696768606f546f71a1e90546613be37d1aa37f64/pkg/storage/names/generate.go
+		GenerateName:    apiutil.DNSSafeShortenTo52Characters(crt.Name) + "-",
+		Annotations:     annotations,
+		Labels:          crt.Labels,
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(crt, certificateGvk)},
 		Spec: cmapi.CertificateRequestSpec{
 			Duration:  crt.Spec.Duration,
 			IssuerRef: crt.Spec.IssuerRef,
-			Request:   csrPEM.Bytes(),
+			Request:   csrPEM,
 			IsCA:      crt.Spec.IsCA,
 			Usages:    crt.Spec.Usages,
 		},
@@ -399,12 +431,29 @@ func (c *controller) createNewCertificateRequest(ctx context.Context, crt *cmapi
 
 	if utilfeature.DefaultFeatureGate.Enabled(feature.StableCertificateRequestName) {
 		cr.ObjectMeta.GenerateName = ""
-		cr.ObjectMeta.Name = apiutil.DNSSafeShortenTo52Characters(crt.Name) + "-" + fmt.Sprintf("%d", nextRevision)
+
+		// The CertificateRequest name is limited to 253 characters, assuming the nextRevision and hyphen
+		// can be represented using 20 characters, we can directly accept certificate names up to 233
+		// characters. Certificate names that are longer than this will be hashed to a shorter name. We want
+		// to make crafting two Certificates with the same truncated name as difficult as possible, so we
+		// use a cryptographic hash function to hash the full certificate name to 64 characters.
+		// Finally, for Certificates with a name longer than 233 characters, we build the CertificateRequest
+		// name as follows: <first-168-chars-of-certificate-name>-<64-char-hash>-<19-char-nextRevision>
+		//
+		// ComputeSecureUniqueDeterministicNameFromData only errors if the maximum
+		// length is below the 64 character hash, and the hash write it does
+		// internally never fails, so 233 cannot error here.
+		crName, err := apiutil.ComputeSecureUniqueDeterministicNameFromData(crt.Name, 233)
+		if err != nil {
+			return err
+		}
+
+		cr.ObjectMeta.Name = fmt.Sprintf("%s-%d", crName, nextRevision)
 	}
 
 	cr, err = c.client.CertmanagerV1().CertificateRequests(cr.Namespace).Create(ctx, cr, metav1.CreateOptions{FieldManager: c.fieldManager})
 	if err != nil {
-		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonRequestFailed, "Failed to create CertificateRequest: "+err.Error())
+		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonRequestFailed, "Failed to create CertificateRequest: %s", err.Error())
 		return err
 	}
 
@@ -417,14 +466,15 @@ func (c *controller) createNewCertificateRequest(ctx context.Context, crt *cmapi
 		return nil
 	}
 
-	if err := c.waitForCertificateRequestToExist(cr.Namespace, cr.Name); err != nil {
-		return fmt.Errorf("failed whilst waiting for CertificateRequest to exist - this may indicate an apiserver running slowly. Request will be retried. %w", err)
+	if err := c.waitForCertificateRequestToExist(ctx, cr.Namespace, cr.Name); err != nil {
+		c.recorder.Eventf(crt, corev1.EventTypeWarning, reasonRequestFailed, "Failed waiting for CertificateRequest %q to be observed: %s - will retry", cr.Name, err.Error())
+		return fmt.Errorf("failed whilst waiting for CertificateRequest %q to be observed. Request will be retried. %w", cr.Name, err)
 	}
 	return nil
 }
 
-func (c *controller) waitForCertificateRequestToExist(namespace, name string) error {
-	return wait.Poll(time.Millisecond*100, time.Second*5, func() (bool, error) {
+func (c *controller) waitForCertificateRequestToExist(ctx context.Context, namespace, name string) error {
+	return wait.PollUntilContextTimeout(ctx, time.Millisecond*100, time.Second*5, false, func(_ context.Context) (bool, error) {
 		_, err := c.certificateRequestLister.CertificateRequests(namespace).Get(name)
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -442,22 +492,14 @@ type controllerWrapper struct {
 	*controller
 }
 
-func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// construct a new named logger to be reused throughout the controller
 	log := logf.FromContext(ctx.RootContext, ControllerName)
 
-	ctrl, queue, mustSync := NewController(log,
-		ctx.CMClient,
-		ctx.KubeSharedInformerFactory,
-		ctx.SharedInformerFactory,
-		ctx.Recorder,
-		ctx.Clock,
-		ctx.CertificateOptions,
-		ctx.FieldManager,
-	)
+	ctrl, queue, mustSync, err := NewController(log, ctx)
 	c.controller = ctrl
 
-	return queue, mustSync, nil
+	return queue, mustSync, err
 }
 
 func init() {

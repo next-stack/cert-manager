@@ -19,7 +19,8 @@ package acme
 import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	gwapi "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gwapi "sigs.k8s.io/gateway-api/apis/v1"
 
 	cmmeta "github.com/cert-manager/cert-manager/internal/apis/meta"
 )
@@ -45,16 +46,26 @@ type ACMEIssuer struct {
 	// PreferredChain is the chain to use if the ACME server outputs multiple.
 	// PreferredChain is no guarantee that this one gets delivered by the ACME
 	// endpoint.
-	// For example, for Let's Encrypt's DST crosssign you would use:
+	// For example, for Let's Encrypt's DST cross-sign you would use:
 	// "DST Root CA X3" or "ISRG Root X1" for the newer Let's Encrypt root CA.
 	PreferredChain string
 
-	// Enables or disables validation of the ACME server TLS certificate.
-	// If true, requests to the ACME server will not have their TLS certificate
-	// validated (i.e. insecure connections will be allowed).
+	// Base64-encoded bundle of PEM CAs which can be used to validate the certificate
+	// chain presented by the ACME server.
+	// Mutually exclusive with SkipTLSVerify; prefer using CABundle to prevent various
+	// kinds of security vulnerabilities.
+	// If CABundle and SkipTLSVerify are unset, the system certificate bundle inside
+	// the container is used to validate the TLS connection.
+	CABundle []byte
+
+	// INSECURE: Enables or disables validation of the ACME server TLS certificate.
+	// If true, requests to the ACME server will not have the TLS certificate chain
+	// validated.
+	// Mutually exclusive with CABundle; prefer using CABundle to prevent various
+	// kinds of security vulnerabilities.
 	// Only enable this option in development environments.
-	// The cert-manager system installed roots will be used to verify connections
-	// to the ACME server if this is false.
+	// If CABundle and SkipTLSVerify are unset, the system certificate bundle inside
+	// the container is used to validate the TLS connection.
 	// Defaults to false.
 	SkipTLSVerify bool
 
@@ -74,7 +85,13 @@ type ACMEIssuer struct {
 	// Solvers is a list of challenge solvers that will be used to solve
 	// ACME challenges for the matching domains.
 	// Solver configurations must be provided in order to obtain certificates
-	// from an ACME server.
+	// from an ACME server, unless the ACME server pre-authorizes every
+	// identifier on every order, including renewals, out of band
+	// (e.g. pre-validated domains), in which case solvers may be omitted
+	// and no Challenge resources will be created. If any identifier on an
+	// order is not pre-authorized and no solver matches it, the order will
+	// remain pending indefinitely, with only a Warning event recorded
+	// against it.
 	// For more information, see: https://cert-manager.io/docs/configuration/acme/
 	Solvers []ACMEChallengeSolver
 
@@ -89,9 +106,17 @@ type ACMEIssuer struct {
 	// Enables requesting a Not After date on certificates that matches the
 	// duration of the certificate. This is not supported by all ACME servers
 	// like Let's Encrypt. If set to true when the ACME server does not support
-	// it it will create an error on the Order.
+	// it, it will create an error on the Order.
 	// Defaults to false.
 	EnableDurationFeature bool
+
+	// Profile allows requesting a certificate profile from the ACME server.
+	// Supported profiles are listed by the server's ACME directory URL.
+	Profile string `json:"profile,omitempty"`
+
+	// RenewalInformationSource allows fetching ACME Renewal Information from the ACME CA
+	// server. Default is `ARI`.
+	RenewalInformationSource ACMERenewalInformationSource
 }
 
 // ACMEExternalAccountBinding is a reference to a CA external account of the ACME
@@ -138,20 +163,32 @@ type ACMEChallengeSolver struct {
 	// Configures cert-manager to attempt to complete authorizations by
 	// performing the HTTP01 challenge flow.
 	// It is not possible to obtain certificates for wildcard domain names
-	// (e.g. `*.example.com`) using the HTTP01 challenge mechanism.
+	// (e.g., `*.example.com`) using the HTTP01 challenge mechanism.
 	HTTP01 *ACMEChallengeSolverHTTP01
 
 	// Configures cert-manager to attempt to complete authorizations by
 	// performing the DNS01 challenge flow.
 	DNS01 *ACMEChallengeSolverDNS01
+
+	// WaitInsteadOfSelfCheck, if set, skips cert-manager's self-check and
+	// instead waits this long after presentation before asking the ACME server
+	// to validate the challenge.
+	//
+	// A value of 0 skips the self-check and asks the ACME server to validate
+	// immediately after presentation, relying on the ACME server's own
+	// validation retries (RFC 8555 section 8.2) to succeed once the challenge
+	// has propagated. A negative duration is rejected.
+	// Value must be in units accepted by Go time.ParseDuration https://golang.org/pkg/time/#ParseDuration,
+	// for example `30s` or `2m`.
+	WaitInsteadOfSelfCheck *metav1.Duration
 }
 
-// CertificateDomainSelector selects certificates using a label selector, and
+// CertificateDNSNameSelector selects certificates using a label selector, and
 // can optionally select individual DNS names within those certificates.
 // If both MatchLabels and DNSNames are empty, this selector will match all
 // certificates and DNS names within them.
 type CertificateDNSNameSelector struct {
-	// A label selector that is used to refine the set of certificate's that
+	// A label selector that is used to refine the set of certificates that
 	// this challenge solver will apply to.
 	MatchLabels map[string]string
 
@@ -202,16 +239,24 @@ type ACMEChallengeSolverHTTP01Ingress struct {
 	// +optional
 	ServiceType corev1.ServiceType
 
-	// The ingress class to use when creating Ingress resources to solve ACME
-	// challenges that use this challenge solver.
-	// Only one of 'class' or 'name' may be specified.
+	// This field configures the `ingressClassName` when creating Ingress
+	// resources to solve ACME challenges that use this challenge solver. This
+	// is the recommended way of configuring the ingress class. Only one of
+	// `class`, `name` or `ingressClassName` may be specified.
+	IngressClassName *string
+
+	// This field configures the annotation `kubernetes.io/ingress.class` when
+	// creating Ingress resources to solve ACME challenges that use this
+	// challenge solver. Only one of `class`, `name` or `ingressClassName` may
+	// be specified.
 	Class *string
 
 	// The name of the ingress resource that should have ACME challenge solving
 	// routes inserted into it in order to solve HTTP01 challenges.
 	// This is typically used in conjunction with ingress controllers like
 	// ingress-gce, which maintains a 1:1 mapping between external IPs and
-	// ingress resources.
+	// ingress resources. Only one of `class`, `name` or `ingressClassName` may
+	// be specified.
 	Name string
 
 	// Optional pod template used to configure the ACME challenge solver pods
@@ -239,6 +284,10 @@ type ACMEChallengeSolverHTTP01GatewayHTTPRoute struct {
 	// the HTTPRoute. Usually, the parentRef references a Gateway. See:
 	// https://gateway-api.sigs.k8s.io/v1alpha2/api-types/httproute/#attaching-to-gateways
 	ParentRefs []gwapi.ParentReference
+
+	// Optional pod template used to configure the ACME challenge solver pods
+	// used for HTTP01 challenges
+	PodTemplate *ACMEChallengeSolverHTTP01IngressPodTemplate
 }
 
 type ACMEChallengeSolverHTTP01IngressPodTemplate struct {
@@ -250,14 +299,15 @@ type ACMEChallengeSolverHTTP01IngressPodTemplate struct {
 
 	// PodSpec defines overrides for the HTTP01 challenge solver pod.
 	// Only the 'priorityClassName', 'nodeSelector', 'affinity',
-	// 'serviceAccountName' and 'tolerations' fields are supported currently.
+	// 'serviceAccountName', 'tolerations', 'imagePullSecrets', 'securityContext',
+	// and 'resources' fields are supported currently.
 	// All other fields will be ignored.
 	// +optional
 	Spec ACMEChallengeSolverHTTP01IngressPodSpec
 }
 
 type ACMEChallengeSolverHTTP01IngressPodObjectMeta struct {
-	// Annotations that should be added to the create ACME HTTP01 solver pods.
+	// Annotations that should be added to the created ACME HTTP01 solver pods.
 	Annotations map[string]string
 
 	// Labels that should be added to the created ACME HTTP01 solver pods.
@@ -282,6 +332,23 @@ type ACMEChallengeSolverHTTP01IngressPodSpec struct {
 	// If specified, the pod's service account
 	// +optional
 	ServiceAccountName string
+
+	// If specified, the pod's imagePullSecrets
+	// +optional
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty" patchMergeKey:"name" patchStrategy:"merge"`
+
+	// If specified, the pod's security context
+	// +optional
+	SecurityContext *ACMEChallengeSolverHTTP01IngressPodSecurityContext `json:"securityContext,omitempty"`
+
+	// If specified, the pod's resource requirements.
+	// These values override the global resource configuration flags.
+	// Note that when only specifying resource limits, ensure they are greater than or equal
+	// to the corresponding global resource requests configured via controller flags
+	// (--acme-http01-solver-resource-request-cpu, --acme-http01-solver-resource-request-memory).
+	// Kubernetes will reject pod creation if limits are lower than requests, causing challenge failures.
+	// +optional
+	Resources *ACMEChallengeSolverHTTP01IngressPodResources `json:"resources,omitempty"`
 }
 
 type ACMEChallengeSolverHTTP01IngressTemplate struct {
@@ -307,6 +374,15 @@ type ACMEChallengeSolverDNS01 struct {
 	// CNAMEStrategy configures how the DNS01 provider should handle CNAME
 	// records when found in DNS zones.
 	CNAMEStrategy CNAMEStrategy
+
+	// Nameservers defines a list of DNS nameservers to use for DNS01 propagation
+	// checks. Each entry must be in the format `<host>:<port>` for plain DNS,
+	// where host may be an IP address or hostname, or
+	// `https://<DoH RFC 8484 server address>` for DNS over HTTPS. If not set,
+	// the controller's configured global DNS01 recursive nameservers are used.
+	// When specified, this overrides the global nameservers for this solver
+	// only, and disables the authoritative nameserver check.
+	Nameservers []string
 
 	// Use the Akamai DNS zone management API to manage DNS01 challenge records.
 	Akamai *ACMEIssuerDNS01ProviderAkamai
@@ -337,6 +413,95 @@ type ACMEChallengeSolverDNS01 struct {
 	// Configure an external webhook based DNS01 challenge solver to manage
 	// DNS01 challenge records.
 	Webhook *ACMEIssuerDNS01ProviderWebhook
+}
+
+type ACMEChallengeSolverHTTP01IngressPodSecurityContext struct {
+	// The SELinux context to be applied to all containers.
+	// If unspecified, the container runtime will allocate a random SELinux context for each
+	// container.  May also be set in SecurityContext.  If set in
+	// both SecurityContext and PodSecurityContext, the value specified in SecurityContext
+	// takes precedence for that container.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	SELinuxOptions *corev1.SELinuxOptions `json:"seLinuxOptions,omitempty"`
+	// The UID to run the entrypoint of the container process.
+	// Defaults to user specified in image metadata if unspecified.
+	// May also be set in SecurityContext.  If set in both SecurityContext and
+	// PodSecurityContext, the value specified in SecurityContext takes precedence
+	// for that container.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
+	// The GID to run the entrypoint of the container process.
+	// Uses runtime default if unset.
+	// May also be set in SecurityContext.  If set in both SecurityContext and
+	// PodSecurityContext, the value specified in SecurityContext takes precedence
+	// for that container.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+	// Indicates that the container must run as a non-root user.
+	// If true, the Kubelet will validate the image at runtime to ensure that it
+	// does not run as UID 0 (root) and fail to start the container if it does.
+	// If unset or false, no such validation will be performed.
+	// May also be set in SecurityContext.  If set in both SecurityContext and
+	// PodSecurityContext, the value specified in SecurityContext takes precedence.
+	// +optional
+	RunAsNonRoot *bool `json:"runAsNonRoot,omitempty"`
+	// A list of groups applied to the first process run in each container, in addition
+	// to the container's primary GID, the fsGroup (if specified), and group memberships
+	// defined in the container image for the uid of the container process. If unspecified,
+	// no additional groups are added to any container. Note that group memberships
+	// defined in the container image for the uid of the container process are still effective,
+	// even if they are not included in this list.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	SupplementalGroups []int64 `json:"supplementalGroups,omitempty"`
+	// A special supplemental group that applies to all containers in a pod.
+	// Some volume types allow the Kubelet to change the ownership of that volume
+	// to be owned by the pod:
+	//
+	// 1. The owning GID will be the FSGroup
+	// 2. The setgid bit is set (new files created in the volume will be owned by FSGroup)
+	// 3. The permission bits are OR'd with rw-rw----
+	//
+	// If unset, the Kubelet will not modify the ownership and permissions of any volume.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	FSGroup *int64 `json:"fsGroup,omitempty"`
+	// Sysctls hold a list of namespaced sysctls used for the pod. Pods with unsupported
+	// sysctls (by the container runtime) might fail to launch.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	Sysctls []corev1.Sysctl `json:"sysctls,omitempty"`
+	// fsGroupChangePolicy defines behavior of changing ownership and permission of the volume
+	// before being exposed inside Pod. This field will only apply to
+	// volume types which support fsGroup based ownership(and permissions).
+	// It will have no effect on ephemeral volume types such as: secret, configmaps
+	// and emptydir.
+	// Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	FSGroupChangePolicy *corev1.PodFSGroupChangePolicy `json:"fsGroupChangePolicy,omitempty"`
+	// The seccomp options to use by the containers in this pod.
+	// Note that this field cannot be set when spec.os.name is windows.
+	// +optional
+	SeccompProfile *corev1.SeccompProfile `json:"seccompProfile,omitempty"`
+}
+
+// ACMEChallengeSolverHTTP01IngressPodResources defines resource requirements for ACME HTTP01 solver pods.
+// To keep API surface essential, this trims down the 'corev1.ResourceRequirements' type to only include the Requests and Limits fields.
+type ACMEChallengeSolverHTTP01IngressPodResources struct {
+	// Limits describes the maximum amount of compute resources allowed.
+	// More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+	// +optional
+	Limits corev1.ResourceList
+	// Requests describes the minimum amount of compute resources required.
+	// If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+	// otherwise to the global values configured via controller flags. Requests cannot exceed Limits.
+	// More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+	// +optional
+	Requests corev1.ResourceList
 }
 
 // CNAMEStrategy configures how the DNS01 provider should handle CNAME records
@@ -399,24 +564,27 @@ type ACMEIssuerDNS01ProviderDigitalOcean struct {
 // ACMEIssuerDNS01ProviderRoute53 is a structure containing the Route 53
 // configuration for AWS
 type ACMEIssuerDNS01ProviderRoute53 struct {
+	// Auth configures how cert-manager authenticates.
+	Auth *Route53Auth
+
 	// The AccessKeyID is used for authentication.
 	// Cannot be set when SecretAccessKeyID is set.
-	// If neither the Access Key nor Key ID are set, we fall-back to using env
-	// vars, shared credentials file or AWS Instance metadata,
+	// If neither the Access Key nor Key ID are set, we fall back to using env
+	// vars, shared credentials file, or AWS Instance metadata,
 	// see: https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials
 	AccessKeyID string
 
 	// The SecretAccessKey is used for authentication. If set, pull the AWS
 	// access key ID from a key within a Kubernetes Secret.
 	// Cannot be set when AccessKeyID is set.
-	// If neither the Access Key nor Key ID are set, we fall-back to using env
-	// vars, shared credentials file or AWS Instance metadata,
+	// If neither the Access Key nor Key ID are set, we fall back to using env
+	// vars, shared credentials file, or AWS Instance metadata,
 	// see: https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials
 	SecretAccessKeyID *cmmeta.SecretKeySelector
 
 	// The SecretAccessKey is used for authentication.
-	// If neither the Access Key nor Key ID are set, we fall-back to using env
-	// vars, shared credentials file or AWS Instance metadata,
+	// If neither the Access Key nor Key ID are set, we fall back to using env
+	// vars, shared credentials file, or AWS Instance metadata,
 	// see: https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials
 	SecretAccessKey cmmeta.SecretKeySelector
 
@@ -424,11 +592,40 @@ type ACMEIssuerDNS01ProviderRoute53 struct {
 	// or the inferred credentials from environment variables, shared credentials file or AWS Instance metadata
 	Role string
 
-	// If set, the provider will manage only this zone in Route53 and will not do an lookup using the route53:ListHostedZonesByName api call.
+	// If set, the provider will manage only this zone in Route53 and will not do a lookup using the route53:ListHostedZonesByName api call.
 	HostedZoneID string
 
 	// Always set the region when using AccessKeyID and SecretAccessKey
 	Region string
+}
+
+// Route53Auth is configuration used to authenticate with a Route53.
+type Route53Auth struct {
+	// Kubernetes authenticates with Route53 using AssumeRoleWithWebIdentity
+	// by passing a bound ServiceAccount token.
+	Kubernetes *Route53KubernetesAuth
+}
+
+// Route53KubernetesAuth is a configuration to authenticate against Route53
+// using a bound Kubernetes ServiceAccount token.
+type Route53KubernetesAuth struct {
+	// A reference to a service account that will be used to request a bound
+	// token (also known as "projected token"). To use this field, you must
+	// configure an RBAC rule to let cert-manager request a token.
+	ServiceAccountRef *ServiceAccountRef
+}
+
+// ServiceAccountRef is a service account used by cert-manager to request a
+// token. The expiration of the token is also set by cert-manager to 10 minutes.
+type ServiceAccountRef struct {
+	// Name of the ServiceAccount used to request a token.
+	Name string
+
+	// TokenAudiences is an optional list of audiences to include in the
+	// token passed to AWS. The default token consisting of the issuer's namespace
+	// and name is always included.
+	// If unset the audience defaults to `sts.amazonaws.com`.
+	TokenAudiences []string
 }
 
 // ACMEIssuerDNS01ProviderAzureDNS is a structure containing the
@@ -452,12 +649,23 @@ type ACMEIssuerDNS01ProviderAzureDNS struct {
 	Environment AzureDNSEnvironment
 
 	ManagedIdentity *AzureManagedIdentity
+
+	ZoneType AzureZoneType `json:"zoneType,omitempty"`
 }
+
+type AzureZoneType string
+
+const (
+	PrivateAzureZone AzureZoneType = "AzurePrivateZone"
+	PublicAzureZone  AzureZoneType = "AzurePublicZone"
+)
 
 type AzureManagedIdentity struct {
 	ClientID string
 
 	ResourceID string
+
+	TenantID string
 }
 
 type AzureDNSEnvironment string
@@ -482,7 +690,7 @@ type ACMEIssuerDNS01ProviderAcmeDNS struct {
 type ACMEIssuerDNS01ProviderRFC2136 struct {
 	// The IP address or hostname of an authoritative DNS server supporting
 	// RFC2136 in the form host:port. If the host is an IPv6 address it must be
-	// enclosed in square brackets (e.g [2001:db8::1]) ; port is optional.
+	// enclosed in square brackets (e.g [2001:db8::1]) port is optional.
 	// This field is required.
 	Nameserver string
 
@@ -499,7 +707,18 @@ type ACMEIssuerDNS01ProviderRFC2136 struct {
 	// Supported values are (case-insensitive): ``HMACMD5`` (default),
 	// ``HMACSHA1``, ``HMACSHA256`` or ``HMACSHA512``.
 	TSIGAlgorithm string
+
+	// Protocol to use for dynamic DNS update queries. Valid values are (case-sensitive) ``TCP`` and ``UDP``; ``UDP`` (default).
+	// +optional
+	Protocol RFC2136UpdateProtocol
 }
+
+type RFC2136UpdateProtocol string
+
+const (
+	RFC2136UpdateProtocolTCP RFC2136UpdateProtocol = "TCP"
+	RFC2136UpdateProtocolUDP RFC2136UpdateProtocol = "UDP"
+)
 
 // ACMEIssuerDNS01ProviderWebhook specifies configuration for a webhook DNS01
 // provider, including where to POST ChallengePayload resources.
@@ -512,14 +731,14 @@ type ACMEIssuerDNS01ProviderWebhook struct {
 
 	// The name of the solver to use, as defined in the webhook provider
 	// implementation.
-	// This will typically be the name of the provider, e.g. 'cloudflare'.
+	// This will typically be the name of the provider, e.g., 'cloudflare'.
 	SolverName string
 
 	// Additional configuration that should be passed to the webhook apiserver
 	// when challenges are processed.
 	// This can contain arbitrary JSON data.
 	// Secret values should not be specified in this stanza.
-	// If secret values are needed (e.g. credentials for a DNS service), you
+	// If secret values are needed (e.g., credentials for a DNS service), you
 	// should use a SecretKeySelector to reference a Secret resource.
 	// For details on the schema of this field, consult the webhook provider
 	// implementation's documentation.
@@ -535,4 +754,19 @@ type ACMEIssuerStatus struct {
 	// ACME account, in order to track changes made to registered account
 	// associated with the  Issuer
 	LastRegisteredEmail string
+
+	// LastPrivateKeyHash is a hash of the private key associated with the latest
+	// registered ACME account, in order to track changes made to registered account
+	// associated with the Issuer
+	LastPrivateKeyHash string
 }
+
+// ACMERenewalInformationSource determines whether to enable fetching ACME Renewal Information
+// from the ACME CA server. This is independent of the feature gate `ACMEUseARI`
+// and can be used to enable or disable the feature on a per-issuer basis.
+type ACMERenewalInformationSource string
+
+const (
+	ACMERenewalInformationSourceARI  ACMERenewalInformationSource = "ARI"
+	ACMERenewalInformationSourceNone ACMERenewalInformationSource = "None"
+)

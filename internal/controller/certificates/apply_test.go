@@ -22,8 +22,9 @@ import (
 	"sync"
 	"testing"
 
-	fuzz "github.com/google/gofuzz"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/randfill"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 )
@@ -38,22 +39,30 @@ func Test_serializeApply(t *testing.T) {
 	jobs := make(chan int)
 
 	wg.Add(numJobs)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		go func() {
 			for j := range jobs {
 				t.Run("fuzz_"+strconv.Itoa(j), func(t *testing.T) {
 					var crt cmapi.Certificate
-					fuzz.New().NilChance(0.5).Fuzz(&crt)
-					crt.ManagedFields = nil
+					randfill.New().NilChance(0.5).Fill(&crt)
+
+					// Seed a non-empty ManagedFields to verify serializeApply
+					// strips it — the API server rejects patches containing
+					// metadata.managedFields.
+					crt.ManagedFields = []metav1.ManagedFieldsEntry{
+						{Manager: "test", Operation: metav1.ManagedFieldsOperationUpdate},
+					}
 
 					crtData, err := serializeApply(&crt)
 					assert.NoError(t, err)
 					assert.Regexp(t, expReg, string(crtData))
 
-					// Test round trip serializing Certificate preserved the spec.
+					// Test round trip serializing Certificate preserved the spec
+					// and stripped ManagedFields.
 					var rtCrt cmapi.Certificate
 					assert.NoError(t, json.Unmarshal(crtData, &rtCrt))
 					assert.Equal(t, rtCrt.Spec, crt.Spec)
+					assert.Nil(t, rtCrt.ManagedFields)
 
 					wg.Done()
 				})
@@ -61,7 +70,7 @@ func Test_serializeApply(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < numJobs; i++ {
+	for i := range numJobs {
 		jobs <- i
 	}
 	close(jobs)
@@ -78,8 +87,8 @@ func Test_serializeApplyStatus(t *testing.T) {
 	// meta/type object, empty spec. Status should be matched both via regex, and
 	// when empty.
 	const (
-		expReg   = `^{"kind":"Certificate","apiVersion":"cert-manager.io/v1","metadata":{"name":"foo","namespace":"bar","creationTimestamp":null},"spec":{"secretName":"","issuerRef":{"name":""}},"status":{.*}$`
-		expEmpty = `{"kind":"Certificate","apiVersion":"cert-manager.io/v1","metadata":{"name":"foo","namespace":"bar","creationTimestamp":null},"spec":{"secretName":"","issuerRef":{"name":""}},"status":{}}`
+		expReg   = `^{"kind":"Certificate","apiVersion":"cert-manager.io/v1","metadata":{"name":"foo","namespace":"bar"},"spec":{"secretName":"","issuerRef":{"name":""}},"status":{.*}$`
+		expEmpty = `{"kind":"Certificate","apiVersion":"cert-manager.io/v1","metadata":{"name":"foo","namespace":"bar"},"spec":{"secretName":"","issuerRef":{"name":""}},"status":{}}`
 		numJobs  = 10000
 	)
 
@@ -87,12 +96,12 @@ func Test_serializeApplyStatus(t *testing.T) {
 	jobs := make(chan int)
 
 	wg.Add(numJobs)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		go func() {
 			for j := range jobs {
 				t.Run("fuzz_"+strconv.Itoa(j), func(t *testing.T) {
 					var crt cmapi.Certificate
-					fuzz.New().NilChance(0.5).Fuzz(&crt)
+					randfill.New().NilChance(0.5).Fill(&crt)
 					crt.Name = "foo"
 					crt.Namespace = "bar"
 
@@ -118,7 +127,7 @@ func Test_serializeApplyStatus(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < numJobs; i++ {
+	for i := range numJobs {
 		jobs <- i
 	}
 	close(jobs)

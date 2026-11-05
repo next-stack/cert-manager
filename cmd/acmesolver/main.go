@@ -17,11 +17,12 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
-	"os"
+	"context"
 
-	"github.com/cert-manager/cert-manager/cmd/acmesolver/app"
-	"github.com/cert-manager/cert-manager/cmd/util"
+	"github.com/cert-manager/cert-manager/internal/cmd/util"
+	logf "github.com/cert-manager/cert-manager/pkg/logs"
+
+	"github.com/cert-manager/cert-manager/acmesolver-binary/app"
 )
 
 // acmesolver solves ACME http-01 challenges. This is intended to run as a pod
@@ -29,13 +30,17 @@ import (
 // cert-manager.
 
 func main() {
-	stopCh, exit := util.SetupExitHandler(util.GracefulShutdown)
+	ctx, exit := util.SetupExitHandler(context.Background(), util.GracefulShutdown)
 	defer exit() // This function might call os.Exit, so defer last
 
-	cmd := app.NewACMESolverCommand(stopCh)
+	logf.InitLogs()
+	defer logf.FlushLogs()
+	ctx = logf.NewContext(ctx, logf.Log, "acmesolver")
 
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
+	cmd := app.NewACMESolverCommand(ctx)
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		logf.Log.Error(err, "error executing command")
 		util.SetExitCode(err)
 	}
 }

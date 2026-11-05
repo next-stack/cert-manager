@@ -20,32 +20,47 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"path"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	flowcontrolapi "k8s.io/api/flowcontrol/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/client-go/discovery"
-	kubeinformers "k8s.io/client-go/informers"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
+	kscheme "k8s.io/client-go/kubernetes/scheme"
 	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/transport"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/utils/clock"
-	gwapi "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gwapi "sigs.k8s.io/gateway-api/apis/v1"
 	gwclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gwscheme "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/scheme"
 	gwinformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
+	"github.com/cert-manager/cert-manager/internal/kube"
 	"github.com/cert-manager/cert-manager/pkg/acme/accounts"
+	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	clientset "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
 	cmscheme "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/scheme"
 	informers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
+	utildns "github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	"github.com/cert-manager/cert-manager/pkg/metrics"
 	"github.com/cert-manager/cert-manager/pkg/util"
@@ -68,38 +83,56 @@ type Context struct {
 	// RootContext is the root context for the controller
 	RootContext context.Context
 
-	// StopCh is a channel that will be closed when the controller is signalled
-	// to exit
-	StopCh <-chan struct{}
-
 	// FieldManager is the string that should be used as the field manager when
 	// applying API object. This value is derived from the user agent.
 	FieldManager string
 	// RESTConfig is the loaded Kubernetes apiserver rest client configuration
 	RESTConfig *rest.Config
+	// Scheme is the Kubernetes scheme that should be used when serialising and
+	// deserialising API objects
+	Scheme *runtime.Scheme
 	// Client is a Kubernetes clientset
 	Client kubernetes.Interface
 	// CMClient is a cert-manager clientset
 	CMClient clientset.Interface
 	// GWClient is a GatewayAPI clientset.
 	GWClient gwclient.Interface
-	// DiscoveryClient is a discovery interface. Usually set to Client.Discovery unless a fake client is in use.
-	DiscoveryClient discovery.DiscoveryInterface
+	// MetadataClient is a PartialObjectMetadata client
+	MetadataClient metadata.Interface
+
+	// Clock should be used to access the current time instead of relying on
+	// time.Now, to make it easier to test controllers that utilise time
+	Clock clock.Clock
+
+	// ACMEAccountRegistry is used as a cache of ACME accounts between various
+	// components of cert-manager
+	ACMEAccountRegistry accounts.Registry
+
+	// Metrics is used for exposing Prometheus metrics across the controllers
+	Metrics *metrics.Metrics
 
 	// Recorder to record events to
 	Recorder record.EventRecorder
 
 	// KubeSharedInformerFactory can be used to obtain shared
 	// SharedIndexInformer instances for Kubernetes types
-	KubeSharedInformerFactory kubeinformers.SharedInformerFactory
+	KubeSharedInformerFactory internalinformers.KubeInformerFactory
+
 	// SharedInformerFactory can be used to obtain shared SharedIndexInformer
-	// instances
+	// instances for cert-manager.io types
 	SharedInformerFactory informers.SharedInformerFactory
 
-	// The Gateway API is an external CRD, which means its shared informers are
-	// not available in controllerpkg.Context.
+	// HTTP01ResourceMetadataInformersFactory is a metadata only informers
+	// factory with a http-01 resource label filter selector
+	HTTP01ResourceMetadataInformersFactory metadatainformer.SharedInformerFactory
+
+	// GWShared can be used to obtain SharedIndexInformer instances for
+	// gateway.networking.k8s.io types
 	GWShared             gwinformers.SharedInformerFactory
 	GatewaySolverEnabled bool
+
+	// DNSResolver is used to resolve ACME DNS challenges
+	DNSResolver *utildns.CachingResolver
 
 	ContextOptions
 }
@@ -124,23 +157,24 @@ type ContextOptions struct {
 	// If unset, operates on all namespaces
 	Namespace string
 
-	// Clock should be used to access the current time instead of relying on
-	// time.Now, to make it easier to test controllers that utilise time
-	Clock clock.Clock
-
-	// Metrics is used for exposing Prometheus metrics across the controllers
-	Metrics *metrics.Metrics
-
 	IssuerOptions
 	ACMEOptions
 	IngressShimOptions
 	CertificateOptions
 	SchedulerOptions
+	ConfigOptions
+}
+
+type ConfigOptions struct {
+	// EnableGatewayAPI indicates if the user has enabled GatewayAPI support.
+	EnableGatewayAPI bool
+	// EnableGatewayAPIListenerSet indicates if the user has enabled ListenerSets support.
+	EnableGatewayAPIListenerSet bool
 }
 
 type IssuerOptions struct {
 	// ClusterResourceNamespace is the namespace to store resources created by
-	// non-namespaced resources (e.g. ClusterIssuer) in.
+	// non-namespaced resources (e.g., ClusterIssuer) in.
 	ClusterResourceNamespace string
 
 	// ClusterIssuerAmbientCredentials controls whether a cluster issuer should
@@ -170,9 +204,19 @@ type ACMEOptions struct {
 	// HTTP01SolverResourceLimitsMemory defines the ACME pod's resource limits Memory size
 	HTTP01SolverResourceLimitsMemory resource.Quantity
 
+	// ACMEHTTP01SolverRunAsNonRoot sets the ACME pod's ability to run as root
+	ACMEHTTP01SolverRunAsNonRoot bool
+
+	// HTTP01SolverRuntimeClassName defines the ACME pod's runtimeClassName
+	HTTP01SolverRuntimeClassName string
+
 	// HTTP01SolverNameservers is a list of nameservers to use when performing self-checks
 	// for ACME HTTP01 validations.
 	HTTP01SolverNameservers []string
+
+	// HTTP01SolverExtraLabels are additional labels to apply to ACME HTTP01
+	// solver resources.
+	HTTP01SolverExtraLabels map[string]string
 
 	// DNS01CheckAuthoritative is a flag for controlling if auth nss are used
 	// for checking propagation of an RR. This is the ideal scenario
@@ -181,10 +225,6 @@ type ACMEOptions struct {
 	// DNS01Nameservers is a list of nameservers to use when performing self-checks
 	// for ACME DNS01 validations.
 	DNS01Nameservers []string
-
-	// AccountRegistry is used as a cache of ACME accounts between various
-	// components of cert-manager
-	AccountRegistry accounts.Registry
 
 	// DNS01CheckRetryPeriod is the time the controller should wait between checking if a ACME dns entry exists.
 	DNS01CheckRetryPeriod time.Duration
@@ -198,6 +238,8 @@ type IngressShimOptions struct {
 	DefaultIssuerKind                 string
 	DefaultIssuerGroup                string
 	DefaultAutoCertificateAnnotations []string
+	ExtraCertificateAnnotations       []string
+	GatewayAPIExtraProtocols          sets.Set[string]
 }
 
 type CertificateOptions struct {
@@ -207,6 +249,16 @@ type CertificateOptions struct {
 	// CopiedAnnotationPrefixes defines which annotations should be copied
 	// Certificate -> CertificateRequest, CertificateRequest -> Order.
 	CopiedAnnotationPrefixes []string
+	// CertificateRequestMinimumBackoffDuration defines the minimum backoff duration
+	// when a certificate request fails (default 1h). The backoff delay starts at
+	// this duration and is exponentially increased with each consecutive failure,
+	// up to the configured maximum backoff duration.
+	CertificateRequestMinimumBackoffDuration time.Duration
+	// CertificateRequestMaximumBackoffDuration defines the maximum backoff duration
+	// when a certificate request fails. The backoff delay starts at
+	// the minimum backoff duration and is exponentially increased with
+	// each consecutive failure, but will never exceed this maximum (default 32h).
+	CertificateRequestMaximumBackoffDuration time.Duration
 }
 
 type SchedulerOptions struct {
@@ -215,7 +267,7 @@ type SchedulerOptions struct {
 	MaxConcurrentChallenges int
 }
 
-// ContextFactory is used for constructing new Contexts who's clients have been
+// ContextFactory is used for constructing new Contexts whose clients have been
 // configured with a User Agent built from the component name.
 type ContextFactory struct {
 	// baseRestConfig is the base Kubernetes REST config that can authenticate to
@@ -235,56 +287,110 @@ type ContextFactory struct {
 // corresponding QPS and Burst buckets.
 func NewContextFactory(ctx context.Context, opts ContextOptions) (*ContextFactory, error) {
 	// Load the users Kubernetes config
-	restConfig, err := clientcmd.BuildConfigFromFlags(opts.APIServerHost, opts.Kubeconfig)
+	restConfig, err := kube.BuildClientConfig(opts.APIServerHost, opts.Kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("error creating rest config: %w", err)
 	}
 	restConfig = util.RestConfigWithUserAgent(restConfig)
-	restConfig.QPS = opts.KubernetesAPIQPS
-	restConfig.Burst = opts.KubernetesAPIBurst
+	log := logf.FromContext(ctx)
 
-	// Construct a single RateLimiter used across all built Context's clients. A
-	// single rate limiter (with corresponding QPS and Burst buckets) are
-	// preserved for all Contexts.
-	// Adapted from
-	// https://github.com/kubernetes/client-go/blob/v0.23.3/kubernetes/clientset.go#L431-L435
-	if restConfig.RateLimiter == nil && restConfig.QPS > 0 {
-		if restConfig.Burst <= 0 {
-			return nil, errors.New("burst is required to be greater than 0 when RateLimiter is not set and QPS is set to greater than 0")
-		}
-		restConfig.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(restConfig.QPS, restConfig.Burst)
+	const apfProbeTimeout = 5 * time.Second
+	apfProbeCtx, cancel := context.WithTimeout(ctx, apfProbeTimeout)
+	defer cancel()
+
+	apfEnabled, err := isAPFEnabled(apfProbeCtx, restConfig)
+	if err != nil {
+		log.Error(err, "Failed to determine whether API Priority and Fairness is enabled, falling back to client-side rate limiting")
+		apfEnabled = false
 	}
 
-	clients, err := buildClients(restConfig)
+	if apfEnabled {
+		restConfig.QPS = -1
+		restConfig.Burst = -1
+	} else {
+		restConfig.QPS = opts.KubernetesAPIQPS
+		restConfig.Burst = opts.KubernetesAPIBurst
+		// Construct a single RateLimiter used across all built Context's clients.
+		// Adapted from
+		// https://github.com/kubernetes/client-go/blob/v0.23.3/kubernetes/clientset.go#L431-L435
+		if restConfig.RateLimiter == nil && restConfig.QPS >= 0 {
+			if restConfig.QPS == 0 {
+				restConfig.QPS = rest.DefaultQPS // 5
+			}
+			if restConfig.Burst == 0 {
+				restConfig.Burst = rest.DefaultBurst // 10
+			}
+			if restConfig.Burst <= 0 {
+				return nil, errors.New("burst is required to be greater than 0 when RateLimiter is not set and QPS is set to greater than 0")
+			}
+			restConfig.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(restConfig.QPS, restConfig.Burst)
+		}
+	}
+
+	clients, err := buildClients(restConfig, opts)
 	if err != nil {
 		return nil, err
 	}
 
 	sharedInformerFactory := informers.NewSharedInformerFactoryWithOptions(clients.cmClient, resyncPeriod, informers.WithNamespace(opts.Namespace))
-	kubeSharedInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(clients.kubeClient, resyncPeriod, kubeinformers.WithNamespace(opts.Namespace))
+
+	var kubeSharedInformerFactory internalinformers.KubeInformerFactory
+	if utilfeature.DefaultFeatureGate.Enabled(feature.SecretsFilteredCaching) {
+		kubeSharedInformerFactory = internalinformers.NewFilteredSecretsKubeInformerFactory(ctx, clients.kubeClient, clients.metadataOnlyClient, resyncPeriod, opts.Namespace)
+	} else {
+		kubeSharedInformerFactory = internalinformers.NewBaseKubeInformerFactory(clients.kubeClient, resyncPeriod, opts.Namespace)
+	}
+	r, err := labels.NewRequirement(cmacme.DomainLabelKey, selection.Exists, nil)
+	if err != nil {
+		panic(fmt.Errorf("internal error: failed to build label selector to filter HTTP-01 challenge resources: %w", err))
+	}
+	isHTTP01ChallengeResourceLabelSelector := labels.NewSelector().Add(*r)
+	http01ResourceMetadataInformerFactory := metadatainformer.NewFilteredSharedInformerFactory(clients.metadataOnlyClient, resyncPeriod, opts.Namespace, func(listOptions *metav1.ListOptions) {
+		// metadataInformersFactory is at the moment only used for pods
+		// and services for http-01 challenge which can be identified by
+		// the same label keys, so it is okay to set the label selector
+		// here. If we start using it for other resources then we'll
+		// have to set the selectors on individual informers instead.
+		listOptions.LabelSelector = isHTTP01ChallengeResourceLabelSelector.String()
+	})
+
 	gwSharedInformerFactory := gwinformers.NewSharedInformerFactoryWithOptions(clients.gwClient, resyncPeriod, gwinformers.WithNamespace(opts.Namespace))
+
+	clock := clock.RealClock{}
+	metrics := metrics.New(log, clock)
 
 	return &ContextFactory{
 		baseRestConfig: restConfig,
-		log:            logf.FromContext(ctx),
+		log:            log,
 		ctx: &Context{
-			RootContext:               ctx,
-			StopCh:                    ctx.Done(),
-			KubeSharedInformerFactory: kubeSharedInformerFactory,
-			SharedInformerFactory:     sharedInformerFactory,
-			GWShared:                  gwSharedInformerFactory,
-			GatewaySolverEnabled:      clients.gatewayAvailable,
-			ContextOptions:            opts,
+			RootContext:                            ctx,
+			KubeSharedInformerFactory:              kubeSharedInformerFactory,
+			SharedInformerFactory:                  sharedInformerFactory,
+			GWShared:                               gwSharedInformerFactory,
+			GatewaySolverEnabled:                   clients.gatewayAvailable,
+			HTTP01ResourceMetadataInformersFactory: http01ResourceMetadataInformerFactory,
+			ContextOptions:                         opts,
+			Clock:                                  clock,
+			Metrics:                                metrics,
+			ACMEAccountRegistry: accounts.NewDefaultRegistry(
+				accounts.NewClient(metrics, restConfig.UserAgent),
+			),
+			DNSResolver: utildns.NewCachingResolver(),
 		},
 	}, nil
 }
 
-// Build builds a new controller Context who's clients have a User Agent
+// Build builds a new controller Context whose clients have a User Agent
 // derived from the optional component name.
 func (c *ContextFactory) Build(component ...string) (*Context, error) {
 	restConfig := util.RestConfigWithUserAgent(c.baseRestConfig, component...)
 
-	clients, err := buildClients(restConfig)
+	scheme := runtime.NewScheme()
+	utilruntime.Must(kscheme.AddToScheme(scheme))
+	utilruntime.Must(cmscheme.AddToScheme(scheme))
+	utilruntime.Must(gwscheme.AddToScheme(scheme))
+
+	clients, err := buildClients(restConfig, c.ctx.ContextOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -292,21 +398,20 @@ func (c *ContextFactory) Build(component ...string) (*Context, error) {
 	// Create event broadcaster.
 	// Add cert-manager types to the default Kubernetes Scheme so Events can be
 	// logged properly.
-	cmscheme.AddToScheme(scheme.Scheme)
-	gwscheme.AddToScheme(scheme.Scheme)
+
 	c.log.V(logf.DebugLevel).Info("creating event broadcaster")
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(logf.WithInfof(c.log.V(logf.DebugLevel)).Infof)
 	eventBroadcaster.StartRecordingToSink(&clientv1.EventSinkImpl{Interface: clients.kubeClient.CoreV1().Events("")})
-	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: util.PrefixFromUserAgent(restConfig.UserAgent)})
+	recorder := eventBroadcaster.NewRecorder(scheme, corev1.EventSource{Component: util.PrefixFromUserAgent(restConfig.UserAgent)})
 
 	ctx := *c.ctx
 	ctx.FieldManager = util.PrefixFromUserAgent(restConfig.UserAgent)
 	ctx.RESTConfig = restConfig
+	ctx.Scheme = scheme
 	ctx.Client = clients.kubeClient
 	ctx.CMClient = clients.cmClient
 	ctx.GWClient = clients.gwClient
-	ctx.DiscoveryClient = clients.kubeClient.Discovery()
 	ctx.Recorder = recorder
 
 	return &ctx, nil
@@ -314,36 +419,50 @@ func (c *ContextFactory) Build(component ...string) (*Context, error) {
 
 // contextClients is a helper struct containing API clients.
 type contextClients struct {
-	kubeClient       kubernetes.Interface
-	cmClient         clientset.Interface
-	gwClient         gwclient.Interface
-	gatewayAvailable bool
+	kubeClient         kubernetes.Interface
+	cmClient           clientset.Interface
+	gwClient           gwclient.Interface
+	metadataOnlyClient metadata.Interface
+	gatewayAvailable   bool
 }
 
 // buildClients builds all required clients for the context using the given
 // REST config.
-func buildClients(restConfig *rest.Config) (contextClients, error) {
-	// Create a cert-manager api client
-	cmClient, err := clientset.NewForConfig(restConfig)
+func buildClients(restConfig *rest.Config, opts ContextOptions) (contextClients, error) {
+	httpClient, err := rest.HTTPClientFor(restConfig)
 	if err != nil {
-		return contextClients{}, fmt.Errorf("error creating internal group client: %w", err)
+		return contextClients{}, fmt.Errorf("error creating HTTP client: %w", err)
+	}
+
+	// Create a cert-manager api client
+	cmClient, err := clientset.NewForConfigAndClient(restConfig, httpClient)
+	if err != nil {
+		return contextClients{}, fmt.Errorf("error creating cert-manager client: %w", err)
 	}
 
 	// Create a Kubernetes api client
-	kubeClient, err := kubernetes.NewForConfig(restConfig)
+	kubeClient, err := kubernetes.NewForConfigAndClient(restConfig, httpClient)
 	if err != nil {
 		return contextClients{}, fmt.Errorf("error creating kubernetes client: %w", err)
 	}
 
+	// create a metadata-only client
+	metadataOnlyClient, err := metadata.NewForConfigAndClient(restConfig, httpClient)
+	if err != nil {
+		return contextClients{}, fmt.Errorf("error creating metadata-only client: %w", err)
+	}
+
 	var gatewayAvailable bool
 	// Check if the Gateway API feature gate was enabled
-	if utilfeature.DefaultFeatureGate.Enabled(feature.ExperimentalGatewayAPISupport) {
+	if utilfeature.DefaultFeatureGate.Enabled(feature.ExperimentalGatewayAPISupport) && opts.EnableGatewayAPI {
 		// Check if the gateway API CRDs are available. If they are not found
 		// return an error which will cause cert-manager to crashloopbackoff.
 		d := kubeClient.Discovery()
 		resources, err := d.ServerResourcesForGroupVersion(gwapi.GroupVersion.String())
-		var GatewayAPINotAvailable = "the Gateway API CRDs do not seem to be present, but " + feature.ExperimentalGatewayAPISupport +
+		GatewayAPINotAvailable := "the Gateway API CRDs do not seem to be present, but " + feature.ExperimentalGatewayAPISupport +
 			" is set to true. Please install the gateway-api CRDs."
+		GatewayAPIListenerSetsNotAvailable := "the Gateway API ListenerSet CRD do not seem to be present, but " + feature.ListenerSets +
+			" is set to true. Please install the gateway-api ListenerSet CRD."
 		switch {
 		case apierrors.IsNotFound(err):
 			return contextClients{}, fmt.Errorf("%s (%w)", GatewayAPINotAvailable, err)
@@ -352,15 +471,90 @@ func buildClients(restConfig *rest.Config) (contextClients, error) {
 		case len(resources.APIResources) == 0:
 			return contextClients{}, fmt.Errorf("%s (found %d APIResources in %s)", GatewayAPINotAvailable, len(resources.APIResources), gwapi.GroupVersion.String())
 		default:
+			if utilfeature.DefaultFeatureGate.Enabled(feature.ListenerSets) && opts.EnableGatewayAPIListenerSet {
+				var listenerSetsAvailable bool
+				for _, res := range resources.APIResources {
+					if res.Kind == "ListenerSet" {
+						listenerSetsAvailable = true
+						break
+					}
+				}
+
+				if !listenerSetsAvailable {
+					return contextClients{}, fmt.Errorf("found GatewayAPI CRDs; however %s", GatewayAPIListenerSetsNotAvailable)
+				}
+			}
 			gatewayAvailable = true
 		}
 	}
 
 	// Create a GatewayAPI client.
-	gwClient, err := gwclient.NewForConfig(restConfig)
+	gwClient, err := gwclient.NewForConfigAndClient(restConfig, httpClient)
 	if err != nil {
 		return contextClients{}, fmt.Errorf("error creating kubernetes client: %w", err)
 	}
 
-	return contextClients{kubeClient, cmClient, gwClient, gatewayAvailable}, nil
+	return contextClients{kubeClient, cmClient, gwClient, metadataOnlyClient, gatewayAvailable}, nil
+}
+
+// serverUrl returns the base URL for the cluster based on the supplied config.
+// Host and Version are required. GroupVersion is ignored.
+// Based on `serverURL` from kubernetes-sigs/cli-utils
+func serverURL(config *rest.Config) (*url.URL, error) {
+	// TODO: move the default to secure when the apiserver supports TLS by default
+	// config.Insecure is taken to mean "I want HTTPS but don't bother checking the certs against a CA."
+	hasCA := len(config.CAFile) != 0 || len(config.CAData) != 0
+	hasCert := len(config.CertFile) != 0 || len(config.CertData) != 0
+	defaultTLS := hasCA || hasCert || config.Insecure
+	host := config.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	hostURL, _, err := rest.DefaultServerURL(host, config.APIPath, schema.GroupVersion{}, defaultTLS)
+	return hostURL, err
+}
+
+// Based on `IsEnabled` from kubernetes-sigs/cli-utils
+func isAPFEnabled(ctx context.Context, config *rest.Config) (bool, error) {
+	tcfg, err := config.TransportConfig()
+	if err != nil {
+		return false, fmt.Errorf("building transport config: %w", err)
+	}
+	rt, err := transport.New(tcfg)
+	if err != nil {
+		return false, fmt.Errorf("building round tripper: %w", err)
+	}
+
+	u, err := serverURL(config)
+	if err != nil {
+		return false, fmt.Errorf("parsing API server host URL: %w", err)
+	}
+
+	u.Path = path.Join(u.Path, "livez/ping")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.String(), nil)
+	if err != nil {
+		return false, fmt.Errorf("building request: %w", err)
+	}
+
+	if config.UserAgent != "" {
+		req.Header.Set("User-Agent", config.UserAgent)
+	}
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		return false, fmt.Errorf("making %s request: %w", u.Path, err)
+	}
+
+	if resp.Body != nil {
+		resp.Body.Close()
+	}
+
+	// If the flowcontrol header is present, AP&F is enabled.
+	if value := resp.Header.Get(flowcontrolapi.ResponseHeaderMatchedFlowSchemaUID); value != "" {
+		return true, nil
+	}
+
+	return false, nil
 }

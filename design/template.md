@@ -1,5 +1,5 @@
 <!--
-This template is adapted from Kubernetes Enchancements KEP template https://raw.githubusercontent.com/kubernetes/enhancements/a86942e8ba802d0035ec7d4a9c992f03bca7dce9/keps/NNNN-kep-template/README.md
+This template is adapted from Kubernetes Enhancements KEP template https://raw.githubusercontent.com/kubernetes/enhancements/a86942e8ba802d0035ec7d4a9c992f03bca7dce9/keps/NNNN-kep-template/README.md
 -->
 
 # CHANGEME: Title
@@ -36,8 +36,9 @@ This checklist contains actions which must be completed before a PR implementing
 - [ ] Test plan has been agreed upon and the tests implemented 
 - [ ] Feature gate status has been agreed upon (whether the new functionality will be placed behind a feature gate or not)
 - [ ] Graduation criteria is in place if required (if the new functionality is placed behind a feature gate, how will it graduate between stages)
-- [ ] User-facing documentation has been PR-ed against the release branch in [cert-manager/website]
+- [ ] User-facing documentation has been PR-ed against the release branch in [cert-manager/website][]
 
+[cert-manager/website]: https://github.com/cert-manager/website
 
 ## Summary
 
@@ -80,7 +81,7 @@ This is where we get down to the specifics of what the proposal actually is.
 What is the desired outcome and how do we measure success?
 This should have enough detail that reviewers can understand exactly what
 you're proposing, but should not include things like API designs or
-implementation- those should go into "Design Details" below.
+implementation - those should go into "Design Details" below.
 -->
 
 ### User Stories (Optional)

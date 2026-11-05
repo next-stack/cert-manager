@@ -18,13 +18,15 @@ package issuer
 
 import (
 	"context"
+
+	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 )
 
 type Interface interface {
-	// Setup initialises the issuer. This may include registering accounts with
+	// Setup initializes the issuer. This may include registering accounts with
 	// a service, creating a CA and storing it somewhere, or verifying
 	// credentials and authorization with a remote server.
-	Setup(ctx context.Context) error
+	Setup(ctx context.Context, issuer v1.GenericIssuer) error
 }
 
 type IssueResponse struct {
@@ -38,7 +40,7 @@ type IssueResponse struct {
 	// If set, the certificate and CA field will also be overwritten with the
 	// contents of the field.
 	// If Certificate is not set, the existing Certificate will be overwritten.
-	PrivateKey []byte
+	PrivateKey []byte // #nosec G117 -- field holds runtime private key material, not a hardcoded secret
 
 	// CA is the CA certificate that should be stored in the target secret.
 	// This field should only be set if the private key field is set, similar

@@ -19,14 +19,13 @@ package revisionmanager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -35,7 +34,6 @@ import (
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
-	cminformers "github.com/cert-manager/cert-manager/pkg/client/informers/externalversions"
 	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates"
@@ -58,21 +56,33 @@ type revision struct {
 	types.NamespacedName
 }
 
-func NewController(log logr.Logger, client cmclient.Interface, cmFactory cminformers.SharedInformerFactory) (*controller, workqueue.RateLimitingInterface, []cache.InformerSynced) {
+func NewController(log logr.Logger, ctx *controllerpkg.Context) (*controller, workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// create a queue used to queue up items to be processed
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(time.Second*1, time.Second*30), ControllerName)
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultCertificateRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
 	// obtain references to all the informers used by this controller
-	certificateInformer := cmFactory.Certmanager().V1().Certificates()
-	certificateRequestInformer := cmFactory.Certmanager().V1().CertificateRequests()
+	certificateInformer := ctx.SharedInformerFactory.Certmanager().V1().Certificates()
+	certificateRequestInformer := ctx.SharedInformerFactory.Certmanager().V1().CertificateRequests()
 
-	certificateInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: queue})
-	certificateRequestInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{
-		// Trigger reconciles on changes to any 'owned' CertificateRequest resources
-		WorkFunc: certificates.EnqueueCertificatesForResourceUsingPredicates(log, queue, certificateInformer.Lister(), labels.Everything(),
-			predicate.ResourceOwnerOf,
+	if _, err := certificateInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(queue)); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := certificateRequestInformer.Informer().AddEventHandler(
+		controllerpkg.BlockingEventHandler(
+			// Trigger reconciles on changes to any 'owned' CertificateRequest resources
+			certificates.EnqueueCertificatesForResourceUsingPredicates[*cmapi.CertificateRequest](
+				log, queue, certificateInformer.Lister(),
+				predicate.ResourceOwnerOf,
+			),
 		),
-	})
+	); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
 
 	// build a list of InformerSynced functions that will be returned by the Register method.
 	// the controller will only begin processing items once all of these informers have synced.
@@ -84,39 +94,30 @@ func NewController(log logr.Logger, client cmclient.Interface, cmFactory cminfor
 	return &controller{
 		certificateLister:        certificateInformer.Lister(),
 		certificateRequestLister: certificateRequestInformer.Lister(),
-		client:                   client,
-	}, queue, mustSync
+		client:                   ctx.CMClient,
+	}, queue, mustSync, nil
 }
 
 // ProcessItem will attempt to garbage collect old CertificateRequests based
 // upon `spec.revisionHistoryLimit`. This controller will only act on
 // Certificates which are in a Ready state and this value is set.
-func (c *controller) ProcessItem(ctx context.Context, key string) error {
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
 	log := logf.FromContext(ctx).WithValues("key", key)
 
 	ctx = logf.NewContext(ctx, log)
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		log.Error(err, "invalid resource key passed to ProcessItem")
-		return nil
-	}
+	namespace, name := key.Namespace, key.Name
 
 	crt, err := c.certificateLister.Certificates(namespace).Get(name)
-	if apierrors.IsNotFound(err) {
-		log.V(logf.DebugLevel).Info("certificate not found for key", "error", err.Error())
-		return nil
-	}
-	if err != nil {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
+	}
+	if crt == nil || crt.DeletionTimestamp != nil {
+		// If the Certificate object was/ is being deleted, we don't want to start deleting
+		// CertificateRequests last minute in the same namespace.
+		return nil
 	}
 
 	log = logf.WithResource(log, crt)
-
-	// If RevisionHistoryLimit is nil, don't attempt to garbage collect old
-	// CertificateRequests
-	if crt.Spec.RevisionHistoryLimit == nil {
-		return nil
-	}
 
 	// Only garbage collect over Certificates that are in a Ready=True condition.
 	if !apiutil.CertificateHasCondition(crt, cmapi.CertificateCondition{
@@ -128,18 +129,26 @@ func (c *controller) ProcessItem(ctx context.Context, key string) error {
 
 	// Get all CertificateRequests that are owned by this Certificate
 	requests, err := certificates.ListCertificateRequestsMatchingPredicates(
-		c.certificateRequestLister.CertificateRequests(crt.Namespace), labels.Everything(), predicate.ResourceOwnedBy(crt))
+		c.certificateRequestLister.CertificateRequests(crt.Namespace),
+		predicate.ResourceOwnedBy[*cmapi.CertificateRequest](crt))
 	if err != nil {
 		return err
 	}
 
 	// Fetch and delete all CertificateRequests that need to be deleted
-	limit := int(*crt.Spec.RevisionHistoryLimit)
+	// If RevisionHistoryLimit is nil, then default to 1
+	var limit int
+	if crt.Spec.RevisionHistoryLimit == nil {
+		limit = 1
+	} else {
+		limit = int(*crt.Spec.RevisionHistoryLimit)
+	}
+
 	toDelete := certificateRequestsToDelete(log, limit, requests)
 
 	for _, req := range toDelete {
 		logf.WithRelatedResourceName(log, req.Name, req.Namespace, cmapi.CertificateRequestKind).
-			WithValues("revision", req.rev).Info("garbage collecting old certificate request revsion")
+			WithValues("revision", req.rev).Info("garbage collecting old certificate request revision")
 		err = c.client.CertmanagerV1().CertificateRequests(req.Namespace).Delete(ctx, req.Name, metav1.DeleteOptions{})
 		if apierrors.IsNotFound(err) {
 			continue
@@ -169,13 +178,13 @@ func certificateRequestsToDelete(log logr.Logger, limit int, requests []*cmapi.C
 		log = logf.WithRelatedResource(log, req)
 
 		if req.Annotations == nil || req.Annotations[cmapi.CertificateRequestRevisionAnnotationKey] == "" {
-			log.Error(errors.New("skipping processing request with missing revsion"), "")
+			log.Error(errors.New("skipping processing request with missing revision"), "")
 			continue
 		}
 
 		rn, err := strconv.Atoi(req.Annotations[cmapi.CertificateRequestRevisionAnnotationKey])
 		if err != nil {
-			log.Error(err, "failed to parse request revsion")
+			log.Error(err, "failed to parse request revision")
 			continue
 		}
 
@@ -186,7 +195,7 @@ func certificateRequestsToDelete(log logr.Logger, limit int, requests []*cmapi.C
 		return revisions[i].rev < revisions[j].rev
 	})
 
-	// Return the oldest revsions which are over the limit
+	// Return the oldest revisions which are over the limit
 	remaining := len(revisions) - limit
 	if remaining < 0 {
 		return nil
@@ -201,14 +210,14 @@ type controllerWrapper struct {
 	*controller
 }
 
-func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.RateLimitingInterface, []cache.InformerSynced, error) {
+func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
 	// construct a new named logger to be reused throughout the controller
 	log := logf.FromContext(ctx.RootContext, ControllerName)
 
-	ctrl, queue, mustSync := NewController(log, ctx.CMClient, ctx.SharedInformerFactory)
+	ctrl, queue, mustSync, err := NewController(log, ctx)
 	c.controller = ctrl
 
-	return queue, mustSync, nil
+	return queue, mustSync, err
 }
 
 func init() {

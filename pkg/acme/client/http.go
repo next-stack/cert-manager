@@ -19,7 +19,6 @@ package client
 import (
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/cert-manager/cert-manager/pkg/metrics"
@@ -32,9 +31,20 @@ import (
 // calls made to the ACME server caused by retries in the underlying ACME
 // library.
 
-// Transport is a http.RoundTripper that collects Prometheus metrics of every
-// request it processes. It allows to be configured with callbacks that process
-// request path and query into a suitable label value.
+// MetricsContextKey is the type used for context keys in the metrics package.
+// Using a custom type prevents key collisions with other packages.
+type MetricsContextKey string
+
+// AcmeActionLabel is the context key for storing the logical ACME operation name.
+const AcmeActionLabel = MetricsContextKey("acme_action")
+
+// maxACMEResponseBodyBytes caps how much of any single ACME response body is
+// buffered into memory, guarding against a hostile server streaming an unbounded body.
+const maxACMEResponseBodyBytes int64 = 16 << 20 // 16 MiB
+
+// Transport is an http.RoundTripper that instruments every request it processes:
+// it records Prometheus metrics for the request and caps the size of the
+// response body to guard against an ACME server returning an unbounded body.
 type Transport struct {
 	metrics *metrics.Metrics
 
@@ -73,12 +83,27 @@ func (it *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := it.wrappedRT.RoundTrip(req)
 	if resp != nil {
 		statusCode = resp.StatusCode
-	}
 
+		// Cap every response body (including retries, which flow through here)
+		// so the ACME library cannot buffer an unbounded body. Reading past the
+		// limit yields a *http.MaxBytesError, so an oversized body surfaces as a
+		// distinct error rather than being silently truncated. A nil
+		// ResponseWriter is accepted since we only need the client-side cap.
+		if resp.Body != nil {
+			resp.Body = http.MaxBytesReader(nil, resp.Body, maxACMEResponseBodyBytes)
+		}
+	}
+	var action string
+	if op, ok := req.Context().Value(AcmeActionLabel).(string); ok {
+		action = op
+	} else {
+		// Fallback for any requests where the context was not set.
+		action = "unnamed_action"
+	}
 	labels := []string{
 		req.URL.Scheme,
 		req.URL.Host,
-		pathProcessor(req.URL.Path),
+		action,
 		req.Method,
 		fmt.Sprintf("%d", statusCode),
 	}
@@ -88,15 +113,4 @@ func (it *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// return the response and error reported from the next RoundTripper.
 	return resp, err
-}
-
-// pathProcessor will trim the provided path to only include the first 2
-// segments in order to reduce the number of prometheus labels generated
-func pathProcessor(path string) string {
-	p := strings.Split(path, "/")
-	// only record the first two path segments as a prometheus label value
-	if len(p) > 3 {
-		p = p[:3]
-	}
-	return strings.Join(p, "/")
 }

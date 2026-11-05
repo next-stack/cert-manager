@@ -19,11 +19,13 @@ package validation
 import (
 	"crypto/x509"
 	"fmt"
+	"slices"
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	cmacme "github.com/cert-manager/cert-manager/internal/apis/acme"
@@ -105,10 +107,24 @@ func ValidateIssuerConfig(iss *certmanager.IssuerConfig, fldPath *field.Path) (f
 
 func ValidateACMEIssuerConfig(iss *cmacme.ACMEIssuer, fldPath *field.Path) (field.ErrorList, []string) {
 	var warnings []string
+
 	el := field.ErrorList{}
+
+	if len(iss.CABundle) > 0 && iss.SkipTLSVerify {
+		el = append(el, field.Invalid(fldPath.Child("caBundle"), "", "caBundle and skipTLSVerify are mutually exclusive and cannot both be set"))
+		el = append(el, field.Invalid(fldPath.Child("skipTLSVerify"), iss.SkipTLSVerify, "caBundle and skipTLSVerify are mutually exclusive and cannot both be set"))
+	}
+
+	if len(iss.CABundle) > 0 {
+		if err := validateCABundleNotEmpty(iss.CABundle); err != nil {
+			el = append(el, field.Invalid(fldPath.Child("caBundle"), "", err.Error()))
+		}
+	}
+
 	if len(iss.PrivateKey.Name) == 0 {
 		el = append(el, field.Required(fldPath.Child("privateKeySecretRef", "name"), "private key secret name is a required field"))
 	}
+
 	if len(iss.Server) == 0 {
 		el = append(el, field.Required(fldPath.Child("server"), "acme server URL is a required field"))
 	}
@@ -121,6 +137,7 @@ func ValidateACMEIssuerConfig(iss *cmacme.ACMEIssuer, fldPath *field.Path) (fiel
 
 		el = append(el, ValidateSecretKeySelector(&eab.Key, eabFldPath.Child("keySecretRef"))...)
 
+		//nolint:staticcheck // SA1019 accessing the deprecated eab.KeyAlgorithm field is intentional here.
 		if len(eab.KeyAlgorithm) != 0 {
 			warnings = append(warnings, deprecatedACMEEABKeyAlgorithmField)
 		}
@@ -146,11 +163,16 @@ func ValidateACMEIssuerChallengeSolverConfig(sol *cmacme.ACMEChallengeSolver, fl
 			el = append(el, field.Forbidden(fldPath, "may not specify more than one solver type in a single solver"))
 		} else {
 			numProviders++
-			el = append(el, ValidateACMEChallengeSolverDNS01(sol.DNS01, fldPath.Child("dns01"))...)
+			solverErrs, _ := ValidateACMEChallengeSolverDNS01(sol.DNS01, fldPath.Child("dns01"))
+			el = append(el, solverErrs...)
 		}
 	}
 	if numProviders == 0 {
 		el = append(el, field.Required(fldPath, "no solver type configured"))
+	}
+
+	if sol.WaitInsteadOfSelfCheck != nil && sol.WaitInsteadOfSelfCheck.Duration < 0 {
+		el = append(el, field.Invalid(fldPath.Child("waitInsteadOfSelfCheck"), sol.WaitInsteadOfSelfCheck.Duration, "waitInsteadOfSelfCheck must not be negative"))
 	}
 
 	return el
@@ -181,9 +203,31 @@ func ValidateACMEIssuerChallengeSolverHTTP01Config(http01 *cmacme.ACMEChallengeS
 func ValidateACMEIssuerChallengeSolverHTTP01IngressConfig(ingress *cmacme.ACMEChallengeSolverHTTP01Ingress, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 
-	if ingress.Class != nil && len(ingress.Name) > 0 {
-		el = append(el, field.Forbidden(fldPath, "only one of 'name' or 'class' should be specified"))
+	numFieldsSpecified := 0
+	if ingress.Class != nil {
+		numFieldsSpecified++
 	}
+	if ingress.IngressClassName != nil {
+		numFieldsSpecified++
+	}
+	if len(ingress.Name) > 0 {
+		numFieldsSpecified++
+	}
+	if numFieldsSpecified > 1 {
+		el = append(el, field.Forbidden(fldPath, "only one of 'ingressClassName', 'name' or 'class' should be specified"))
+	}
+
+	// Since "class" used to be a free string, let's have a stricter validation
+	// for "ingressClassName" since it is expected to be a valid resource name.
+	// A notable example is "azure/application-gateway" that is a valid value
+	// for "class" but not for "ingressClassName".
+	if ingress.IngressClassName != nil {
+		errs := validation.IsDNS1123Subdomain(*ingress.IngressClassName)
+		if len(errs) > 0 {
+			el = append(el, field.Invalid(fldPath.Child("ingressClassName"), *ingress.IngressClassName, "must be a valid IngressClass name: "+strings.Join(errs, ", ")))
+		}
+	}
+
 	switch ingress.ServiceType {
 	case "", corev1.ServiceTypeClusterIP, corev1.ServiceTypeNodePort:
 	default:
@@ -201,9 +245,22 @@ func ValidateACMEIssuerChallengeSolverHTTP01GatewayConfig(gateway *cmacme.ACMECh
 	default:
 		el = append(el, field.Invalid(fldPath.Child("serviceType"), gateway.ServiceType, `must be empty, "ClusterIP" or "NodePort"`))
 	}
-	if len(gateway.ParentRefs) == 0 {
-		el = append(el, field.Required(fldPath.Child("parentRefs"), `at least 1 parentRef is required`))
+
+	// We dont need to check if parentRefs are present since we have the override annotations
+	// on the certificate either through certificate-shim or manually. We only need to validate if
+	// kind is present and if name is not present or if name is present without kind.
+	for i, g := range gateway.ParentRefs {
+		if g.Kind != nil && g.Name == "" {
+			el = append(el, field.Required(fldPath.Child("parentRefs").Index(i).Child("name"), "name is required when kind is specified"))
+			return el
+		}
+
+		if g.Name != "" && g.Kind == nil {
+			el = append(el, field.Required(fldPath.Child("parentRefs").Index(i).Child("kind"), "kind is required when name is specified"))
+			return el
+		}
 	}
+
 	return el
 }
 
@@ -217,6 +274,11 @@ func ValidateCAIssuerConfig(iss *certmanager.CAIssuer, fldPath *field.Path) fiel
 			el = append(el, field.Invalid(fldPath.Child("ocspServer").Index(i), ocspURL, "must be a valid URL, e.g., http://ocsp.int-x3.letsencrypt.org"))
 		}
 	}
+	for i, issuerURL := range iss.IssuingCertificateURLs {
+		if issuerURL == "" {
+			el = append(el, field.Invalid(fldPath.Child("issuingCertificateURLs").Index(i), issuerURL, "must be a valid URL"))
+		}
+	}
 	return el
 }
 
@@ -226,40 +288,185 @@ func ValidateSelfSignedIssuerConfig(iss *certmanager.SelfSignedIssuer, fldPath *
 
 func ValidateVaultIssuerConfig(iss *certmanager.VaultIssuer, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
+
 	if len(iss.Server) == 0 {
 		el = append(el, field.Required(fldPath.Child("server"), ""))
 	}
+
 	if len(iss.Path) == 0 {
 		el = append(el, field.Required(fldPath.Child("path"), ""))
+	} else if containsDotDotSegment(iss.Path) {
+		el = append(el, field.Invalid(fldPath.Child("path"), iss.Path, "must not contain '..' path segments"))
 	}
 
-	// check if caBundle is valid
-	certs := iss.CABundle
-	if len(certs) > 0 {
-		caCertPool := x509.NewCertPool()
-		ok := caCertPool.AppendCertsFromPEM(certs)
-		if !ok {
-			el = append(el, field.Invalid(fldPath.Child("caBundle"), "", "Specified CA bundle is invalid"))
+	if len(iss.CABundle) > 0 {
+		if err := validateCABundleNotEmpty(iss.CABundle); err != nil {
+			el = append(el, field.Invalid(fldPath.Child("caBundle"), "<snip>", err.Error()))
 		}
 	}
 
 	if len(iss.CABundle) > 0 && iss.CABundleSecretRef != nil {
-		el = append(el, field.Invalid(fldPath.Child("caBundle"), iss.CABundle, "specified caBundle and caBundleSecretRef cannot be used together"))
+		// We don't use iss.CABundle for the "value interface{}" argument to field.Invalid for caBundle
+		// since printing the whole bundle verbatim won't help diagnose any issues
+		el = append(el, field.Invalid(fldPath.Child("caBundle"), "<snip>", "specified caBundle and caBundleSecretRef cannot be used together"))
 		el = append(el, field.Invalid(fldPath.Child("caBundleSecretRef"), iss.CABundleSecretRef.Name, "specified caBundleSecretRef and caBundle cannot be used together"))
 	}
 
+	if iss.ClientCertSecretRef != nil && iss.ClientKeySecretRef == nil {
+		el = append(el, field.Invalid(fldPath.Child("clientKeySecretRef"), "<snip>", "clientKeySecretRef must be provided when defining the clientCertSecretRef"))
+	} else if iss.ClientCertSecretRef == nil && iss.ClientKeySecretRef != nil {
+		el = append(el, field.Invalid(fldPath.Child("clientCertSecretRef"), "<snip>", "clientCertSecretRef must be provided when defining the clientKeySecretRef"))
+	}
+
+	el = append(el, ValidateVaultIssuerAuth(&iss.Auth, fldPath.Child("auth"))...)
+
 	return el
-	// TODO: add validation for Vault authentication types
+}
+
+func ValidateVaultIssuerAuth(auth *certmanager.VaultAuth, fldPath *field.Path) field.ErrorList {
+	el := field.ErrorList{}
+
+	unionCount := 0
+	if auth.TokenSecretRef != nil {
+		unionCount++
+	}
+
+	if auth.AppRole != nil {
+		if auth.AppRole.RoleId == "" {
+			el = append(el, field.Required(fldPath.Child("appRole", "roleId"), ""))
+		}
+
+		if auth.AppRole.SecretRef.Name == "" {
+			el = append(el, field.Required(fldPath.Child("appRole", "secretRef", "name"), ""))
+		}
+
+		if containsDotDotSegment(auth.AppRole.Path) {
+			el = append(el, field.Invalid(fldPath.Child("appRole", "path"), auth.AppRole.Path, "must not contain '..' path segments"))
+		}
+		unionCount++
+	}
+
+	if auth.ClientCertificate != nil {
+		if containsDotDotSegment(auth.ClientCertificate.Path) {
+			el = append(el, field.Invalid(fldPath.Child("clientCertificate", "path"), auth.ClientCertificate.Path, "must not contain '..' path segments"))
+		}
+		unionCount++
+	}
+
+	if auth.Kubernetes != nil {
+		unionCount++
+
+		if auth.Kubernetes.Role == "" {
+			el = append(el, field.Required(fldPath.Child("kubernetes", "role"), ""))
+		}
+
+		if containsDotDotSegment(auth.Kubernetes.Path) {
+			el = append(el, field.Invalid(fldPath.Child("kubernetes", "path"), auth.Kubernetes.Path, "must not contain '..' path segments"))
+		}
+
+		kubeCount := 0
+		if len(auth.Kubernetes.SecretRef.Name) > 0 {
+			kubeCount++
+		}
+
+		if auth.Kubernetes.ServiceAccountRef != nil {
+			kubeCount++
+			if len(auth.Kubernetes.ServiceAccountRef.Name) == 0 {
+				el = append(el, field.Required(fldPath.Child("kubernetes", "serviceAccountRef", "name"), ""))
+			}
+		}
+
+		if kubeCount == 0 {
+			el = append(el, field.Required(fldPath.Child("kubernetes"), "please supply one of: secretRef, serviceAccountRef"))
+		}
+		if kubeCount > 1 {
+			el = append(el, field.Forbidden(fldPath.Child("kubernetes"), "please supply one of: secretRef, serviceAccountRef"))
+		}
+	}
+
+	if auth.AWS != nil {
+		unionCount++
+
+		if auth.AWS.Role == "" {
+			el = append(el, field.Required(fldPath.Child("aws", "role"), ""))
+		}
+
+		if containsDotDotSegment(auth.AWS.MountPath) {
+			el = append(el, field.Invalid(fldPath.Child("aws", "mountPath"), auth.AWS.MountPath, "must not contain '..' path segments"))
+		}
+
+		if auth.AWS.ServiceAccountRef != nil {
+			if len(auth.AWS.ServiceAccountRef.Name) == 0 {
+				el = append(el, field.Required(fldPath.Child("aws", "serviceAccountRef", "name"), ""))
+			}
+			if auth.AWS.IAMRoleARN == "" {
+				el = append(el, field.Required(fldPath.Child("aws", "iamRoleArn"), "iamRoleArn is required when using serviceAccountRef for IRSA"))
+			}
+		}
+	}
+
+	if unionCount == 0 {
+		el = append(el, field.Required(fldPath, "please supply one of: appRole, kubernetes, tokenSecretRef, clientCertificate, aws"))
+	}
+
+	// Due to the fact that there has not been any "oneOf" validation on
+	// tokenSecretRef, appRole, and kubernetes, people may already have created
+	// Issuer resources in which they have set two of these fields instead of
+	// one. To avoid breaking these manifests, we don't check that the user has
+	// set a single field among these three. Instead, we documented in the API
+	// that it is the first field that is set gets used.
+
+	return el
+}
+
+// containsDotDotSegment checks for literal ".." path segments only.
+// We considered using path.Clean(p) != p instead, which also catches
+// double slashes and trailing slashes, but that risks rejecting
+// existing working Issuers on update with cosmetically non-canonical paths.
+func containsDotDotSegment(p string) bool {
+	return slices.Contains(strings.Split(p, "/"), "..")
 }
 
 func ValidateVenafiTPP(tpp *certmanager.VenafiTPP, fldPath *field.Path) (el field.ErrorList) {
 	if tpp.URL == "" {
 		el = append(el, field.Required(fldPath.Child("url"), ""))
 	}
+
+	// TODO: validate CABundle using validateCABundleNotEmpty
+
+	// Validate only one of CABundle/CABundleSecretRef is passed
+	el = append(el, validateVenafiTPPCABundleUnique(tpp, fldPath)...)
+
+	return el
+}
+
+func validateVenafiTPPCABundleUnique(tpp *certmanager.VenafiTPP, fldPath *field.Path) (el field.ErrorList) {
+	numCAs := 0
+	if len(tpp.CABundle) > 0 {
+		numCAs++
+	}
+	if tpp.CABundleSecretRef != nil {
+		numCAs++
+	}
+
+	if numCAs > 1 {
+		el = append(el, field.Forbidden(fldPath, "may not specify more than one of caBundle/caBundleSecretRef as TPP CA Bundle"))
+	}
+
 	return el
 }
 
 func ValidateVenafiCloud(c *certmanager.VenafiCloud, fldPath *field.Path) (el field.ErrorList) {
+	return el
+}
+
+func ValidateVenafiNGTS(ngts *certmanager.VenafiNGTS, fldPath *field.Path) (el field.ErrorList) {
+	if ngts.TSGID == "" {
+		el = append(el, field.Required(fldPath.Child("tsgID"), ""))
+	}
+	if ngts.CredentialsRef.Name == "" {
+		el = append(el, field.Required(fldPath.Child("credentialsRef", "name"), ""))
+	}
 	return el
 }
 
@@ -276,12 +483,16 @@ func ValidateVenafiIssuerConfig(iss *certmanager.VenafiIssuer, fldPath *field.Pa
 		unionCount++
 		el = append(el, ValidateVenafiCloud(iss.Cloud, fldPath.Child("cloud"))...)
 	}
+	if iss.NGTS != nil {
+		unionCount++
+		el = append(el, ValidateVenafiNGTS(iss.NGTS, fldPath.Child("ngts"))...)
+	}
 
 	if unionCount == 0 {
-		el = append(el, field.Required(fldPath, "please supply one of: tpp, cloud"))
+		el = append(el, field.Required(fldPath, "please supply one of: tpp, cloud, ngts"))
 	}
 	if unionCount > 1 {
-		el = append(el, field.Forbidden(fldPath, "please supply one of: tpp, cloud"))
+		el = append(el, field.Forbidden(fldPath, "please supply one of: tpp, cloud, ngts"))
 	}
 
 	return el
@@ -295,8 +506,9 @@ var supportedTSIGAlgorithms = []string{
 	"HMACSHA512",
 }
 
-func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPath *field.Path) field.ErrorList {
+func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPath *field.Path) (field.ErrorList, []*cmmeta.SecretKeySelector) {
 	el := field.ErrorList{}
+	requiredSecrets := []*cmmeta.SecretKeySelector{}
 
 	// allow empty values for now, until we have a MutatingWebhook to apply
 	// default values to fields.
@@ -308,12 +520,24 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 			el = append(el, field.Invalid(fldPath.Child("cnameStrategy"), p.CNAMEStrategy, fmt.Sprintf("must be one of %q or %q", cmacme.NoneStrategy, cmacme.FollowStrategy)))
 		}
 	}
+	for i, ns := range p.Nameservers {
+		if err := util.ValidDNS01Nameserver(ns); err != nil {
+			el = append(el, field.Invalid(fldPath.Child("nameservers").Index(i), ns, err.Error()))
+		}
+	}
+
 	numProviders := 0
 	if p.Akamai != nil {
 		numProviders++
 		el = append(el, ValidateSecretKeySelector(&p.Akamai.AccessToken, fldPath.Child("akamai", "accessToken"))...)
+		requiredSecrets = append(requiredSecrets, &p.Akamai.AccessToken)
+
 		el = append(el, ValidateSecretKeySelector(&p.Akamai.ClientSecret, fldPath.Child("akamai", "clientSecret"))...)
+		requiredSecrets = append(requiredSecrets, &p.Akamai.ClientSecret)
+
 		el = append(el, ValidateSecretKeySelector(&p.Akamai.ClientToken, fldPath.Child("akamai", "clientToken"))...)
+		requiredSecrets = append(requiredSecrets, &p.Akamai.ClientToken)
+
 		if len(p.Akamai.ServiceConsumerDomain) == 0 {
 			el = append(el, field.Required(fldPath.Child("akamai", "serviceConsumerDomain"), ""))
 		}
@@ -333,20 +557,26 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 					el = append(el, field.Required(fldPath.Child("azureDNS", "clientSecretSecretRef"), ""))
 				} else {
 					el = append(el, ValidateSecretKeySelector(p.AzureDNS.ClientSecret, fldPath.Child("azureDNS", "clientSecretSecretRef"))...)
+					requiredSecrets = append(requiredSecrets, p.AzureDNS.ClientSecret)
 				}
 				if len(p.AzureDNS.TenantID) == 0 {
 					el = append(el, field.Required(fldPath.Child("azureDNS", "tenantID"), ""))
 				}
 				if p.AzureDNS.ManagedIdentity != nil {
-					el = append(el, field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity can not be used at the same time as clientID, clientSecretSecretRef or tenantID"))
+					el = append(el, field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managed identity cannot be used at the same time as clientID, clientSecretSecretRef or tenantID"))
 				}
-			} else {
-				// using managed identity
-				if p.AzureDNS.ManagedIdentity != nil && len(p.AzureDNS.ManagedIdentity.ClientID) > 0 && len(p.AzureDNS.ManagedIdentity.ResourceID) > 0 {
+			} else if p.AzureDNS.ManagedIdentity != nil {
+				if len(p.AzureDNS.ManagedIdentity.ClientID) > 0 && len(p.AzureDNS.ManagedIdentity.ResourceID) > 0 {
 					el = append(el, field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managedIdentityClientID and managedIdentityResourceID cannot both be specified"))
 				}
-
+				if len(p.AzureDNS.ManagedIdentity.TenantID) > 0 && len(p.AzureDNS.ManagedIdentity.ResourceID) > 0 {
+					el = append(el, field.Forbidden(fldPath.Child("azureDNS", "managedIdentity"), "managedIdentityTenantID and managedIdentityResourceID cannot both be specified"))
+				}
+				if len(p.AzureDNS.ManagedIdentity.TenantID) > 0 && len(p.AzureDNS.ManagedIdentity.ClientID) == 0 {
+					el = append(el, field.Required(fldPath.Child("azureDNS", "managedIdentity"), "managedIdentityClientID is required when using managedIdentityTenantID"))
+				}
 			}
+
 			// SubscriptionID must always be defined
 			if len(p.AzureDNS.SubscriptionID) == 0 {
 				el = append(el, field.Required(fldPath.Child("azureDNS", "subscriptionID"), ""))
@@ -359,7 +589,7 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 			case "", cmacme.AzurePublicCloud, cmacme.AzureChinaCloud, cmacme.AzureGermanCloud, cmacme.AzureUSGovernmentCloud:
 			default:
 				el = append(el, field.Invalid(fldPath.Child("azureDNS", "environment"), p.AzureDNS.Environment,
-					fmt.Sprintf("must be either empty or one of %s, %s, %s or %s", cmacme.AzurePublicCloud, cmacme.AzureChinaCloud, cmacme.AzureGermanCloud, cmacme.AzureUSGovernmentCloud)))
+					fmt.Sprintf("must be either empty or one of %s, %s, %s, or %s", cmacme.AzurePublicCloud, cmacme.AzureChinaCloud, cmacme.AzureGermanCloud, cmacme.AzureUSGovernmentCloud)))
 			}
 		}
 	}
@@ -372,6 +602,7 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 			// selector
 			if p.CloudDNS.ServiceAccount != nil {
 				el = append(el, ValidateSecretKeySelector(p.CloudDNS.ServiceAccount, fldPath.Child("cloudDNS", "serviceAccountSecretRef"))...)
+				requiredSecrets = append(requiredSecrets, p.CloudDNS.ServiceAccount)
 			}
 			if len(p.CloudDNS.Project) == 0 {
 				el = append(el, field.Required(fldPath.Child("cloudDNS", "project"), ""))
@@ -385,9 +616,11 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 			numProviders++
 			if p.Cloudflare.APIKey != nil {
 				el = append(el, ValidateSecretKeySelector(p.Cloudflare.APIKey, fldPath.Child("cloudflare", "apiKeySecretRef"))...)
+				requiredSecrets = append(requiredSecrets, p.Cloudflare.APIKey)
 			}
 			if p.Cloudflare.APIToken != nil {
 				el = append(el, ValidateSecretKeySelector(p.Cloudflare.APIToken, fldPath.Child("cloudflare", "apiTokenSecretRef"))...)
+				requiredSecrets = append(requiredSecrets, p.Cloudflare.APIToken)
 			}
 			if p.Cloudflare.APIKey != nil && p.Cloudflare.APIToken != nil {
 				el = append(el, field.Forbidden(fldPath.Child("cloudflare"), "apiKeySecretRef and apiTokenSecretRef cannot both be specified"))
@@ -405,25 +638,26 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 			el = append(el, field.Forbidden(fldPath.Child("route53"), "may not specify more than one provider type"))
 		} else {
 			numProviders++
-			// region is the only required field for route53 as ambient credentials can be used instead
-			if len(p.Route53.Region) == 0 {
-				el = append(el, field.Required(fldPath.Child("route53", "region"), ""))
-			}
 			// We don't include a validation here asserting that either the
 			// AccessKeyID or SecretAccessKeyID must be specified, because it is
 			// valid to use neither when using ambient credentials.
 			if len(p.Route53.AccessKeyID) > 0 && p.Route53.SecretAccessKeyID != nil {
 				el = append(el, field.Required(fldPath.Child("route53"), "accessKeyID and accessKeyIDSecretRef cannot both be specified"))
 			}
+			if len(p.Route53.SecretAccessKey.Name) > 0 {
+				requiredSecrets = append(requiredSecrets, &p.Route53.SecretAccessKey)
+			}
 			// if an accessKeyIDSecretRef is given, validate that it resolves to an actual secret
 			if p.Route53.SecretAccessKeyID != nil {
 				el = append(el, ValidateSecretKeySelector(p.Route53.SecretAccessKeyID, fldPath.Child("route53", "accessKeyIDSecretRef"))...)
+				requiredSecrets = append(requiredSecrets, p.Route53.SecretAccessKeyID)
 			}
 		}
 	}
 	if p.AcmeDNS != nil {
 		numProviders++
 		el = append(el, ValidateSecretKeySelector(&p.AcmeDNS.AccountSecret, fldPath.Child("acmeDNS", "accountSecretRef"))...)
+		requiredSecrets = append(requiredSecrets, &p.AcmeDNS.AccountSecret)
 		if len(p.AcmeDNS.Host) == 0 {
 			el = append(el, field.Required(fldPath.Child("acmeDNS", "host"), ""))
 		}
@@ -435,6 +669,7 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 		} else {
 			numProviders++
 			el = append(el, ValidateSecretKeySelector(&p.DigitalOcean.Token, fldPath.Child("digitalocean", "tokenSecretRef"))...)
+			requiredSecrets = append(requiredSecrets, &p.DigitalOcean.Token)
 		}
 	}
 	if p.RFC2136 != nil {
@@ -461,15 +696,18 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 					el = append(el, field.NotSupported(fldPath.Child("rfc2136", "tsigAlgorithm"), "", supportedTSIGAlgorithms))
 				}
 			}
+			if len(p.RFC2136.TSIGSecret.Name) > 0 {
+				requiredSecrets = append(requiredSecrets, &p.RFC2136.TSIGSecret)
+			}
+
 			if len(p.RFC2136.TSIGKeyName) > 0 {
 				el = append(el, ValidateSecretKeySelector(&p.RFC2136.TSIGSecret, fldPath.Child("rfc2136", "tsigSecretSecretRef"))...)
 			}
 
 			if len(ValidateSecretKeySelector(&p.RFC2136.TSIGSecret, fldPath.Child("rfc2136", "tsigSecretSecretRef"))) == 0 {
-				if len(p.RFC2136.TSIGKeyName) <= 0 {
+				if len(p.RFC2136.TSIGKeyName) == 0 {
 					el = append(el, field.Required(fldPath.Child("rfc2136", "tsigKeyName"), ""))
 				}
-
 			}
 		}
 	}
@@ -487,7 +725,7 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 		el = append(el, field.Required(fldPath, "no DNS01 provider configured"))
 	}
 
-	return el
+	return el, requiredSecrets
 }
 
 func ValidateSecretKeySelector(sks *cmmeta.SecretKeySelector, fldPath *field.Path) field.ErrorList {
@@ -499,4 +737,23 @@ func ValidateSecretKeySelector(sks *cmmeta.SecretKeySelector, fldPath *field.Pat
 		el = append(el, field.Required(fldPath.Child("key"), "secret key is required"))
 	}
 	return el
+}
+
+// validateCABundleNotEmpty performs a soft check on the CA bundle to see if there's at least one
+// valid CA certificate inside.
+// This uses the standard library crypto/x509.CertPool.AppendCertsFromPEM function, which
+// skips over invalid certificates rather than rejecting them.
+func validateCABundleNotEmpty(bundle []byte) error {
+	// TODO: Change this function to actually validate certificates so that invalid certs
+	// are rejected or at least warned on.
+	// For example, something like: https://github.com/cert-manager/trust-manager/blob/21c839ff1128990e049eaf23000a9a8d6716c89e/pkg/util/pem.go#L26-L81
+
+	pool := x509.NewCertPool()
+
+	ok := pool.AppendCertsFromPEM(bundle)
+	if !ok {
+		return fmt.Errorf("cert bundle didn't contain any valid certificates")
+	}
+
+	return nil
 }

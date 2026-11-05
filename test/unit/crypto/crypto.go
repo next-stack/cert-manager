@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 
@@ -30,7 +31,6 @@ import (
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/pkg/controller/certificates"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 )
@@ -112,9 +112,7 @@ func CreateCryptoBundle(originalCert *cmapi.Certificate, clock clock.Clock) (*Cr
 	}
 
 	annotations := make(map[string]string)
-	for k, v := range crt.Annotations {
-		annotations[k] = v
-	}
+	maps.Copy(annotations, crt.Annotations)
 	if crt.Status.Revision != nil {
 		annotations[cmapi.CertificateRequestRevisionAnnotationKey] = fmt.Sprintf("%d", *crt.Status.Revision)
 	}
@@ -122,12 +120,10 @@ func CreateCryptoBundle(originalCert *cmapi.Certificate, clock clock.Clock) (*Cr
 	annotations[cmapi.CertificateRequestPrivateKeyAnnotationKey] = crt.Spec.SecretName
 	annotations[cmapi.CertificateNameKey] = crt.Name
 	certificateRequest := &cmapi.CertificateRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            reqName,
-			Namespace:       crt.Namespace,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(crt, certificateGvk)},
-			Annotations:     annotations,
-		},
+		Name:            reqName,
+		Namespace:       crt.Namespace,
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(crt, certificateGvk)},
+		Annotations:     annotations,
 		Spec: cmapi.CertificateRequestSpec{
 			Request:   csrPEM,
 			Duration:  crt.Spec.Duration,
@@ -136,7 +132,7 @@ func CreateCryptoBundle(originalCert *cmapi.Certificate, clock clock.Clock) (*Cr
 		},
 	}
 
-	unsignedCert, err := pki.GenerateTemplateFromCertificateRequest(certificateRequest)
+	unsignedCert, err := pki.CertificateTemplateFromCertificateRequest(certificateRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +175,7 @@ func CreateCryptoBundle(originalCert *cmapi.Certificate, clock clock.Clock) (*Cr
 		}),
 	)
 
-	tempCertBytes, err := certificates.GenerateLocallySignedTemporaryCertificate(crt, privateKeyBytes)
+	tempCertBytes, err := pki.GenerateLocallySignedTemporaryCertificate(crt, privateKeyBytes)
 	if err != nil {
 		panic("failed to generate test fixture: " + err.Error())
 	}
@@ -256,7 +252,7 @@ func MustCreateCertWithNotBeforeAfter(t *testing.T, pkData []byte, spec *cmapi.C
 		t.Fatal(err)
 	}
 
-	template, err := pki.GenerateTemplate(spec)
+	template, err := pki.CertificateTemplateFromCertificate(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +275,7 @@ func MustCreateCert(t *testing.T, pkData []byte, spec *cmapi.Certificate) []byte
 		t.Fatal(err)
 	}
 
-	template, err := pki.GenerateTemplate(spec)
+	template, err := pki.CertificateTemplateFromCertificate(spec)
 	if err != nil {
 		t.Fatal(err)
 	}

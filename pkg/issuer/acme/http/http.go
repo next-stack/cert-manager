@@ -25,14 +25,15 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	corev1listers "k8s.io/client-go/listers/core/v1"
 	networkingv1listers "k8s.io/client-go/listers/networking/v1"
+	"k8s.io/client-go/tools/cache"
 	k8snet "k8s.io/utils/net"
-	gwapilisters "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1alpha2"
+	gwapilisters "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1"
 
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -49,6 +50,11 @@ const (
 	acmeSolverListenPort = 8089
 
 	loggerName = "http01"
+
+	// maxAcmeChallengeBodySize is the max size of a received response body for an
+	// acme http challenge. The value is arbitrary and is chosen to be large enough
+	// that any reasonable response would fit.
+	maxAcmeChallengeBodySize = 1024 * 1024 // 1mb
 )
 
 var (
@@ -59,8 +65,8 @@ var (
 type Solver struct {
 	*controller.Context
 
-	podLister       corev1listers.PodLister
-	serviceLister   corev1listers.ServiceLister
+	podLister       cache.GenericLister
+	serviceLister   cache.GenericLister
 	ingressLister   networkingv1listers.IngressLister
 	httpRouteLister gwapilisters.HTTPRouteLister
 
@@ -74,10 +80,10 @@ type reachabilityTest func(ctx context.Context, url *url.URL, key string, dnsSer
 func NewSolver(ctx *controller.Context) (*Solver, error) {
 	return &Solver{
 		Context:          ctx,
-		podLister:        ctx.KubeSharedInformerFactory.Core().V1().Pods().Lister(),
-		serviceLister:    ctx.KubeSharedInformerFactory.Core().V1().Services().Lister(),
-		ingressLister:    ctx.KubeSharedInformerFactory.Networking().V1().Ingresses().Lister(),
-		httpRouteLister:  ctx.GWShared.Gateway().V1alpha2().HTTPRoutes().Lister(),
+		podLister:        ctx.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("pods")).Lister(),
+		serviceLister:    ctx.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("services")).Lister(),
+		ingressLister:    ctx.KubeSharedInformerFactory.Ingresses().Lister(),
+		httpRouteLister:  ctx.GWShared.Gateway().V1().HTTPRoutes().Lister(),
 		testReachability: testReachability,
 		requiredPasses:   5,
 	}, nil
@@ -108,19 +114,22 @@ func (s *Solver) Present(ctx context.Context, issuer v1.GenericIssuer, ch *cmacm
 	log := logf.FromContext(ctx).WithName(loggerName)
 	ctx = logf.NewContext(ctx, log)
 
-	_, podErr := s.ensurePod(ctx, ch)
-	svc, svcErr := s.ensureService(ctx, ch)
+	podErr := s.ensurePod(ctx, ch)
+	svcName, svcErr := s.ensureService(ctx, ch)
 	if svcErr != nil {
 		return utilerrors.NewAggregate([]error{podErr, svcErr})
 	}
 	var ingressErr, gatewayErr error
 	if ch.Spec.Solver.HTTP01 != nil {
 		if ch.Spec.Solver.HTTP01.Ingress != nil {
-			_, ingressErr = s.ensureIngress(ctx, ch, svc.Name)
+			_, ingressErr = s.ensureIngress(ctx, ch, svcName)
 			return utilerrors.NewAggregate([]error{podErr, svcErr, ingressErr})
 		}
 		if ch.Spec.Solver.HTTP01.GatewayHTTPRoute != nil {
-			_, gatewayErr = s.ensureGatewayHTTPRoute(ctx, ch, svc.Name)
+			if !s.GatewaySolverEnabled {
+				return fmt.Errorf("couldn't Present challenge %s/%s: gateway api is not enabled", ch.Namespace, ch.Name)
+			}
+			_, gatewayErr = s.ensureGatewayHTTPRoute(ctx, ch, svcName)
 			return utilerrors.NewAggregate([]error{podErr, svcErr, gatewayErr})
 		}
 	}
@@ -160,13 +169,21 @@ func (s *Solver) Check(ctx context.Context, issuer v1.GenericIssuer, ch *cmacme.
 	ctx = logf.NewContext(ctx, log)
 
 	log.V(logf.DebugLevel).Info("running self check multiple times to ensure challenge has propagated", "required_passes", s.requiredPasses)
-	for i := 0; i < s.requiredPasses; i++ {
+	for i := range s.requiredPasses {
 		err := s.testReachability(ctx, url, ch.Spec.Key, s.HTTP01SolverNameservers, s.Context.RESTConfig.UserAgent)
 		if err != nil {
 			return err
 		}
 		log.V(logf.DebugLevel).Info("reachability test passed, re-checking in 2s time")
-		time.Sleep(time.Second * 2)
+
+		if i != s.requiredPasses-1 {
+			// sleep for 2s between checks, but respect context cancellation
+			select {
+			case <-time.After(time.Second * 2):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 
 	log.V(logf.DebugLevel).Info("self check succeeded")
@@ -176,7 +193,7 @@ func (s *Solver) Check(ctx context.Context, issuer v1.GenericIssuer, ch *cmacme.
 
 // CleanUp will ensure the created service, ingress and pod are clean/deleted of any
 // cert-manager created data.
-func (s *Solver) CleanUp(ctx context.Context, issuer v1.GenericIssuer, ch *cmacme.Challenge) error {
+func (s *Solver) CleanUp(ctx context.Context, ch *cmacme.Challenge) error {
 	var errs []error
 	errs = append(errs, s.cleanupPods(ctx, ch))
 	errs = append(errs, s.cleanupServices(ctx, ch))
@@ -254,15 +271,17 @@ func testReachability(ctx context.Context, url *url.URL, key string, dnsServers 
 			// > When redirected to an HTTPS URL, it does not validate certificates (since
 			// > this challenge is intended to bootstrap valid certificates, it may encounter
 			// > self-signed or expired certificates along the way).
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: true, // #nosec G402 -- ACME HTTP-01 self-check follows redirects to HTTPS where certs may be invalid (see comment above)
 		},
 	}
 
 	if len(dnsServers) != 0 {
 		transport.DialContext = func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-			// we need to increment a counter to iterate through the dns servers as the dialer will not
-			// return an error if the dns server is not responding.
-			counter := 0
+			// This Dial ignores the resolv.conf address that the resolver passes
+			// in, so we rotate through dnsServers ourselves. Without this, every
+			// resolver retry would hit the same server. The counter is atomic
+			// because the resolver dials from parallel A and AAAA goroutines.
+			var counter atomic.Uint32
 			dialer := &net.Dialer{
 				Timeout: 3 * time.Second,
 				Resolver: &net.Resolver{
@@ -271,8 +290,7 @@ func testReachability(ctx context.Context, url *url.URL, key string, dnsServers 
 						d := net.Dialer{
 							Timeout: 3 * time.Second,
 						}
-						s := dnsServers[counter%len(dnsServers)]
-						counter++
+						s := dnsServers[int(counter.Add(1)-1)%len(dnsServers)]
 						return d.DialContext(ctx, network, s)
 					},
 				},
@@ -285,34 +303,35 @@ func testReachability(ctx context.Context, url *url.URL, key string, dnsServers 
 		Timeout:   time.Second * 10,
 	}
 
-	response, err := client.Do(req)
+	response, err := client.Do(req) // #nosec G704 -- intentional ACME HTTP-01 self-check request; URL is provided by caller (typically Challenge DNSName + token via buildChallengeUrl)
 	if err != nil {
 		log.V(logf.DebugLevel).Info("failed to perform self check GET request", "error", err)
 		return fmt.Errorf("failed to perform self check GET request '%s': %v", url, err)
 	}
+	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
 		log.V(logf.DebugLevel).Info("received HTTP status code was not StatusOK (200)", "code", response.StatusCode)
 		return fmt.Errorf("wrong status code '%d', expected '%d'", response.StatusCode, http.StatusOK)
 	}
 
-	defer response.Body.Close()
-	presentedKey, err := io.ReadAll(response.Body)
+	presentedKey, err := io.ReadAll(io.LimitReader(response.Body, maxAcmeChallengeBodySize))
 	if err != nil {
 		log.V(logf.DebugLevel).Info("failed to decode response body", "error", err)
 		return fmt.Errorf("failed to read response body: %v", err)
 	}
 
 	if string(presentedKey) != key {
-		// truncate the response before displaying it to avoid extra long strings
-		// being displayed to users
+		// truncate the response before logging it to avoid extra long strings
+		// being displayed to operators
 		keyToPrint := string(presentedKey)
 		if len(keyToPrint) > 24 {
 			// trim spaces to make output look right if it ends with whitespace
 			keyToPrint = strings.TrimSpace(keyToPrint[:24]) + "... (truncated)"
 		}
 		log.V(logf.DebugLevel).Info("key returned by server did not match expected", "actual", keyToPrint, "expected", key)
-		return fmt.Errorf("did not get expected response when querying endpoint, expected %q but got: %s", key, keyToPrint)
+		// The response body is deliberately kept out of the returned error
+		return fmt.Errorf("did not get expected response %q when querying endpoint", key)
 	}
 
 	log.V(logf.DebugLevel).Info("reachability test succeeded")

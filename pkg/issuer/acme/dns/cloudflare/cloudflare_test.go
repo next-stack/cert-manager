@@ -9,6 +9,7 @@ this directory.
 package cloudflare
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
 )
@@ -34,8 +36,8 @@ type DNSProviderMock struct {
 	mock.Mock
 }
 
-func (c *DNSProviderMock) makeRequest(method, uri string, body io.Reader) (json.RawMessage, error) {
-	//stub makeRequest
+func (c *DNSProviderMock) makeRequest(ctx context.Context, method, uri string, body io.Reader) (json.RawMessage, error) {
+	// stub makeRequest
 	args := c.Called(method, uri, nil)
 	return args.Get(0).([]uint8), args.Error(1)
 }
@@ -50,49 +52,39 @@ func init() {
 	}
 }
 
-func restoreCloudFlareEnv() {
-	os.Setenv("CLOUDFLARE_EMAIL", cflareEmail)
-	os.Setenv("CLOUDFLARE_API_KEY", cflareAPIKey)
-}
-
 func TestNewDNSProviderValidAPIKey(t *testing.T) {
-	os.Setenv("CLOUDFLARE_EMAIL", "")
-	os.Setenv("CLOUDFLARE_API_KEY", "")
+	t.Setenv("CLOUDFLARE_EMAIL", "")
+	t.Setenv("CLOUDFLARE_API_KEY", "")
 	_, err := NewDNSProviderCredentials("123", "123", "", util.RecursiveNameservers, "cert-manager-test")
 	assert.NoError(t, err)
-	restoreCloudFlareEnv()
 }
 
 func TestNewDNSProviderValidAPIToken(t *testing.T) {
-	os.Setenv("CLOUDFLARE_EMAIL", "")
-	os.Setenv("CLOUDFLARE_API_KEY", "")
+	t.Setenv("CLOUDFLARE_EMAIL", "")
+	t.Setenv("CLOUDFLARE_API_KEY", "")
 	_, err := NewDNSProviderCredentials("123", "", "123", util.RecursiveNameservers, "cert-manager-test")
 	assert.NoError(t, err)
-	restoreCloudFlareEnv()
 }
 
 func TestNewDNSProviderKeyAndTokenProvided(t *testing.T) {
-	os.Setenv("CLOUDFLARE_EMAIL", "")
-	os.Setenv("CLOUDFLARE_API_KEY", "")
+	t.Setenv("CLOUDFLARE_EMAIL", "")
+	t.Setenv("CLOUDFLARE_API_KEY", "")
 	_, err := NewDNSProviderCredentials("123", "123", "123", util.RecursiveNameservers, "cert-manager-test")
 	assert.EqualError(t, err, "the Cloudflare API key and API token cannot be both present simultaneously")
-	restoreCloudFlareEnv()
 }
 
 func TestNewDNSProviderValidApiKeyEnv(t *testing.T) {
-	os.Setenv("CLOUDFLARE_EMAIL", "test@example.com")
-	os.Setenv("CLOUDFLARE_API_KEY", "123")
+	t.Setenv("CLOUDFLARE_EMAIL", "test@example.com")
+	t.Setenv("CLOUDFLARE_API_KEY", "123")
 	_, err := NewDNSProvider(util.RecursiveNameservers, "cert-manager-test")
 	assert.NoError(t, err)
-	restoreCloudFlareEnv()
 }
 
 func TestNewDNSProviderMissingCredErr(t *testing.T) {
-	os.Setenv("CLOUDFLARE_EMAIL", "")
-	os.Setenv("CLOUDFLARE_API_KEY", "")
+	t.Setenv("CLOUDFLARE_EMAIL", "")
+	t.Setenv("CLOUDFLARE_API_KEY", "")
 	_, err := NewDNSProvider(util.RecursiveNameservers, "cert-manager-test")
 	assert.EqualError(t, err, "no Cloudflare credential has been given (can be either an API key or an API token)")
-	restoreCloudFlareEnv()
 }
 
 func TestFindNearestZoneForFQDN(t *testing.T) {
@@ -106,7 +98,7 @@ func TestFindNearestZoneForFQDN(t *testing.T) {
 		{"id":"1a23cc4567b8def91a01c23a456e78cd","name":"sub.domain.com"}
 	]`), nil)
 
-	zone, err := FindNearestZoneForFQDN(dnsProvider, "_acme-challenge.test.sub.domain.com.")
+	zone, err := FindNearestZoneForFQDN(t.Context(), dnsProvider, "_acme-challenge.test.sub.domain.com.")
 
 	assert.NoError(t, err)
 	assert.Equal(t, zone, DNSZone{ID: "1a23cc4567b8def91a01c23a456e78cd", Name: "sub.domain.com"})
@@ -125,7 +117,7 @@ func TestFindNearestZoneForFQDNInvalidToken(t *testing.T) {
 while querying the Cloudflare API for GET "/zones?name=_acme-challenge.test.sub.domain.com"
 	 Error: 9109: Invalid access token`))
 
-	_, err := FindNearestZoneForFQDN(dnsProvider, "_acme-challenge.test.sub.domain.com.")
+	_, err := FindNearestZoneForFQDN(t.Context(), dnsProvider, "_acme-challenge.test.sub.domain.com.")
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Invalid access token")
@@ -139,7 +131,7 @@ func TestCloudFlarePresent(t *testing.T) {
 	provider, err := NewDNSProviderCredentials(cflareEmail, cflareAPIKey, cflareAPIToken, util.RecursiveNameservers, "cert-manager-test")
 	assert.NoError(t, err)
 
-	err = provider.Present(cflareDomain, "_acme-challenge."+cflareDomain+".", "123d==")
+	err = provider.Present(t.Context(), cflareDomain, "_acme-challenge."+cflareDomain+".", "123d==")
 	assert.NoError(t, err)
 }
 
@@ -153,6 +145,79 @@ func TestCloudFlareCleanUp(t *testing.T) {
 	provider, err := NewDNSProviderCredentials(cflareEmail, cflareAPIKey, cflareAPIToken, util.RecursiveNameservers, "cert-manager-test")
 	assert.NoError(t, err)
 
-	err = provider.CleanUp(cflareDomain, "_acme-challenge."+cflareDomain+".", "123d==")
+	err = provider.CleanUp(t.Context(), cflareDomain, "_acme-challenge."+cflareDomain+".", "123d==")
 	assert.NoError(t, err)
+}
+
+func TestNewDNSProviderFromOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		options []DNSProviderOption
+		wantErr string
+	}{
+		{
+			name: "valid API key auth",
+			options: []DNSProviderOption{
+				Email("123"), APIKey("123"),
+				UserAgent("cert-manager-test"),
+			},
+		},
+		{
+			name: "valid API token auth",
+			options: []DNSProviderOption{
+				APIToken("123"),
+				UserAgent("cert-manager-test"),
+			},
+		},
+		{
+			name: "API key with embedded newline",
+			options: []DNSProviderOption{
+				Email("test@example.com"), APIKey("key\nvalue"),
+				UserAgent("cert-manager-test"),
+			},
+			wantErr: "the Cloudflare API key is invalid (does the API key contain a newline?)",
+		},
+		{
+			name: "API token with embedded newline",
+			options: []DNSProviderOption{
+				APIToken("token\nvalue"),
+				UserAgent("cert-manager-test"),
+			},
+			wantErr: "the Cloudflare API token is invalid (does the API token contain a newline?)",
+		},
+		{
+			name: "key and token both provided",
+			options: []DNSProviderOption{
+				Email("123"), APIKey("123"), APIToken("123"),
+				UserAgent("cert-manager-test"),
+			},
+			wantErr: "the Cloudflare API key and API token cannot be both present simultaneously",
+		},
+		{
+			name: "key without email",
+			options: []DNSProviderOption{
+				APIKey("123"),
+				UserAgent("cert-manager-test"),
+			},
+			wantErr: "no Cloudflare credential has been given (can be either an API key or an API token)",
+		},
+		{
+			name: "no credentials",
+			options: []DNSProviderOption{
+				UserAgent("cert-manager-test"),
+			},
+			wantErr: "no Cloudflare credential has been given (can be either an API key or an API token)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewDNSProviderFromOptions(t.Context(), tt.options...)
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }

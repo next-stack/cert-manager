@@ -21,53 +21,50 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/test/e2e/framework"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cert-manager/cert-manager/e2e-tests/framework"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-func (a *acme) createDNS01Issuer(f *framework.Framework) string {
-	a.ensureEABSecret(f, f.Namespace.Name)
+func (a *acme) createDNS01Issuer(ctx context.Context, f *framework.Framework) string {
+	a.ensureEABSecret(ctx, f, f.Namespace.Name)
 
 	By("Creating an ACME DNS01 Issuer")
 	issuer := &cmapi.Issuer{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "acme-issuer-dns01-",
-		},
-		Spec: a.createDNS01IssuerSpec(f.Config.Addons.ACMEServer.URL, f.Config.Addons.ACMEServer.DNSServer),
+		GenerateName: "acme-issuer-dns01-",
+		Spec:         a.createDNS01IssuerSpec(f.Config.Addons.ACMEServer.URL, f.Config.Addons.ACMEServer.DNSServer),
 	}
-	issuer, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(context.TODO(), issuer, metav1.CreateOptions{})
+	issuer, err := f.CertManagerClientSet.CertmanagerV1().Issuers(f.Namespace.Name).Create(ctx, issuer, metav1.CreateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "failed to create acme DNS01 Issuer")
 
 	// wait for issuer to be ready
 	By("Waiting for acme DNS01 Issuer to be Ready")
-	issuer, err = f.Helper().WaitIssuerReady(issuer, time.Minute*5)
+	issuer, err = f.Helper().WaitIssuerReady(ctx, issuer, time.Minute*5)
 	Expect(err).ToNot(HaveOccurred())
 
 	return fmt.Sprintf("issuers.cert-manager.io/%s.%s", issuer.Namespace, issuer.Name)
 }
 
-func (a *acme) createDNS01ClusterIssuer(f *framework.Framework) string {
-	a.ensureEABSecret(f, f.Config.Addons.CertManager.ClusterResourceNamespace)
+func (a *acme) createDNS01ClusterIssuer(ctx context.Context, f *framework.Framework) string {
+	a.ensureEABSecret(ctx, f, f.Config.Addons.CertManager.ClusterResourceNamespace)
 
 	By("Creating an ACME DNS01 ClusterIssuer")
 	issuer := &cmapi.ClusterIssuer{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "acme-cluster-issuer-dns01-",
-		},
-		Spec: a.createDNS01IssuerSpec(f.Config.Addons.ACMEServer.URL, f.Config.Addons.ACMEServer.DNSServer),
+		GenerateName: "acme-cluster-issuer-dns01-",
+		Spec:         a.createDNS01IssuerSpec(f.Config.Addons.ACMEServer.URL, f.Config.Addons.ACMEServer.DNSServer),
 	}
-	issuer, err := f.CertManagerClientSet.CertmanagerV1().ClusterIssuers().Create(context.TODO(), issuer, metav1.CreateOptions{})
+	issuer, err := f.CertManagerClientSet.CertmanagerV1().ClusterIssuers().Create(ctx, issuer, metav1.CreateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "failed to create acme DNS01 ClusterIssuer")
 
 	// wait for issuer to be ready
 	By("Waiting for acme DNS01 Cluster Issuer to be Ready")
-	issuer, err = f.Helper().WaitClusterIssuerReady(issuer, time.Minute*5)
+	issuer, err = f.Helper().WaitClusterIssuerReady(ctx, issuer, time.Minute*5)
 	Expect(err).ToNot(HaveOccurred())
 
 	return fmt.Sprintf("clusterissuers.cert-manager.io/%s", issuer.Name)
@@ -75,22 +72,20 @@ func (a *acme) createDNS01ClusterIssuer(f *framework.Framework) string {
 
 func (a *acme) createDNS01IssuerSpec(serverURL, dnsServer string) cmapi.IssuerSpec {
 	return cmapi.IssuerSpec{
-		IssuerConfig: cmapi.IssuerConfig{
-			ACME: &cmacme.ACMEIssuer{
-				Server:        serverURL,
-				SkipTLSVerify: true,
-				PrivateKey: cmmeta.SecretKeySelector{
-					LocalObjectReference: cmmeta.LocalObjectReference{
-						Name: "acme-private-key",
-					},
+		ACME: &cmacme.ACMEIssuer{
+			Server:        serverURL,
+			SkipTLSVerify: true,
+			PrivateKey: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{
+					Name: "acme-private-key",
 				},
-				ExternalAccountBinding: a.eab,
-				Solvers: []cmacme.ACMEChallengeSolver{
-					{
-						DNS01: &cmacme.ACMEChallengeSolverDNS01{
-							RFC2136: &cmacme.ACMEIssuerDNS01ProviderRFC2136{
-								Nameserver: dnsServer,
-							},
+			},
+			ExternalAccountBinding: a.eab,
+			Solvers: []cmacme.ACMEChallengeSolver{
+				{
+					DNS01: &cmacme.ACMEChallengeSolverDNS01{
+						RFC2136: &cmacme.ACMEIssuerDNS01ProviderRFC2136{
+							Nameserver: dnsServer,
 						},
 					},
 				},

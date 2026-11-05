@@ -18,40 +18,56 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"time"
 
-	"github.com/spf13/cobra"
-
-	"github.com/cert-manager/cert-manager/cmd/util"
 	"github.com/cert-manager/cert-manager/pkg/issuer/acme/http/solver"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
+	"github.com/spf13/cobra"
+	"k8s.io/component-base/logs"
 )
 
-func NewACMESolverCommand(stopCh <-chan struct{}) *cobra.Command {
+func NewACMESolverCommand(_ context.Context) *cobra.Command {
 	s := new(solver.HTTP01Solver)
+	logOptions := logs.NewOptions()
 
 	cmd := &cobra.Command{
 		Use:   "acmesolver",
 		Short: "HTTP server used to solve ACME challenges.",
+
+		SilenceErrors: true, // Errors are already logged when calling cmd.Execute()
+		SilenceUsage:  true, // Don't print usage on every error
+
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if err := logf.ValidateAndApply(logOptions); err != nil {
+				return fmt.Errorf("error validating options: %s", err)
+			}
+
+			return nil
+		},
+		//nolint:contextcheck // False positive
 		RunE: func(cmd *cobra.Command, args []string) error {
-			rootCtx := util.ContextWithStopCh(context.Background(), stopCh)
-			rootCtx = logf.NewContext(rootCtx, logf.Log, "acmesolver")
-			log := logf.FromContext(rootCtx)
+			runCtx := cmd.Context()
+			log := logf.FromContext(runCtx)
 
 			completedCh := make(chan struct{})
 			go func() {
 				defer close(completedCh)
-				<-stopCh
+				<-runCtx.Done()
+
 				// allow a timeout for graceful shutdown
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 
-				if err := s.Shutdown(ctx); err != nil {
+				//nolint: contextcheck
+				if err := s.Shutdown(shutdownCtx); err != nil {
 					log.Error(err, "error shutting down acmesolver server")
 				}
 			}()
 
-			if err := s.Listen(log); err != nil {
+			if err := s.Listen(log); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
 
@@ -65,6 +81,12 @@ func NewACMESolverCommand(stopCh <-chan struct{}) *cobra.Command {
 	cmd.Flags().StringVar(&s.Domain, "domain", "", "the domain name to verify")
 	cmd.Flags().StringVar(&s.Token, "token", "", "the challenge token to verify against")
 	cmd.Flags().StringVar(&s.Key, "key", "", "the challenge key to respond with")
+
+	logf.AddFlagsNonDeprecated(logOptions, cmd.Flags())
+
+	// TODO: the controller hard-codes the solver container args, so nothing can
+	// set these on a solver Pod yet. Part of
+	// https://github.com/cert-manager/cert-manager/issues/6021
 
 	return cmd
 }

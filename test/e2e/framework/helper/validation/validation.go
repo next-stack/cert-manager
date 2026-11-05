@@ -17,76 +17,53 @@ limitations under the License.
 package validation
 
 import (
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper/featureset"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper/validation/certificates"
-	"github.com/cert-manager/cert-manager/test/e2e/framework/helper/validation/certificatesigningrequests"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/featureset"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/validation/certificaterequests"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/validation/certificates"
+	"github.com/cert-manager/cert-manager/e2e-tests/framework/helper/validation/certificatesigningrequests"
 )
-
-func DefaultCertificateSet() []certificates.ValidationFunc {
-	return []certificates.ValidationFunc{
-		certificates.ExpectValidKeysInSecret,
-		certificates.ExpectCertificateDNSNamesToMatch,
-		certificates.ExpectCertificateOrganizationToMatch,
-		certificates.ExpectCertificateURIsToMatch,
-		certificates.ExpectCorrectTrustChain,
-		certificates.ExpectCARootCertificate,
-		certificates.ExpectEmailsToMatch,
-		certificates.ExpectValidAnnotations,
-		certificates.ExpectValidCertificate,
-		certificates.ExpectValidCommonName,
-		certificates.ExpectValidNotAfterDate,
-		certificates.ExpectValidPrivateKeyData,
-		certificates.ExpectConditionReadyObservedGeneration,
-		certificates.ExpectValidBasicConstraints,
-		certificates.ExpectValidAdditionalOutputFormats,
-	}
-}
-
-func DefaultCertificateSigningRequestSet() []certificatesigningrequests.ValidationFunc {
-	return []certificatesigningrequests.ValidationFunc{
-		certificatesigningrequests.ExpectValidCertificate,
-		certificatesigningrequests.ExpectCertificateOrganizationToMatch,
-		certificatesigningrequests.ExpectValidPrivateKeyData,
-		certificatesigningrequests.ExpectCertificateDNSNamesToMatch,
-		certificatesigningrequests.ExpectCertificateURIsToMatch,
-		certificatesigningrequests.ExpectCertificateIPsToMatch,
-		certificatesigningrequests.ExpectValidCommonName,
-		certificatesigningrequests.ExpectKeyUsageUsageDigitalSignature,
-		certificatesigningrequests.ExpectEmailsToMatch,
-		certificatesigningrequests.ExpectIsCA,
-		certificatesigningrequests.ExpectConditionApproved,
-		certificatesigningrequests.ExpectConditiotNotDenied,
-		certificatesigningrequests.ExpectConditionNotFailed,
-	}
-}
 
 func CertificateSetForUnsupportedFeatureSet(fs featureset.FeatureSet) []certificates.ValidationFunc {
 	// basics
 	out := []certificates.ValidationFunc{
-		certificates.ExpectValidKeysInSecret,
 		certificates.ExpectCertificateDNSNamesToMatch,
 		certificates.ExpectCertificateOrganizationToMatch,
-		certificates.ExpectValidAnnotations,
 		certificates.ExpectValidCertificate,
-		certificates.ExpectValidCommonName,
-		certificates.ExpectValidNotAfterDate,
 		certificates.ExpectValidPrivateKeyData,
-		certificates.ExpectConditionReadyObservedGeneration,
 		certificates.ExpectValidBasicConstraints,
+
+		certificates.ExpectValidNotAfterDate,
+		certificates.ExpectValidKeysInSecret,
+		certificates.ExpectValidAnnotations,
+		certificates.ExpectValidAdditionalOutputFormats,
+
+		certificates.ExpectConditionReadyObservedGeneration,
 	}
 
-	if !fs.Contains(featureset.URISANsFeature) {
+	if !fs.Has(featureset.CommonNameFeature) {
+		out = append(out, certificates.ExpectValidCommonName)
+	}
+
+	if !fs.Has(featureset.URISANsFeature) {
 		out = append(out, certificates.ExpectCertificateURIsToMatch)
 	}
 
-	if !fs.Contains(featureset.EmailSANsFeature) {
+	if !fs.Has(featureset.EmailSANsFeature) {
 		out = append(out, certificates.ExpectEmailsToMatch)
 	}
 
-	if !fs.Contains(featureset.SaveCAToSecret) {
+	if !fs.Has(featureset.IPAddressFeature) {
+		out = append(out, certificates.ExpectCertificateIPsToMatch)
+	}
+
+	if !fs.Has(featureset.DurationFeature) {
+		out = append(out, certificates.ExpectDurationToMatch)
+	}
+
+	if !fs.Has(featureset.SaveCAToSecret) {
 		out = append(out, certificates.ExpectCorrectTrustChain)
 
-		if !fs.Contains(featureset.SaveRootCAToSecret) {
+		if !fs.Has(featureset.SaveRootCAToSecret) {
 			out = append(out, certificates.ExpectCARootCertificate)
 		}
 	}
@@ -94,12 +71,77 @@ func CertificateSetForUnsupportedFeatureSet(fs featureset.FeatureSet) []certific
 	return out
 }
 
-func CertificateSigningRequestSetForUnsupportedFeatureSet(fs featureset.FeatureSet) []certificatesigningrequests.ValidationFunc {
-	validations := DefaultCertificateSigningRequestSet()
+func CertificateRequestSetForUnsupportedFeatureSet(fs featureset.FeatureSet) []certificaterequests.ValidationFunc {
+	// basics
+	out := []certificaterequests.ValidationFunc{
+		certificaterequests.ExpectCertificateDNSNamesToMatch,
+		certificaterequests.ExpectCertificateOrganizationToMatch,
+		certificaterequests.ExpectValidCertificate,
+		certificaterequests.ExpectValidPrivateKeyData,
+		certificaterequests.ExpectValidBasicConstraints,
 
-	if !fs.Contains(featureset.DurationFeature) {
-		validations = append(validations, certificatesigningrequests.ExpectValidDuration)
+		certificaterequests.ExpectConditionApproved,
+		certificaterequests.ExpectConditionNotDenied,
 	}
 
-	return validations
+	if !fs.Has(featureset.CommonNameFeature) {
+		out = append(out, certificaterequests.ExpectValidCommonName)
+	}
+
+	if !fs.Has(featureset.URISANsFeature) {
+		out = append(out, certificaterequests.ExpectCertificateURIsToMatch)
+	}
+
+	if !fs.Has(featureset.EmailSANsFeature) {
+		out = append(out, certificaterequests.ExpectEmailsToMatch)
+	}
+
+	if !fs.Has(featureset.IPAddressFeature) {
+		out = append(out, certificaterequests.ExpectCertificateIPsToMatch)
+	}
+
+	if !fs.Has(featureset.DurationFeature) {
+		out = append(out, certificaterequests.ExpectDurationToMatch)
+	}
+
+	return out
+}
+
+func CertificateSigningRequestSetForUnsupportedFeatureSet(fs featureset.FeatureSet) []certificatesigningrequests.ValidationFunc {
+	// basics
+	out := []certificatesigningrequests.ValidationFunc{
+		certificatesigningrequests.ExpectCertificateDNSNamesToMatch,
+		certificatesigningrequests.ExpectCertificateOrganizationToMatch,
+		certificatesigningrequests.ExpectValidCertificate,
+		certificatesigningrequests.ExpectValidPrivateKeyData,
+		certificatesigningrequests.ExpectValidBasicConstraints,
+
+		certificatesigningrequests.ExpectKeyUsageUsageDigitalSignature,
+
+		certificatesigningrequests.ExpectConditionApproved,
+		certificatesigningrequests.ExpectConditionNotDenied,
+		certificatesigningrequests.ExpectConditionNotFailed,
+	}
+
+	if !fs.Has(featureset.CommonNameFeature) {
+		out = append(out, certificatesigningrequests.ExpectValidCommonName)
+	}
+
+	if !fs.Has(featureset.URISANsFeature) {
+		out = append(out, certificatesigningrequests.ExpectCertificateURIsToMatch)
+	}
+
+	if !fs.Has(featureset.EmailSANsFeature) {
+		out = append(out, certificatesigningrequests.ExpectEmailsToMatch)
+	}
+
+	if !fs.Has(featureset.IPAddressFeature) {
+		out = append(out, certificatesigningrequests.ExpectCertificateIPsToMatch)
+	}
+
+	if !fs.Has(featureset.DurationFeature) {
+		out = append(out, certificatesigningrequests.ExpectDurationToMatch)
+	}
+
+	return out
 }

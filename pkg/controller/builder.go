@@ -20,8 +20,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
 
 // Builder is used to build controllers that implement the queuingController
@@ -36,11 +34,6 @@ type Builder struct {
 
 	// the actual controller implementation
 	impl queueingController
-
-	// runFirstFuncs are a list of functions that will be called immediately
-	// after the controller has been initialised, once. They are run in queue, sequentially,
-	// and block runDurationFuncs until complete.
-	runFirstFuncs []runFunc
 
 	// runDurationFuncs are a list of functions that will be called every
 	// 'duration'
@@ -71,21 +64,11 @@ func (b *Builder) With(function func(context.Context), duration time.Duration) *
 	return b
 }
 
-// First will register a function that will be called once, after the
-// controller has been initialised. They are queued, run sequentially, and
-// block "With" runDurationFuncs from running until all are complete.
-func (b *Builder) First(function func(context.Context)) *Builder {
-	b.runFirstFuncs = append(b.runFirstFuncs, function)
-	return b
-}
-
 func (b *Builder) Complete() (Interface, error) {
 	controllerctx, err := b.contextFactory.Build(b.name)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx := logf.NewContext(controllerctx.RootContext, logf.Log, b.name)
 
 	if b.impl == nil {
 		return nil, fmt.Errorf("controller implementation must be non-nil")
@@ -95,5 +78,5 @@ func (b *Builder) Complete() (Interface, error) {
 		return nil, fmt.Errorf("error registering controller: %v", err)
 	}
 
-	return NewController(ctx, b.name, controllerctx.Metrics, b.impl.ProcessItem, mustSync, b.runDurationFuncs, queue), nil
+	return NewController(b.name, controllerctx.Metrics, b.impl.ProcessItem, mustSync, b.runDurationFuncs, queue), nil
 }

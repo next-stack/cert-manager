@@ -17,20 +17,18 @@ limitations under the License.
 package certificaterequests
 
 import (
-	"context"
 	"testing"
-	"time"
 
+	internalcertificaterequests "github.com/cert-manager/cert-manager/internal/controller/certificaterequests"
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	testcrypto "github.com/cert-manager/cert-manager/test/unit/crypto"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	fakeclock "k8s.io/utils/clock/testing"
 
-	internalcertificaterequests "github.com/cert-manager/cert-manager/internal/controller/certificaterequests"
-	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/test/integration/framework"
-	testcrypto "github.com/cert-manager/cert-manager/test/unit/crypto"
+	"github.com/cert-manager/cert-manager/integration-tests/framework"
 )
 
 // Test_Apply ensures that the CertificateRequest Apply helpers can set both
@@ -41,25 +39,24 @@ func Test_Apply(t *testing.T) {
 		name      = "test-apply"
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*40)
-	defer cancel()
+	restConfig, stopFn := framework.RunControlPlane(t)
+	t.Cleanup(stopFn)
 
-	restConfig, stopFn := framework.RunControlPlane(t, ctx)
-	defer stopFn()
-
-	kubeClient, _, cmClient, _ := framework.NewClients(t, restConfig)
+	kubeClient, _, cmClient, _, _ := framework.NewClients(t, restConfig)
 
 	t.Log("creating test Namespace")
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-	_, err := kubeClient.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
+	ns := &corev1.Namespace{Name: namespace}
+	_, err := kubeClient.CoreV1().Namespaces().Create(t.Context(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	bundle := testcrypto.MustCreateCryptoBundle(t, &cmapi.Certificate{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Namespace: namespace,
+		Name:      name,
 		Spec: cmapi.CertificateSpec{
 			CommonName: "test-bundle-1",
-			IssuerRef:  cmmeta.ObjectReference{Name: "test-bundle-1"},
-		}},
+			IssuerRef:  cmmeta.IssuerReference{Name: "test-bundle-1"},
+		},
+	},
 		&fakeclock.FakeClock{},
 	)
 	req := bundle.CertificateRequest
@@ -69,17 +66,15 @@ func Test_Apply(t *testing.T) {
 	req.Annotations = nil
 
 	t.Log("creating CertificateRequest")
-	_, err = cmClient.CertmanagerV1().CertificateRequests(namespace).Create(ctx, req, metav1.CreateOptions{FieldManager: "cert-manager-test"})
+	_, err = cmClient.CertmanagerV1().CertificateRequests(namespace).Create(t.Context(), req, metav1.CreateOptions{FieldManager: "cert-manager-test"})
 	assert.NoError(t, err)
 
 	t.Log("ensuring apply will can set annotations and labels")
-	req, err = internalcertificaterequests.Apply(ctx, cmClient, "cert-manager-test", &cmapi.CertificateRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace, Name: name,
-			Annotations: map[string]string{"test-1": "abc", "test-2": "def"},
-			Labels:      map[string]string{"123": "456", "789": "abc"},
-		},
-		Spec: req.Spec,
+	req, err = internalcertificaterequests.Apply(t.Context(), cmClient, "cert-manager-test", &cmapi.CertificateRequest{
+		Namespace: namespace, Name: name,
+		Annotations: map[string]string{"test-1": "abc", "test-2": "def"},
+		Labels:      map[string]string{"123": "456", "789": "abc"},
+		Spec:        req.Spec,
 	})
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"test-1": "abc", "test-2": "def"}, req.Annotations, "annotations")
@@ -87,14 +82,15 @@ func Test_Apply(t *testing.T) {
 
 	t.Log("ensuring apply will can status")
 	assert.NoError(t,
-		internalcertificaterequests.ApplyStatus(ctx, cmClient, "cert-manager-test", &cmapi.CertificateRequest{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		internalcertificaterequests.ApplyStatus(t.Context(), cmClient, "cert-manager-test", &cmapi.CertificateRequest{
+			Namespace: namespace,
+			Name:      name,
 			Status: cmapi.CertificateRequestStatus{
 				Conditions: []cmapi.CertificateRequestCondition{{Type: cmapi.CertificateRequestConditionType("Random"), Status: cmmeta.ConditionTrue, Reason: "reason", Message: "message"}},
 			},
 		}),
 	)
-	req, err = cmClient.CertmanagerV1().CertificateRequests(namespace).Get(ctx, name, metav1.GetOptions{})
+	req, err = cmClient.CertmanagerV1().CertificateRequests(namespace).Get(t.Context(), name, metav1.GetOptions{})
 	assert.NoError(t, err)
 	assert.Equal(t, []cmapi.CertificateRequestCondition{{Type: cmapi.CertificateRequestConditionType("Random"), Status: cmmeta.ConditionTrue, Reason: "reason", Message: "message"}}, req.Status.Conditions)
 }

@@ -18,25 +18,37 @@ package acmeorders
 
 import (
 	"context"
-	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
-	acmeapi "golang.org/x/crypto/acme"
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	coretesting "k8s.io/client-go/testing"
+	"k8s.io/component-base/featuregate"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	fakeclock "k8s.io/utils/clock/testing"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	"github.com/cert-manager/cert-manager/internal/pem"
 	accountstest "github.com/cert-manager/cert-manager/pkg/acme/accounts/test"
 	acmecl "github.com/cert-manager/cert-manager/pkg/acme/client"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
+	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
+	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	schedulertest "github.com/cert-manager/cert-manager/pkg/scheduler/test"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
+	"github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
+	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
 )
 
 func TestSync(t *testing.T) {
@@ -68,7 +80,7 @@ func TestSync(t *testing.T) {
 	}))
 
 	testIssuerHTTP01TestComPreferredChain := gen.Issuer("testissuer", gen.SetIssuerACME(cmacme.ACMEIssuer{
-		PreferredChain: "ISRG Root X1",
+		PreferredChain: "DST Root CA X3", // This is the common name of the root certificate in the testAltCert
 		Solvers: []cmacme.ACMEChallengeSolver{
 			{
 				Selector: &cmacme.CertificateDNSNameSelector{
@@ -83,12 +95,30 @@ func TestSync(t *testing.T) {
 
 	testOrder := gen.Order("testorder",
 		gen.SetOrderCommonName("test.com"),
-		gen.SetOrderIssuer(cmmeta.ObjectReference{
+		gen.SetOrderIssuer(cmmeta.IssuerReference{
 			Name: testIssuerHTTP01TestCom.Name,
 		}),
 	)
 
-	testOrderIP := gen.Order("testorder", gen.SetOrderIssuer(cmmeta.ObjectReference{Name: testIssuerHTTP01.Name}), gen.SetOrderIPAddresses("10.0.0.1"))
+	testOrderIP := gen.Order("testorder",
+		gen.SetOrderCommonName("10.0.0.2"),
+		gen.SetOrderIssuer(cmmeta.IssuerReference{
+			Name: testIssuerHTTP01.Name,
+		}),
+		gen.SetOrderIPAddresses("10.0.0.1"))
+
+	const ipv6AddressOne = "2001:4860:4860::8888"
+	const ipv6AddressTwo = "2001:4860:4860::8844"
+
+	testOrderIPV6 := gen.Order("testorder",
+		gen.SetOrderCommonName(ipv6AddressOne),
+		gen.SetOrderIssuer(cmmeta.IssuerReference{
+			Name: testIssuerHTTP01.Name,
+		}),
+		gen.SetOrderIPAddresses(ipv6AddressTwo))
+
+	testOrderReplacesID := gen.OrderFrom(testOrder,
+		gen.SetOrderReplacesID("testorder-old"))
 
 	pendingStatus := cmacme.OrderStatus{
 		State:       cmacme.Pending,
@@ -144,6 +174,125 @@ func TestSync(t *testing.T) {
 		Detail:     "some error",
 	}
 
+	// testCert is using the following Let's Encrypt chain (X1 is not included):
+	//   leaf -> R3 -> ISRG Root X1
+	testCert := `-----BEGIN CERTIFICATE-----
+MIIEZjCCA06gAwIBAgISAx0TG3o1EufZi/OTOnR9vqt/MA0GCSqGSIb3DQEBCwUA
+MDIxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1MZXQncyBFbmNyeXB0MQswCQYDVQQD
+EwJSMzAeFw0yMzEyMTkxNjIwMjFaFw0yNDAzMTgxNjIwMjBaMBoxGDAWBgNVBAMT
+D2NlcnQtbWFuYWdlci5pbzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCRoMZW8
+FQpb9R2fNhLps2Jms1e058hkiz9PzfyVZT4n0ONmV2OlnNXg7Y3F8v47yc5tq5W6
+8oum8TN+Y2v3u2CjggJXMIICUzAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYI
+KwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFBljJ3oq
+zwwTlkvYYFNit4ol03klMB8GA1UdIwQYMBaAFBQusxe3WFbLrlAJQOYfr52LFMLG
+MFUGCCsGAQUFBwEBBEkwRzAhBggrBgEFBQcwAYYVaHR0cDovL3IzLm8ubGVuY3Iu
+b3JnMCIGCCsGAQUFBzAChhZodHRwOi8vcjMuaS5sZW5jci5vcmcvMF4GA1UdEQRX
+MFWCD2NlcnQtbWFuYWdlci5pb4IUZG9jcy5jZXJ0LW1hbmFnZXIuaW+CF25ldGxp
+ZnkuY2VydC1tYW5hZ2VyLmlvghN3d3cuY2VydC1tYW5hZ2VyLmlvMBMGA1UdIAQM
+MAowCAYGZ4EMAQIBMIIBBgYKKwYBBAHWeQIEAgSB9wSB9ADyAHcASLDja9qmRzQP
+5WoC+p0w6xxSActW3SyB2bu/qznYhHMAAAGMgxfC6wAABAMASDBGAiEA1Ac3K8oT
+EGY509sNj0/hZ4x5Td6aA3HsElojcF0DOMwCIQDxXgjEDmg0vS4u5BHEndIecmHe
+2cMTnTIRM8c9IW0ZTgB3AKLiv9Ye3i8vB6DWTm03p9xlQ7DGtS6i2reK+Jpt9RfY
+AAABjIMXwyAAAAQDAEgwRgIhAI9E0vDiqkNXYqtVmQBxM1Nk6eOmeMtZSGoojfBW
+IsHBAiEA4S+mvJMqrVQ78UtAT+SGJ9Mr6fb/T45rDmID0PDhuXEwDQYJKoZIhvcN
+AQELBQADggEBAJuZ66ArEUG/98Aaz+xYPbpRAfNmllyk9o6exmmZWrAvTBgzCF+D
+T+UN8XtOwVW4lTJGHBsXmY9mGtP4lPehGwSD26fJsHTGZYTUGHFwStHrhbu1tyKc
+hQg/wgviBN0oRsPWcBqMp0jZkHDNUZPq6fmVGXWeX+sx6Cu+iC8BrdQiEzD8DtrJ
+11n6zDjy3mW64D/8MNCGzESbJ9F9N5162Yd3JWHO2eA9FXvcDg6lY2lBitQECqz1
+m8/A7QoPnC9uk/LvEnaqmLbZy7+yK/5+wDbW1y6AbIeo7On1UAXymn5zBTKlEkVm
+Q+Rh9actCRTGKaeLO4ar2i59xZ9OnqZhx9c=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIFFjCCAv6gAwIBAgIRAJErCErPDBinU/bWLiWnX1owDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMjAwOTA0MDAwMDAw
+WhcNMjUwOTE1MTYwMDAwWjAyMQswCQYDVQQGEwJVUzEWMBQGA1UEChMNTGV0J3Mg
+RW5jcnlwdDELMAkGA1UEAxMCUjMwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+AoIBAQC7AhUozPaglNMPEuyNVZLD+ILxmaZ6QoinXSaqtSu5xUyxr45r+XXIo9cP
+R5QUVTVXjJ6oojkZ9YI8QqlObvU7wy7bjcCwXPNZOOftz2nwWgsbvsCUJCWH+jdx
+sxPnHKzhm+/b5DtFUkWWqcFTzjTIUu61ru2P3mBw4qVUq7ZtDpelQDRrK9O8Zutm
+NHz6a4uPVymZ+DAXXbpyb/uBxa3Shlg9F8fnCbvxK/eG3MHacV3URuPMrSXBiLxg
+Z3Vms/EY96Jc5lP/Ooi2R6X/ExjqmAl3P51T+c8B5fWmcBcUr2Ok/5mzk53cU6cG
+/kiFHaFpriV1uxPMUgP17VGhi9sVAgMBAAGjggEIMIIBBDAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMBIGA1UdEwEB/wQIMAYB
+Af8CAQAwHQYDVR0OBBYEFBQusxe3WFbLrlAJQOYfr52LFMLGMB8GA1UdIwQYMBaA
+FHm0WeZ7tuXkAXOACIjIGlj26ZtuMDIGCCsGAQUFBwEBBCYwJDAiBggrBgEFBQcw
+AoYWaHR0cDovL3gxLmkubGVuY3Iub3JnLzAnBgNVHR8EIDAeMBygGqAYhhZodHRw
+Oi8veDEuYy5sZW5jci5vcmcvMCIGA1UdIAQbMBkwCAYGZ4EMAQIBMA0GCysGAQQB
+gt8TAQEBMA0GCSqGSIb3DQEBCwUAA4ICAQCFyk5HPqP3hUSFvNVneLKYY611TR6W
+PTNlclQtgaDqw+34IL9fzLdwALduO/ZelN7kIJ+m74uyA+eitRY8kc607TkC53wl
+ikfmZW4/RvTZ8M6UK+5UzhK8jCdLuMGYL6KvzXGRSgi3yLgjewQtCPkIVz6D2QQz
+CkcheAmCJ8MqyJu5zlzyZMjAvnnAT45tRAxekrsu94sQ4egdRCnbWSDtY7kh+BIm
+lJNXoB1lBMEKIq4QDUOXoRgffuDghje1WrG9ML+Hbisq/yFOGwXD9RiX8F6sw6W4
+avAuvDszue5L3sz85K+EC4Y/wFVDNvZo4TYXao6Z0f+lQKc0t8DQYzk1OXVu8rp2
+yJMC6alLbBfODALZvYH7n7do1AZls4I9d1P4jnkDrQoxB3UqQ9hVl3LEKQ73xF1O
+yK5GhDDX8oVfGKF5u+decIsH4YaTw7mP3GFxJSqv3+0lUFJoi5Lc5da149p90Ids
+hCExroL1+7mryIkXPeFM5TgO9r0rvZaBFOvV2z0gp35Z0+L4WPlbuEjN/lxPFin+
+HlUjr8gRsI3qfJOQFy/9rKIJR0Y/8Omwt/8oTWgy1mdeHmmjk7j1nYsvC9JSQ6Zv
+MldlTTKB3zhThV1+XWYp6rjd5JW1zbVWEkLNxE7GJThEUG3szgBVGP7pSWTUTsqX
+nLRbwHOoq7hHwg==
+-----END CERTIFICATE-----
+`
+
+	// testCert is using the following Let's Encrypt chain (DST Root CA X3 is not included):
+	//   leaf -> R3 -> ISRG Root X1 -> DST Root CA X3
+	testAltCert := testCert + `-----BEGIN CERTIFICATE-----
+MIIFYDCCBEigAwIBAgIQQAF3ITfU6UK47naqPGQKtzANBgkqhkiG9w0BAQsFADA/
+MSQwIgYDVQQKExtEaWdpdGFsIFNpZ25hdHVyZSBUcnVzdCBDby4xFzAVBgNVBAMT
+DkRTVCBSb290IENBIFgzMB4XDTIxMDEyMDE5MTQwM1oXDTI0MDkzMDE4MTQwM1ow
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwggIiMA0GCSqGSIb3DQEB
+AQUAA4ICDwAwggIKAoICAQCt6CRz9BQ385ueK1coHIe+3LffOJCMbjzmV6B493XC
+ov71am72AE8o295ohmxEk7axY/0UEmu/H9LqMZshftEzPLpI9d1537O4/xLxIZpL
+wYqGcWlKZmZsj348cL+tKSIG8+TA5oCu4kuPt5l+lAOf00eXfJlII1PoOK5PCm+D
+LtFJV4yAdLbaL9A4jXsDcCEbdfIwPPqPrt3aY6vrFk/CjhFLfs8L6P+1dy70sntK
+4EwSJQxwjQMpoOFTJOwT2e4ZvxCzSow/iaNhUd6shweU9GNx7C7ib1uYgeGJXDR5
+bHbvO5BieebbpJovJsXQEOEO3tkQjhb7t/eo98flAgeYjzYIlefiN5YNNnWe+w5y
+sR2bvAP5SQXYgd0FtCrWQemsAXaVCg/Y39W9Eh81LygXbNKYwagJZHduRze6zqxZ
+Xmidf3LWicUGQSk+WT7dJvUkyRGnWqNMQB9GoZm1pzpRboY7nn1ypxIFeFntPlF4
+FQsDj43QLwWyPntKHEtzBRL8xurgUBN8Q5N0s8p0544fAQjQMNRbcTa0B7rBMDBc
+SLeCO5imfWCKoqMpgsy6vYMEG6KDA0Gh1gXxG8K28Kh8hjtGqEgqiNx2mna/H2ql
+PRmP6zjzZN7IKw0KKP/32+IVQtQi0Cdd4Xn+GOdwiK1O5tmLOsbdJ1Fu/7xk9TND
+TwIDAQABo4IBRjCCAUIwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw
+SwYIKwYBBQUHAQEEPzA9MDsGCCsGAQUFBzAChi9odHRwOi8vYXBwcy5pZGVudHJ1
+c3QuY29tL3Jvb3RzL2RzdHJvb3RjYXgzLnA3YzAfBgNVHSMEGDAWgBTEp7Gkeyxx
++tvhS5B1/8QVYIWJEDBUBgNVHSAETTBLMAgGBmeBDAECATA/BgsrBgEEAYLfEwEB
+ATAwMC4GCCsGAQUFBwIBFiJodHRwOi8vY3BzLnJvb3QteDEubGV0c2VuY3J5cHQu
+b3JnMDwGA1UdHwQ1MDMwMaAvoC2GK2h0dHA6Ly9jcmwuaWRlbnRydXN0LmNvbS9E
+U1RST09UQ0FYM0NSTC5jcmwwHQYDVR0OBBYEFHm0WeZ7tuXkAXOACIjIGlj26Ztu
+MA0GCSqGSIb3DQEBCwUAA4IBAQAKcwBslm7/DlLQrt2M51oGrS+o44+/yQoDFVDC
+5WxCu2+b9LRPwkSICHXM6webFGJueN7sJ7o5XPWioW5WlHAQU7G75K/QosMrAdSW
+9MUgNTP52GE24HGNtLi1qoJFlcDyqSMo59ahy2cI2qBDLKobkx/J3vWraV0T9VuG
+WCLKTVXkcGdtwlfFRjlBz4pYg1htmf5X6DYO8A4jqv2Il9DjXA6USbW1FzXSLr9O
+he8Y4IWS6wY7bCkjCWDcRQJMEhg76fsO3txE+FiYruq9RUWhiF1myv4Q6W+CyBFC
+Dfvp7OOGAN6dEOM4+qR9sdjoSYKEBpsr6GtPAQw4dy753ec5
+-----END CERTIFICATE-----
+`
+
+	decodeAll := func(pemBytes []byte) [][]byte {
+		var blocks [][]byte
+		for {
+			block, rest, _ := pem.SafeDecodeCertificateBundle(pemBytes)
+			if block == nil {
+				break
+			}
+
+			blocks = append(blocks, block.Bytes)
+			pemBytes = rest
+		}
+		return blocks
+	}
+
+	rawTestCert := decodeAll([]byte(testCert))
+	if _, err := pki.ParseSingleCertificateChainPEM([]byte(testCert)); err != nil {
+		t.Fatalf("error parsing test certificate: %v", err)
+	}
+
+	rawTestAltCert := decodeAll([]byte(testAltCert))
+	if _, err := pki.ParseSingleCertificateChainPEM([]byte(testAltCert)); err != nil {
+		t.Fatalf("error parsing test certificate: %v", err)
+	}
+
 	testOrderPending := gen.OrderFrom(testOrder, gen.SetOrderStatus(pendingStatus))
 	testOrderInvalid := testOrderPending.DeepCopy()
 	testOrderInvalid.Status.State = cmacme.Invalid
@@ -154,51 +303,13 @@ func TestSync(t *testing.T) {
 	testOrderValid := testOrderPending.DeepCopy()
 	testOrderValid.Status.State = cmacme.Valid
 	// pem encoded word 'test'
-	testOrderValid.Status.Certificate = []byte(`-----BEGIN CERTIFICATE-----
-dGVzdA==
------END CERTIFICATE-----
-`)
+	testOrderValid.Status.Certificate = []byte(testCert)
 	testOrderReady := testOrderPending.DeepCopy()
 	testOrderReady.Status.State = cmacme.Ready
 
-	testCert := []byte(`-----BEGIN CERTIFICATE-----
-MIIFjTCCA3WgAwIBAgIRANOxciY0IzLc9AUoUSrsnGowDQYJKoZIhvcNAQELBQAw
-TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
-cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTYxMDA2MTU0MzU1
-WhcNMjExMDA2MTU0MzU1WjBKMQswCQYDVQQGEwJVUzEWMBQGA1UEChMNTGV0J3Mg
-RW5jcnlwdDEjMCEGA1UEAxMaTGV0J3MgRW5jcnlwdCBBdXRob3JpdHkgWDMwggEi
-MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCc0wzwWuUuR7dyXTeDs2hjMOrX
-NSYZJeG9vjXxcJIvt7hLQQWrqZ41CFjssSrEaIcLo+N15Obzp2JxunmBYB/XkZqf
-89B4Z3HIaQ6Vkc/+5pnpYDxIzH7KTXcSJJ1HG1rrueweNwAcnKx7pwXqzkrrvUHl
-Npi5y/1tPJZo3yMqQpAMhnRnyH+lmrhSYRQTP2XpgofL2/oOVvaGifOFP5eGr7Dc
-Gu9rDZUWfcQroGWymQQ2dYBrrErzG5BJeC+ilk8qICUpBMZ0wNAxzY8xOJUWuqgz
-uEPxsR/DMH+ieTETPS02+OP88jNquTkxxa/EjQ0dZBYzqvqEKbbUC8DYfcOTAgMB
-AAGjggFnMIIBYzAOBgNVHQ8BAf8EBAMCAYYwEgYDVR0TAQH/BAgwBgEB/wIBADBU
-BgNVHSAETTBLMAgGBmeBDAECATA/BgsrBgEEAYLfEwEBATAwMC4GCCsGAQUFBwIB
-FiJodHRwOi8vY3BzLnJvb3QteDEubGV0c2VuY3J5cHQub3JnMB0GA1UdDgQWBBSo
-SmpjBH3duubRObemRWXv86jsoTAzBgNVHR8ELDAqMCigJqAkhiJodHRwOi8vY3Js
-LnJvb3QteDEubGV0c2VuY3J5cHQub3JnMHIGCCsGAQUFBwEBBGYwZDAwBggrBgEF
-BQcwAYYkaHR0cDovL29jc3Aucm9vdC14MS5sZXRzZW5jcnlwdC5vcmcvMDAGCCsG
-AQUFBzAChiRodHRwOi8vY2VydC5yb290LXgxLmxldHNlbmNyeXB0Lm9yZy8wHwYD
-VR0jBBgwFoAUebRZ5nu25eQBc4AIiMgaWPbpm24wDQYJKoZIhvcNAQELBQADggIB
-ABnPdSA0LTqmRf/Q1eaM2jLonG4bQdEnqOJQ8nCqxOeTRrToEKtwT++36gTSlBGx
-A/5dut82jJQ2jxN8RI8L9QFXrWi4xXnA2EqA10yjHiR6H9cj6MFiOnb5In1eWsRM
-UM2v3e9tNsCAgBukPHAg1lQh07rvFKm/Bz9BCjaxorALINUfZ9DD64j2igLIxle2
-DPxW8dI/F2loHMjXZjqG8RkqZUdoxtID5+90FgsGIfkMpqgRS05f4zPbCEHqCXl1
-eO5HyELTgcVlLXXQDgAWnRzut1hFJeczY1tjQQno6f6s+nMydLN26WuU4s3UYvOu
-OsUxRlJu7TSRHqDC3lSE5XggVkzdaPkuKGQbGpny+01/47hfXXNB7HntWNZ6N2Vw
-p7G6OfY+YQrZwIaQmhrIqJZuigsrbe3W+gdn5ykE9+Ky0VgVUsfxo52mwFYs1JKY
-2PGDuWx8M6DlS6qQkvHaRUo0FMd8TsSlbF0/v965qGFKhSDeQoMpYnwcmQilRh/0
-ayLThlHLN81gSkJjVrPI0Y8xCVPB4twb1PFUd2fPM3sA1tJ83sZ5v8vgFv2yofKR
-PB0t6JzUA81mSqM3kxl5e+IZwhYAyO0OTg3/fs8HqGTNKd9BqoUwSRBzp06JMg5b
-rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
------END CERTIFICATE-----
-`)
-	rawTestCert, _ := pem.Decode(testCert)
-
 	testOrderValidAltCert := gen.OrderFrom(testOrder, gen.SetOrderStatus(pendingStatus))
 	testOrderValidAltCert.Status.State = cmacme.Valid
-	testOrderValidAltCert.Status.Certificate = testCert
+	testOrderValidAltCert.Status.Certificate = []byte(testAltCert)
 
 	fakeHTTP01ACMECl := &acmecl.FakeACME{
 		FakeHTTP01ChallengeResponse: func(s string) (string, error) {
@@ -206,10 +317,15 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 			return "key", nil
 		},
 	}
-	testAuthorizationChallenge, err := buildChallenge(context.TODO(), fakeHTTP01ACMECl, testIssuerHTTP01TestCom, testOrderPending, testOrderPending.Status.Authorizations[0])
+	testAuthorizationChallenge, err := buildPartialChallenge(t.Context(), testIssuerHTTP01TestCom, testOrderPending, testOrderPending.Status.Authorizations[0])
 	if err != nil {
 		t.Fatalf("error building Challenge resource test fixture: %v", err)
 	}
+	key, err := fakeHTTP01ACMECl.FakeHTTP01ChallengeResponse(testAuthorizationChallenge.Spec.Token)
+	if err != nil {
+		t.Fatalf("error building Challenge resource test fixture: %v", err)
+	}
+	testAuthorizationChallenge.Spec.Key = key
 	testAuthorizationChallengeValid := testAuthorizationChallenge.DeepCopy()
 	testAuthorizationChallengeValid.Status.State = cmacme.Valid
 	testAuthorizationChallengeInvalid := testAuthorizationChallenge.DeepCopy()
@@ -245,6 +361,7 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 	testACMEOrderValid := &acmeapi.Order{}
 	*testACMEOrderValid = *testACMEOrderPending
 	testACMEOrderValid.Status = acmeapi.StatusValid
+	testACMEOrderValid.CertURL = "http://testurl"
 	// shallow copy
 	testACMEOrderReady := &acmeapi.Order{}
 	*testACMEOrderReady = *testACMEOrderPending
@@ -291,7 +408,7 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				},
 			},
 		},
-		"create a new order with the acme server with an IP address": {
+		"create a new order with the acme server with an IPv4 address": {
 			order: testOrderIP,
 			builder: &testpkg.Builder{
 				CertManagerObjects: []runtime.Object{testIssuerHTTP01, testOrderIP},
@@ -316,6 +433,53 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 					if id[0].Value != "10.0.0.1" || id[0].Type != "ip" {
 						return nil, errors.New("AuthzID needs to be the IP")
 					}
+					if id[1].Value != "10.0.0.2" || id[1].Type != "ip" {
+						return nil, errors.New("AuthzID needs to be the IP")
+					}
+					return testACMEOrderPending, nil
+				},
+				FakeGetAuthorization: func(ctx context.Context, url string) (*acmeapi.Authorization, error) {
+					if url != "http://authzurl" {
+						return nil, fmt.Errorf("Invalid URL: expected http://authzurl got %q", url)
+					}
+					return testACMEAuthorizationPending, nil
+				},
+				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
+					// TODO: assert s = "token"
+					return "key", nil
+				},
+			},
+		},
+		"create a new order with the acme server with an IPv6 address": {
+			order: testOrderIPV6,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01, testOrderIPV6},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(cmacme.SchemeGroupVersion.WithResource("orders"),
+						"status",
+						testOrderPending.Namespace,
+						gen.OrderFrom(testOrderIPV6, gen.SetOrderStatus(cmacme.OrderStatus{
+							State:       cmacme.Pending,
+							URL:         "http://testurl.com/abcde",
+							FinalizeURL: "http://testurl.com/abcde/finalize",
+							Authorizations: []cmacme.ACMEAuthorization{
+								{
+									URL: "http://authzurl",
+								},
+							},
+						})))),
+				},
+			},
+			acmeClient: &acmecl.FakeACME{
+				FakeAuthorizeOrder: func(ctx context.Context, id []acmeapi.AuthzID, opt ...acmeapi.OrderOption) (*acmeapi.Order, error) {
+					if id[0].Value != ipv6AddressTwo || id[0].Type != "ip" {
+						return nil, fmt.Errorf("AuthzID 1 needs to be expected IPv6 address: wanted value=%s but got %s", ipv6AddressTwo, id[0].Value)
+					}
+
+					if id[1].Value != ipv6AddressOne || id[1].Type != "ip" {
+						return nil, fmt.Errorf("AuthzID 2 needs to be expected IPv6 address: wanted value=%s but got %s", ipv6AddressOne, id[1].Value)
+					}
+
 					return testACMEOrderPending, nil
 				},
 				FakeGetAuthorization: func(ctx context.Context, url string) (*acmeapi.Authorization, error) {
@@ -338,7 +502,8 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 					testpkg.NewAction(coretesting.NewCreateAction(cmacme.SchemeGroupVersion.WithResource("challenges"), testAuthorizationChallenge.Namespace, testAuthorizationChallenge)),
 				},
 				ExpectedEvents: []string{
-					`Normal Created Created Challenge resource "testorder-2179654896" for domain "test.com"`,
+					//nolint: dupword
+					`Normal Created Created Challenge resource "testorder-2580184217" for domain "test.com"`,
 				},
 			},
 			acmeClient: &acmecl.FakeACME{
@@ -490,9 +655,6 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				ExpectedActions:    []testpkg.Action{},
 			},
 			acmeClient: &acmecl.FakeACME{
-				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
-					return testACMEOrderPending, nil
-				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
 					// TODO: assert s = "token"
 					return "key", nil
@@ -536,9 +698,12 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
 					return testACMEOrderValid, nil
 				},
-				FakeCreateOrderCert: func(_ context.Context, url string, csr []byte, bundle bool) ([][]byte, string, error) {
-					testData := []byte("test")
-					return [][]byte{testData}, "http://testurl", nil
+				FakeCreateCertFromOrder: func(_ context.Context, order *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
+					if order.URI != testOrderReady.Status.URL || order.FinalizeURL != testOrderReady.Status.FinalizeURL {
+						return nil, "", fmt.Errorf("Invalid order: expected URI %q and FinalizeURL %q, got %q and %q",
+							testOrderReady.Status.URL, testOrderReady.Status.FinalizeURL, order.URI, order.FinalizeURL)
+					}
+					return rawTestCert, testACMEOrderValid.CertURL, nil
 				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
 					// TODO: assert s = "token"
@@ -560,7 +725,7 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
 					return testACMEOrderReady, nil
 				},
-				FakeCreateOrderCert: func(_ context.Context, url string, csr []byte, bundle bool) ([][]byte, string, error) {
+				FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
 					return nil, "", &acmeError429
 				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
@@ -579,7 +744,7 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
 					return testACMEOrderReady, nil
 				},
-				FakeCreateOrderCert: func(_ context.Context, url string, csr []byte, bundle bool) ([][]byte, string, error) {
+				FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
 					return nil, "", errors.New("some error")
 				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
@@ -606,7 +771,7 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
 					return testACMEOrderValid, nil
 				},
-				FakeCreateOrderCert: func(_ context.Context, url string, csr []byte, bundle bool) ([][]byte, string, error) {
+				FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
 					return nil, "", &acmeError403
 				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
@@ -614,7 +779,13 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 					return "key", nil
 				},
 				FakeFetchCert: func(_ context.Context, url string, bundle bool) ([][]byte, error) {
-					return [][]byte{[]byte("test")}, nil
+					if url != testACMEOrderValid.CertURL {
+						return nil, errors.New("Cert URL is incorrect")
+					}
+					if !bundle {
+						return nil, errors.New("Expecting to be called with bundle=true")
+					}
+					return rawTestCert, nil
 				},
 			},
 			expectErr: false,
@@ -636,7 +807,7 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
 					return testACMEOrderValid, nil
 				},
-				FakeCreateOrderCert: func(_ context.Context, url string, csr []byte, bundle bool) ([][]byte, string, error) {
+				FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
 					return nil, "", &acmeError403
 				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
@@ -644,24 +815,22 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 					return "key", nil
 				},
 				FakeListCertAlternates: func(_ context.Context, url string) ([]string, error) {
+					if url != testACMEOrderValid.CertURL {
+						return nil, errors.New("Cert URL is incorrect")
+					}
 					return []string{"http://alturl"}, nil
-
 				},
 				FakeFetchCert: func(_ context.Context, url string, bundle bool) ([][]byte, error) {
-					if url != "http://alturl" {
-						// This bit just ensures that we
-						// call it from the correct
-						// place. This is the same URL
-						// that is returned from
-						// FakeCertAlternates that
-						// should have been called
-						// before this.
+					if url != testACMEOrderValid.CertURL && url != "http://alturl" {
 						return nil, errors.New("Cert URL is incorrect")
 					}
 					if !bundle {
 						return nil, errors.New("Expecting to be called with bundle=true")
 					}
-					return [][]byte{rawTestCert.Bytes}, nil
+					if url == testACMEOrderValid.CertURL {
+						return rawTestCert, nil
+					}
+					return rawTestAltCert, nil
 				},
 			},
 			expectErr: false,
@@ -683,32 +852,58 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
 					return testACMEOrderValid, nil
 				},
-				FakeCreateOrderCert: func(_ context.Context, url string, csr []byte, bundle bool) ([][]byte, string, error) {
-					testData := []byte("test")
-					return [][]byte{testData}, "http://testurl", nil
+				FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
+					return rawTestCert, testACMEOrderValid.CertURL, nil
 				},
 				FakeListCertAlternates: func(_ context.Context, url string) ([]string, error) {
-					if url != "http://testurl" {
+					if url != testACMEOrderValid.CertURL {
 						return nil, errors.New("Cert URL is incorrect")
 					}
 					return []string{"http://alturl"}, nil
-
 				},
 				FakeFetchCert: func(_ context.Context, url string, bundle bool) ([][]byte, error) {
 					if url != "http://alturl" {
-						// This bit just ensures that we
-						// call it from the correct
-						// place. This is the same URL
-						// that is returned from
-						// FakeCertAlternates that
-						// should have been called
-						// before this.
-						return nil, errors.New("Cert URL is incorrect")
+						return nil, errors.New("Cert URL is incorrect: expected http://alturl got " + url)
 					}
 					if !bundle {
 						return nil, errors.New("Expecting to be called with bundle=true")
 					}
-					return [][]byte{rawTestCert.Bytes}, nil
+					return rawTestAltCert, nil
+				},
+				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
+					// TODO: assert s = "token"
+					return "key", nil
+				},
+			},
+		},
+		"preferred chain is default cert chain": {
+			order: testOrderReady.DeepCopy(),
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{
+					gen.IssuerFrom(testIssuerHTTP01TestComPreferredChain, gen.SetIssuerACMEPreferredChain("ISRG Root X1")),
+					testOrderReady, testAuthorizationChallengeValid,
+				},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(cmacme.SchemeGroupVersion.WithResource("orders"),
+						"status",
+						testOrderValid.Namespace, testOrderValid)),
+				},
+				ExpectedEvents: []string{
+					"Normal Complete Order completed successfully",
+				},
+			},
+			acmeClient: &acmecl.FakeACME{
+				FakeGetOrder: func(_ context.Context, url string) (*acmeapi.Order, error) {
+					return testACMEOrderValid, nil
+				},
+				FakeCreateCertFromOrder: func(_ context.Context, _ *acmeapi.Order, csr []byte, bundle bool) ([][]byte, string, error) {
+					return rawTestCert, testACMEOrderValid.CertURL, nil
+				},
+				FakeListCertAlternates: func(_ context.Context, url string) ([]string, error) {
+					return nil, errors.New("should not be called")
+				},
+				FakeFetchCert: func(_ context.Context, url string, bundle bool) ([][]byte, error) {
+					return nil, errors.New("should not be called")
 				},
 				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
 					// TODO: assert s = "token"
@@ -775,10 +970,112 @@ rUCGwbCUDI0mxadJ3Bz4WxR6fyNpBK2yAinWEsikxqEt
 			},
 			acmeClient: &acmecl.FakeACME{},
 		},
+		"acme-profiles:profiles-not-implemented": {
+			// Simulate an attempt to create an order with a profile on an ACME
+			// server which does not support profiles.
+			order: testOrder,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01, testOrderPending},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(
+						coretesting.NewUpdateSubresourceAction(
+							cmacme.SchemeGroupVersion.WithResource("orders"),
+							"status",
+							testOrderPending.Namespace,
+							gen.OrderFrom(
+								testOrderErrored,
+								gen.SetOrderReason("Failed to create Order: acme: certificate authority does not support profiles"),
+							),
+						)),
+				},
+			},
+			acmeClient: &acmecl.FakeACME{
+				FakeAuthorizeOrder: func(ctx context.Context, id []acmeapi.AuthzID, opt ...acmeapi.OrderOption) (*acmeapi.Order, error) {
+					return nil, acmeapi.ErrCADoesNotSupportProfiles
+				},
+			},
+		},
+		"acme-profiles:profile-not-supported": {
+			// Simulate an attempt to create an order with a profile which the
+			// ACME server does not provide.
+			order: testOrder,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01, testOrderPending},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(
+						coretesting.NewUpdateSubresourceAction(
+							cmacme.SchemeGroupVersion.WithResource("orders"),
+							"status",
+							testOrderPending.Namespace,
+							gen.OrderFrom(
+								testOrderErrored,
+								gen.SetOrderReason("Failed to create Order: acme: certificate authority does not advertise a profile with name"),
+							),
+						)),
+				},
+			},
+			acmeClient: &acmecl.FakeACME{
+				FakeAuthorizeOrder: func(ctx context.Context, id []acmeapi.AuthzID, opt ...acmeapi.OrderOption) (*acmeapi.Order, error) {
+					return nil, acmeapi.ErrProfileNotInSetOfSupportedProfiles
+				},
+			},
+		},
+		"create order with replaces id of the certificate that is being renewed": {
+			order: testOrderReplacesID,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01TestCom, testOrderReplacesID},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(cmacme.SchemeGroupVersion.WithResource("orders"),
+						"status",
+						testOrderPending.Namespace,
+						gen.OrderFrom(testOrderReplacesID, gen.SetOrderStatus(cmacme.OrderStatus{
+							State:       cmacme.Pending,
+							URL:         "http://testurl.com/abcde",
+							FinalizeURL: "http://testurl.com/abcde/finalize",
+							Authorizations: []cmacme.ACMEAuthorization{
+								{
+									URL: "http://authzurl",
+								},
+							},
+						})))),
+				},
+			},
+			featureGates: map[featuregate.Feature]bool{feature.ACMEUseARI: true},
+			acmeClient: &acmecl.FakeACME{
+				FakeDiscover: func(ctx context.Context) (acmeapi.Directory, error) {
+					return acmeapi.Directory{RenewalInfo: "http://testurl.com/renewalInfo"}, nil
+				},
+				FakeAuthorizeOrder: func(ctx context.Context, id []acmeapi.AuthzID, opt ...acmeapi.OrderOption) (*acmeapi.Order, error) {
+					foundReplaces := false
+					for _, o := range opt {
+						v := reflect.ValueOf(o)
+						if v.Kind() == reflect.String && v.String() == "testorder-old" {
+							foundReplaces = true
+						}
+					}
+					if !foundReplaces {
+						return nil, errors.New("expected replaces option to be set on AuthorizeOrder call")
+					}
+					return testACMEOrderPending, nil
+				},
+				FakeGetAuthorization: func(ctx context.Context, url string) (*acmeapi.Authorization, error) {
+					if url != "http://authzurl" {
+						return nil, fmt.Errorf("Invalid URL: expected http://authzurl got %q", url)
+					}
+					return testACMEAuthorizationPending, nil
+				},
+				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
+					return "key", nil
+				},
+			},
+		},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
+			for gate, value := range test.featureGates {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, gate, value)
+			}
 			// reset the fixedClock at the start of each test
 			fixedClock.SetTime(nowTime)
 			// always use the fixedClock unless otherwise specified
@@ -796,6 +1093,7 @@ type testT struct {
 	acmeClient     acmecl.Interface
 	shouldSchedule bool
 	expectErr      bool
+	featureGates   map[featuregate.Feature]bool
 }
 
 func runTest(t *testing.T, test testT) {
@@ -817,7 +1115,7 @@ func runTest(t *testing.T, test testT) {
 	}
 	gotScheduled := false
 	fakeScheduler := schedulertest.FakeScheduler{
-		AddFunc: func(obj interface{}, duration time.Duration) {
+		AddFunc: func(obj types.NamespacedName, duration time.Duration) {
 			gotScheduled = true
 		},
 	}
@@ -825,7 +1123,7 @@ func runTest(t *testing.T, test testT) {
 
 	test.builder.Start()
 
-	err = cw.Sync(context.Background(), test.order)
+	err = cw.Sync(t.Context(), test.order)
 	if err != nil && !test.expectErr {
 		t.Errorf("Expected function to not error, but got: %v", err)
 	}
@@ -837,4 +1135,160 @@ func runTest(t *testing.T, test testT) {
 	}
 
 	test.builder.CheckAndFinish(err)
+}
+
+func TestFinalizeOrder(t *testing.T) {
+	tests := map[string]struct {
+		cl               acmecl.Interface
+		o                *cmacme.Order
+		createRequestLog string
+		getOrderLog      string
+		logCount         int
+	}{
+		"CreateOrderRequest - Succeed, UpdateOrderStatus - Succeed": {
+			cl: &acmecl.FakeACME{
+				FakeCreateCertFromOrder: func(ctx context.Context, order *acmeapi.Order, csr []byte, bundle bool) (der [][]byte, certURL string, err error) {
+					return nil, "", nil
+				},
+				FakeGetOrder: func(ctx context.Context, url string) (*acmeapi.Order, error) {
+					return nil, nil
+				},
+			},
+			o: &cmacme.Order{
+				Spec: cmacme.OrderSpec{
+					DNSNames: []string{
+						"example.com",
+					},
+					IPAddresses: []string{
+						"1.2.3.4",
+					},
+				},
+			},
+			logCount: 0,
+		},
+		"CreateOrderRequest - Fail, UpdateOrderStatus - Succeed": {
+			cl: &acmecl.FakeACME{
+				FakeCreateCertFromOrder: func(ctx context.Context, order *acmeapi.Order, csr []byte, bundle bool) (der [][]byte, certURL string, err error) {
+					return nil, "", &acmeapi.Error{
+						StatusCode: 500,
+						Header: http.Header{
+							"header1": []string{"header2"},
+						},
+					}
+				},
+			},
+			o: &cmacme.Order{
+				Spec: cmacme.OrderSpec{
+					DNSNames: []string{
+						"example.com",
+					},
+					IPAddresses: []string{
+						"1.2.3.4",
+					},
+				},
+			},
+			createRequestLog: "acme server fatal error err=\"500 : \" [errorCode 500 dnsNames [example.com] ipAddresses [1.2.3.4] responseHeaders map[header1:[header2]]]",
+			logCount:         1,
+		},
+		"CreateOrderRequest - Fail, UpdateOrderStatus - Fail": {
+			cl: &acmecl.FakeACME{
+				FakeCreateCertFromOrder: func(ctx context.Context, order *acmeapi.Order, csr []byte, bundle bool) (der [][]byte, certURL string, err error) {
+					return nil, "", &acmeapi.Error{
+						StatusCode: 501,
+						Header: http.Header{
+							"header1": []string{"header2"},
+						},
+					}
+				},
+				FakeGetOrder: func(ctx context.Context, url string) (*acmeapi.Order, error) {
+					return nil, &acmeapi.Error{
+						StatusCode: 502,
+						Header: http.Header{
+							"header3": []string{"header4"},
+						},
+					}
+				},
+			},
+			o: &cmacme.Order{
+				Spec: cmacme.OrderSpec{
+					DNSNames: []string{
+						"example.com",
+					},
+					IPAddresses: []string{
+						"1.2.3.4",
+					},
+				},
+				Status: cmacme.OrderStatus{
+					URL: "example@example.com",
+				},
+			},
+			createRequestLog: "acme server fatal error err=\"501 : \" [errorCode 501 dnsNames [example.com] ipAddresses [1.2.3.4] responseHeaders map[header1:[header2]]]",
+			getOrderLog:      "acme server fatal error err=\"502 : \" [errorCode 502 dnsNames [example.com] ipAddresses [1.2.3.4] responseHeaders map[header3:[header4]]]",
+			logCount:         2,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			s := newFakeLogSink()
+			logger := logr.New(s)
+			ctx := context.Background()
+			ctx = logf.NewContext(ctx, logger)
+
+			i := &v1.Issuer{}
+			cw := &controllerWrapper{}
+
+			_ = cw.finalizeOrder(ctx, test.cl, test.o, i)
+			if len(s.errMessages) != test.logCount {
+				t.Errorf("Unexpected error message count. Expected %d, got %d", test.logCount, len(s.errMessages))
+			}
+
+			if test.createRequestLog != "" && s.errMessages[0] != test.createRequestLog {
+				t.Errorf("Incorrect log message got %q, expected %q", s.errMessages[0], test.createRequestLog)
+			}
+			if test.getOrderLog != "" && s.errMessages[1] != test.getOrderLog {
+				t.Errorf("Incorrect log message got %q, expected %q", s.errMessages[1], test.getOrderLog)
+			}
+		})
+	}
+}
+
+type fakeLogSink struct {
+	messages    []string
+	errMessages []string
+}
+
+func (l *fakeLogSink) Init(info logr.RuntimeInfo) {
+}
+
+func (l *fakeLogSink) Enabled(level int) bool {
+	return true
+}
+
+func (l *fakeLogSink) WithValues(keysAndValues ...any) logr.LogSink {
+	return l
+}
+
+func (l *fakeLogSink) WithName(name string) logr.LogSink {
+	return l
+}
+
+func newFakeLogSink() *fakeLogSink {
+	return &fakeLogSink{}
+}
+
+func (l *fakeLogSink) Info(level int, msg string, keysAndValues ...any) {
+	l.messages = append(l.messages, fmt.Sprintf("%s %s", msg, keysAndValues))
+}
+
+func (l *fakeLogSink) Error(err error, msg string, keysAndValues ...any) {
+	l.errMessages = append(l.errMessages, fmt.Sprintf("%s err=%q %v", msg, err, keysAndValues))
+}
+
+func (l *fakeLogSink) String() string {
+	out := make([]string, len(l.messages))
+	for i := range l.messages {
+		out[i] = "\t-" + l.messages[i]
+	}
+	return strings.Join(out, "\n")
 }

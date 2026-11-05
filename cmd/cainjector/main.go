@@ -18,35 +18,29 @@ package main
 
 import (
 	"context"
-	"flag"
 
-	"os"
-
+	"github.com/cert-manager/cert-manager/internal/cmd/util"
+	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/cert-manager/cert-manager/cmd/cainjector/app"
-	"github.com/cert-manager/cert-manager/cmd/util"
-	logf "github.com/cert-manager/cert-manager/pkg/logs"
+	"github.com/cert-manager/cert-manager/cainjector-binary/app"
 )
 
 func main() {
 	// Set up signal handlers and a cancellable context which gets cancelled on
 	// when either SIGINT or SIGTERM are received.
-	stopCh, exit := util.SetupExitHandler(util.GracefulShutdown)
+	ctx, exit := util.SetupExitHandler(context.Background(), util.GracefulShutdown)
 	defer exit() // This function might call os.Exit, so defer last
 
-	logf.InitLogs(flag.CommandLine)
+	logf.InitLogs()
 	defer logf.FlushLogs()
 	ctrl.SetLogger(logf.Log)
+	ctx = logf.NewContext(ctx, logf.Log)
 
-	ctx := util.ContextWithStopCh(context.Background(), stopCh)
+	cmd := app.NewCAInjectorCommand(ctx)
 
-	cmd := app.NewCommandStartInjectorController(ctx, os.Stdout, os.Stderr)
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
-
-	flag.CommandLine.Parse([]string{})
-	if err := cmd.Execute(); err != nil {
-		cmd.PrintErrln(err)
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		logf.Log.Error(err, "error executing command")
 		util.SetExitCode(err)
 	}
 }

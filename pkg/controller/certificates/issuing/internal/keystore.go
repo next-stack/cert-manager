@@ -24,28 +24,15 @@ package internal
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/x509"
+	"fmt"
 	"time"
 
 	jks "github.com/pavlo-v-chernykh/keystore-go/v4"
 	"software.sslmate.com/src/go-pkcs12"
 
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
-)
-
-const (
-	// pkcs12SecretKey is the name of the data entry in the Secret resource
-	// used to store the p12 file.
-	pkcs12SecretKey = "keystore.p12"
-	// Data Entry Name in the Secret resource for PKCS12 containing Certificate Authority
-	pkcs12TruststoreKey = "truststore.p12"
-
-	// jksSecretKey is the name of the data entry in the Secret resource
-	// used to store the jks file.
-	jksSecretKey = "keystore.jks"
-	// Data Entry Name in the Secret resource for JKS containing Certificate Authority
-	jksTruststoreKey = "truststore.jks"
 )
 
 // encodePKCS12Keystore will encode a PKCS12 keystore using the password provided.
@@ -53,7 +40,7 @@ const (
 // If the certificate data contains multiple certificates, the first will be used
 // as the keystores 'certificate' and the remaining certificates will be prepended
 // to the list of CAs in the resulting keystore.
-func encodePKCS12Keystore(password string, rawKey []byte, certPem []byte, caPem []byte) ([]byte, error) {
+func encodePKCS12Keystore(profile cmapi.PKCS12Profile, password string, rawKey []byte, certPem []byte, caPem []byte) ([]byte, error) {
 	key, err := pki.DecodePrivateKeyBytes(rawKey)
 	if err != nil {
 		return nil, err
@@ -64,7 +51,7 @@ func encodePKCS12Keystore(password string, rawKey []byte, certPem []byte, caPem 
 	}
 	var cas []*x509.Certificate
 	if len(caPem) > 0 {
-		cas, err = pki.DecodeX509CertificateChainBytes(caPem)
+		cas, err = pki.DecodeX509CertificateSetBytes(caPem)
 		if err != nil {
 			return nil, err
 		}
@@ -74,20 +61,42 @@ func encodePKCS12Keystore(password string, rawKey []byte, certPem []byte, caPem 
 	if len(certs) > 1 {
 		cas = append(certs[1:], cas...)
 	}
-	return pkcs12.Encode(rand.Reader, key, certs[0], cas, password)
+
+	switch profile {
+	case cmapi.Modern2026PKCS12Profile:
+		return pkcs12.Modern2026.Encode(key, certs[0], cas, password)
+	case cmapi.Modern2023PKCS12Profile:
+		return pkcs12.Modern2023.Encode(key, certs[0], cas, password)
+	case cmapi.LegacyDESPKCS12Profile:
+		return pkcs12.LegacyDES.Encode(key, certs[0], cas, password)
+	case cmapi.LegacyRC2PKCS12Profile:
+		return pkcs12.LegacyRC2.Encode(key, certs[0], cas, password)
+	default:
+		return pkcs12.LegacyRC2.Encode(key, certs[0], cas, password)
+	}
 }
 
-func encodePKCS12Truststore(password string, caPem []byte) ([]byte, error) {
-	ca, err := pki.DecodeX509CertificateBytes(caPem)
+func encodePKCS12Truststore(profile cmapi.PKCS12Profile, password string, caPem []byte) ([]byte, error) {
+	cas, err := pki.DecodeX509CertificateSetBytes(caPem)
 	if err != nil {
 		return nil, err
 	}
 
-	var cas = []*x509.Certificate{ca}
-	return pkcs12.EncodeTrustStore(rand.Reader, cas, password)
+	switch profile {
+	case cmapi.Modern2026PKCS12Profile:
+		return pkcs12.Modern2026.EncodeTrustStore(cas, password)
+	case cmapi.Modern2023PKCS12Profile:
+		return pkcs12.Modern2023.EncodeTrustStore(cas, password)
+	case cmapi.LegacyDESPKCS12Profile:
+		return pkcs12.LegacyDES.EncodeTrustStore(cas, password)
+	case cmapi.LegacyRC2PKCS12Profile:
+		return pkcs12.LegacyRC2.EncodeTrustStore(cas, password)
+	default:
+		return pkcs12.LegacyRC2.EncodeTrustStore(cas, password)
+	}
 }
 
-func encodeJKSKeystore(password []byte, rawKey []byte, certPem []byte, caPem []byte) ([]byte, error) {
+func encodeJKSKeystore(password []byte, keyAlias string, rawKey []byte, certPem []byte, caPem []byte) ([]byte, error) {
 	// encode the private key to PKCS8
 	key, err := pki.DecodePrivateKeyBytes(rawKey)
 	if err != nil {
@@ -112,25 +121,19 @@ func encodeJKSKeystore(password []byte, rawKey []byte, certPem []byte, caPem []b
 	}
 
 	ks := jks.New()
-	ks.SetPrivateKeyEntry("certificate", jks.PrivateKeyEntry{
+	if err = ks.SetPrivateKeyEntry(keyAlias, jks.PrivateKeyEntry{
 		CreationTime:     time.Now(),
 		PrivateKey:       keyDER,
 		CertificateChain: certs,
-	}, password)
+	}, password); err != nil {
+		return nil, err
+	}
 
 	// add the CA certificate, if set
 	if len(caPem) > 0 {
-		ca, err := pki.DecodeX509CertificateBytes(caPem)
-		if err != nil {
+		if err := addCAsToJKSStore(&ks, caPem); err != nil {
 			return nil, err
 		}
-		ks.SetTrustedCertificateEntry("ca", jks.TrustedCertificateEntry{
-			CreationTime: time.Now(),
-			Certificate: jks.Certificate{
-				Type:    "X509",
-				Content: ca.Raw,
-			}},
-		)
 	}
 
 	buf := &bytes.Buffer{}
@@ -141,23 +144,38 @@ func encodeJKSKeystore(password []byte, rawKey []byte, certPem []byte, caPem []b
 }
 
 func encodeJKSTruststore(password []byte, caPem []byte) ([]byte, error) {
-	ca, err := pki.DecodeX509CertificateBytes(caPem)
-	if err != nil {
+	ks := jks.New()
+	if err := addCAsToJKSStore(&ks, caPem); err != nil {
 		return nil, err
 	}
-
-	ks := jks.New()
-	ks.SetTrustedCertificateEntry("ca", jks.TrustedCertificateEntry{
-		CreationTime: time.Now(),
-		Certificate: jks.Certificate{
-			Type:    "X509",
-			Content: ca.Raw,
-		}},
-	)
-
 	buf := &bytes.Buffer{}
 	if err := ks.Store(buf, password); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func addCAsToJKSStore(ks *jks.KeyStore, caPem []byte) error {
+	cas, err := pki.DecodeX509CertificateSetBytes(caPem)
+	if err != nil {
+		return err
+	}
+
+	creationTime := time.Now()
+	for i, ca := range cas {
+		alias := fmt.Sprintf("ca-%d", i)
+		if i == 0 {
+			alias = "ca"
+		}
+		if err = ks.SetTrustedCertificateEntry(alias, jks.TrustedCertificateEntry{
+			CreationTime: creationTime,
+			Certificate: jks.Certificate{
+				Type:    "X509",
+				Content: ca.Raw,
+			}},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
